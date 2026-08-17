@@ -1,6 +1,6 @@
 {
   "wave": "mobile-only-v1-release-candidate-blocker-closeout",
-  "branch": "mobile-only-v1-release-candidate-blocker-closeout",
+  "branch": "fix.native-multilink-epoch-bridge",
   "base_branch": "mobile-only-v1r5-field-qualification-integrity-scale-closeout",
   "base_sha": "81b6dbb216e843d363fd0088f673076add78013f",
   "implementation_sha": "37e6ed8c4afa00202693cd56919aea78fd4c7af5",

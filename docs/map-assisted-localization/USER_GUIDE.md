@@ -58,6 +58,8 @@ Debug 与 Release 都生成可追踪身份并允许完整开始扫描。手动 D
 7. 检查在线/RTAB‑Map/离线轨迹、累计修正中位/P95/最大值、weak/lost 区间、拒绝约束、价签和质量门结果。
 8. 检查 `draft/review`、version、revision 和门禁阻断项。测试诊断草稿、当前有界修正场和未通过质量策略的完整因子图都不具备正式发布资格，界面的“人工批准发布”会被硬门拒绝。
 
+使用 Debug App 扫描且 C-1/C-2/C-3 仍为 `CALIBRATION_PENDING` 时，手机和 PC 会在其余真实质量门通过后生成“完整测试结果”：轨迹、地图、价签、CSV/XLSX、质量报告和不可变版本均正常提交，标记为 `result_scope=TEST`。该模式不是删减版流程；区别仅是 `production_publish_permitted=false`。若图质量、坐标帧、价签位置/货架关联、穿架、framing、身份或原子提交失败，仍按普通质量门降级或拒绝，Debug 不会绕过这些问题。
+
 ## 价签与轨迹复核
 
 - 手机确认页保存的是 `USER_CONFIRMED` 或 `USER_OVERRIDDEN` 用户证据；算法货架、侧面和置信度仍单独保留。用户选择不会改变 SLAM、轨迹或地图对齐。

@@ -38,7 +38,8 @@ Mobile V1 只承诺 `Fast reduced graph`，以及 Fast 质量失败后至多一�
 - workflow 进入 `.scanning` 前必须持久化完整 start receipt 和 workflow context。receipt 绑定 tracking session、segment、database、map/store/floor、启动状态、时间和 app SHA；context 绑定 receipt reference/SHA 和 scanning checkpoint。
 - 首次相机权限必须在 workflow commit 前完成；`.notDetermined` 只能请求权限并重新进入完整校验，不能允许旧相机 callback 在 workflow 已失败后自行启动。
 - 任何 host、receipt、context 或 cancellation 失败都必须有可调用 rollback，停止 mapping/camera/clock、清除 prior-map 状态、脱离失败数据库并释放 session identity。
-- Debug 与 Release 必须生成同一 version 4 build identity 并进入同一真实扫描、存储、finalization、处理和结果实现；不得为 Debug 维护简化或模拟路径。`MobileBuildIdentity.canStartScan` 只要求身份完整且内部一致，不因 `build_configuration=debug` 或 `working_tree_state=dirty` 阻断测试。Debug 可使用 dirty tracked tree，但必须记录 `production_eligible=false`；Release 继续拒绝 dirty tracked tree，并仅在 clean 时记录 `production_eligible=true`。默认 `RTABMapApp` Run 与 `RTABMapApp-QualifiedDevice` 仍使用 Release，以保留真实性能与现场资格含义。
+- Debug 与 Release 必须生成同一 version 5 build identity 并进入同一真实扫描、存储、finalization、处理和结果实现；不得为 Debug 维护简化或模拟路径。`MobileBuildIdentity.canStartScan` 只要求身份完整且内部一致，不因 `build_configuration=debug` 或 `working_tree_state=dirty` 阻断测试。Debug 可使用 dirty tracked tree，但必须记录 `source_ref`、唯一 tracked patch SHA-256 和 `production_eligible=false`；Release 继续拒绝任意 dirty tracked tree，并仅在 clean 时记录 `production_eligible=true`。默认 `RTABMapApp` Run 与 `RTABMapApp-QualifiedDevice` 仍使用 Release，以保留真实性能与现场资格含义。
+- 结果完整性与生产资格是两个字段：只要图、坐标、价签、framing、身份和原子提交等真实质量门通过，Debug 允许使用明确标记为 `CALIBRATION_PENDING` 的初值生成 `result_scope=TEST`、`result_quality_status=COMPLETE`、`publish_permitted=true` 的完整测试成果，手机和 PC 必须保留全部表格、地图、价签和审计文件；同时固定 `production_publish_permitted=false` 和 `test_calibration_override_applied=true`。clean Release 只有在标定状态为 `CALIBRATED/NOT_APPLICABLE` 且其余门全部通过时，才能设置 `result_scope=PRODUCTION` 与 `production_publish_permitted=true`。测试放行不得绕过损坏输入、身份串包、低置信价签、坐标缺失、穿架、图质量失败或不可原子提交等真实完整性门。
 
 ### 2.5 性能观测、结果保留与资格边界
 

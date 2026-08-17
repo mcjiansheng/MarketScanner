@@ -197,8 +197,9 @@ struct PoseEpochTransitionRecord: Codable, Equatable {
 
 /// Deterministic, cross-platform bridge consensus. The C-1 starting bounds
 /// are used only to decide whether independent native links agree with the
-/// recorded epoch transform. They do not make the calibration or publication
-/// gate pass: CALIBRATION_PENDING remains an unconditional blocker.
+/// recorded epoch transform. They do not make the calibration production-
+/// qualified: CALIBRATION_PENDING remains a production publication blocker,
+/// while Debug may use the same values for an explicitly-scoped TEST result.
 enum PoseEpochBridgeConsensus {
     private struct Selection {
         let centerIndex: Int

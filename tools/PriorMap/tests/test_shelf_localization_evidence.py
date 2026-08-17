@@ -7,6 +7,7 @@ import unittest
 
 from tools.PriorMap.offline_localization import (
     Pose,
+    _result_scope_policy,
     _shelf_localization_calibration_gate,
     build_shelf_face_constraints,
 )
@@ -240,13 +241,82 @@ class ShelfLocalizationEvidenceTests(unittest.TestCase):
         bundle = validate_shelf_localization_records(records, shared_metadata)
         self.assertEqual(len(bundle.accepted_shelf_loops), 1)
 
-    def test_pending_calibration_is_a_publication_blocker(self) -> None:
+    def test_pending_calibration_allows_complete_debug_test_result_only(self) -> None:
         status, qualified = _shelf_localization_calibration_gate(
             {"shelfLocalizationCalibrationStatus": "CALIBRATION_PENDING"},
             evidence_bound=True,
         )
         self.assertEqual(status, "CALIBRATION_PENDING")
         self.assertFalse(qualified)
+        debug_policy = _result_scope_policy(
+            {
+                "appBuildConfiguration": "debug",
+                "appWorkingTreeState": "dirty",
+                "appProductionEligible": False,
+                "appGitSHA": "a" * 40,
+                "appSourceRef": "host-tests",
+                "appSourcePatchSHA256": "b" * 64,
+            },
+            calibration_status=status,
+            calibration_qualified=qualified,
+        )
+        self.assertEqual(debug_policy["result_scope"], "TEST")
+        self.assertTrue(debug_policy["test_calibration_override_applied"])
+        self.assertTrue(debug_policy["calibration_accepted_for_result"])
+        release_policy = _result_scope_policy(
+            {
+                "appBuildConfiguration": "release",
+                "appWorkingTreeState": "clean",
+                "appProductionEligible": True,
+                "appGitSHA": "a" * 40,
+                "appSourceRef": "host-tests",
+                "appSourcePatchSHA256": (
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                ),
+            },
+            calibration_status=status,
+            calibration_qualified=qualified,
+        )
+        self.assertEqual(release_policy["result_scope"], "PRODUCTION")
+        self.assertFalse(release_policy["test_calibration_override_applied"])
+        self.assertFalse(release_policy["calibration_accepted_for_result"])
+        forged_release_policy = _result_scope_policy(
+            {
+                "appBuildConfiguration": "debug",
+                "appWorkingTreeState": "dirty",
+                "appProductionEligible": True,
+                "appGitSHA": "a" * 40,
+                "appSourceRef": "host-tests",
+                "appSourcePatchSHA256": "b" * 64,
+            },
+            calibration_status="CALIBRATED",
+            calibration_qualified=True,
+        )
+        self.assertEqual(forged_release_policy["result_scope"], "TEST")
+        self.assertFalse(
+            forged_release_policy["source_production_eligible"]
+        )
+        malformed_debug_policy = _result_scope_policy(
+            {
+                "appBuildConfiguration": "debug",
+                "appWorkingTreeState": "dirty",
+                "appProductionEligible": False,
+                "appGitSHA": "a" * 40,
+                "appSourceRef": "host-tests",
+                # A dirty build cannot claim the empty tracked patch digest.
+                "appSourcePatchSHA256": (
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                ),
+            },
+            calibration_status=status,
+            calibration_qualified=qualified,
+        )
+        self.assertFalse(
+            malformed_debug_policy["test_calibration_override_applied"]
+        )
+        self.assertFalse(
+            malformed_debug_policy["calibration_accepted_for_result"]
+        )
         self.assertEqual(
             _shelf_localization_calibration_gate({}, evidence_bound=False),
             ("NOT_APPLICABLE", True),

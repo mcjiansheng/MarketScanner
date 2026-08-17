@@ -17,7 +17,12 @@ struct MobileBuildIdentity: Equatable {
     var nativeCoreSHA256: String
     var buildConfiguration: String
     var workingTreeState: String
+    var sourceRef: String
+    var sourcePatchSHA256: String
     var productionEligible: Bool
+
+    private static let emptyPatchSHA256 =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
     /// Strict runtime validation (§3.3): every field must be fully bound,
     /// well-formed and internally consistent. Debug and Release identities
@@ -37,6 +42,12 @@ struct MobileBuildIdentity: Equatable {
                 || buildConfiguration == "release")
             && (workingTreeState == "clean"
                 || workingTreeState == "dirty")
+            && MobileBuildIdentity.isSafeSourceRef(sourceRef)
+            && MobileBuildIdentity.isLowercaseHex(
+                sourcePatchSHA256, length: 64)
+            && (workingTreeState == "clean"
+                ? sourcePatchSHA256 == MobileBuildIdentity.emptyPatchSHA256
+                : sourcePatchSHA256 != MobileBuildIdentity.emptyPatchSHA256)
             && !(buildConfiguration == "release"
                 && workingTreeState == "dirty")
             && productionEligible
@@ -78,6 +89,24 @@ struct MobileBuildIdentity: Equatable {
         return true
     }
 
+    private static func isSafeSourceRef(_ value: String) -> Bool {
+        guard !value.isEmpty, value.utf8.count <= 255 else { return false }
+        for (index, scalar) in value.unicodeScalars.enumerated() {
+            let isUppercase = scalar.value >= 0x41 && scalar.value <= 0x5A
+            let isLowercase = scalar.value >= 0x61 && scalar.value <= 0x7A
+            let isDigit = scalar.value >= 0x30 && scalar.value <= 0x39
+            let isPunctuation = scalar == "." || scalar == "_"
+                || scalar == "-" || scalar == "/"
+            if index == 0 {
+                if !isUppercase && !isLowercase && !isDigit { return false }
+            } else if !isUppercase && !isLowercase && !isDigit
+                && !isPunctuation {
+                return false
+            }
+        }
+        return true
+    }
+
     private static var unusable: MobileBuildIdentity {
         return MobileBuildIdentity(
             appGitSHA: "unknown",
@@ -90,6 +119,8 @@ struct MobileBuildIdentity: Equatable {
             nativeCoreSHA256: "unknown",
             buildConfiguration: "unknown",
             workingTreeState: "unknown",
+            sourceRef: "unknown",
+            sourcePatchSHA256: "unknown",
             productionEligible: false)
     }
 
@@ -113,10 +144,11 @@ struct MobileBuildIdentity: Equatable {
             "wave", "branch", "base_branch", "base_sha",
             "implementation_sha", "validation_sha",
             "build_configuration", "working_tree_state",
+            "source_ref", "source_patch_sha256",
             "production_eligible",
         ]
         guard Set(object.keys) == expectedKeys,
-              StrictJSONScalar.integer(object["version"]) == 4,
+              StrictJSONScalar.integer(object["version"]) == 5,
               (object["format"] as? String) == "MarketScannerBuildIdentity",
               let productionEligible = StrictJSONScalar.boolean(
                 object["production_eligible"])
@@ -137,6 +169,9 @@ struct MobileBuildIdentity: Equatable {
                 object["build_configuration"] as? String ?? "unknown",
             workingTreeState:
                 object["working_tree_state"] as? String ?? "unknown",
+            sourceRef: object["source_ref"] as? String ?? "unknown",
+            sourcePatchSHA256:
+                object["source_patch_sha256"] as? String ?? "unknown",
             productionEligible: productionEligible)
     }
 }

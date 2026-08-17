@@ -827,7 +827,7 @@ class LocalizedVersionStore:
         if calibrated_files_present:
             expected_contracts["calibrated_deliverables_manifest.json"] = (
                 "MarketScannerCalibratedDeliverablesManifest",
-                1,
+                2,
             )
         if publication_files_present:
             expected_contracts.update(
@@ -1221,6 +1221,8 @@ class LocalizedVersionStore:
             "unpositioned_tag_count", "shelf_associated_tag_count",
             "unassociated_tag_count", "low_confidence_tag_count",
             "result_quality_status", "publish_permitted",
+            "production_publish_permitted", "result_scope",
+            "test_calibration_override_applied",
             "algorithm_degradation_codes", "files",
         }
         if set(manifest) != required_keys:
@@ -1270,6 +1272,30 @@ class LocalizedVersionStore:
         ):
             raise LocalizedStoreError(
                 "Calibrated deliverables inventory is incomplete."
+            )
+        if (
+            not isinstance(manifest.get("publish_permitted"), bool)
+            or not isinstance(
+                manifest.get("production_publish_permitted"), bool
+            )
+            or manifest.get("result_scope") not in {"PRODUCTION", "TEST"}
+            or not isinstance(
+                manifest.get("test_calibration_override_applied"), bool
+            )
+            or (
+                manifest["production_publish_permitted"]
+                and (
+                    not manifest["publish_permitted"]
+                    or manifest["result_scope"] != "PRODUCTION"
+                )
+            )
+            or (
+                manifest["test_calibration_override_applied"]
+                and manifest["result_scope"] != "TEST"
+            )
+        ):
+            raise LocalizedStoreError(
+                "Calibrated deliverables result scope is invalid."
             )
         expected_files = {
             "calibrated_positions_by_node.csv",
@@ -1614,6 +1640,10 @@ class LocalizedVersionStore:
                 raise LocalizedStoreError(
                     f"Publication final trajectory authority is invalid: {exc}"
                 ) from exc
+            deliverables = self.read_verified_json(
+                current, "calibrated_deliverables_manifest.json"
+            )
+            self._validate_production_result_scope(deliverables)
             active = self.published()
             if active is not None and active.state == "published":
                 raise LocalizedStoreError(
@@ -1852,6 +1882,26 @@ class LocalizedVersionStore:
             raise
 
     @staticmethod
+    def _validate_production_result_scope(
+        deliverables: dict[str, Any],
+    ) -> None:
+        if (
+            not isinstance(deliverables, dict)
+            or deliverables.get("format")
+            != "MarketScannerCalibratedDeliverablesManifest"
+            or deliverables.get("version") != 2
+            or deliverables.get("result_quality_status") != "COMPLETE"
+            or deliverables.get("publish_permitted") is not True
+            or deliverables.get("production_publish_permitted") is not True
+            or deliverables.get("result_scope") != "PRODUCTION"
+            or deliverables.get("test_calibration_override_applied") is not False
+        ):
+            raise LocalizedStoreError(
+                "Formal publication requires a COMPLETE PRODUCTION result scope "
+                "without a test calibration override."
+            )
+
+    @staticmethod
     def _validate_publication_gate(
         report: dict[str, Any], field_acceptance: dict[str, Any]
     ) -> None:
@@ -1911,6 +1961,7 @@ class LocalizedVersionStore:
                 (
                     "localization_report.json",
                     "localized_review.json",
+                    "calibrated_deliverables_manifest.json",
                     "field_evidence.json",
                     "qualification_manifest.json",
                 ),
@@ -1921,6 +1972,10 @@ class LocalizedVersionStore:
             )
             qualification_manifest = json.loads(
                 artifacts["qualification_manifest.json"].decode("utf-8"),
+                parse_constant=_reject_nonfinite,
+            )
+            deliverables = json.loads(
+                artifacts["calibrated_deliverables_manifest.json"].decode("utf-8"),
                 parse_constant=_reject_nonfinite,
             )
             embedded_qualification = inspect_field_evidence(
@@ -1938,6 +1993,7 @@ class LocalizedVersionStore:
         acceptance = report.get("field_acceptance") if isinstance(report, dict) else None
         if not isinstance(report, dict) or not isinstance(acceptance, dict):
             raise LocalizedStoreError("Published output has no field acceptance record.")
+        self._validate_production_result_scope(deliverables)
         if acceptance.get("review_evidence_sha256") != hashlib.sha256(
             artifacts["localized_review.json"]
         ).hexdigest():

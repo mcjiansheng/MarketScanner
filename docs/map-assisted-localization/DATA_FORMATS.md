@@ -303,7 +303,7 @@ localized_price_tags.csv
 calibrated_deliverables_manifest.json
 ```
 
-`calibrated_deliverables_manifest.json` 记录 source/exported node、source/retained tag、positioned/unpositioned/shelf-associated/unassociated tag 数量，并绑定四张表的 row count、字节数和 SHA-256。普通导出不得修改这些文件。`tools/PriorMap/export_calibrated_trajectory.py` 先按 `version_manifest.json` 验证核心 CSV，再逐字节复制到 version 外的兼容目录并额外生成复核 PNG：
+`calibrated_deliverables_manifest.json` version 2 记录 source/exported node、source/retained tag、positioned/unpositioned/shelf-associated/unassociated tag 数量，并绑定四张表的 row count、字节数和 SHA-256。它同时保存 `result_scope`、`publish_permitted`、`production_publish_permitted` 和 `test_calibration_override_applied`：Debug 待标定结果可在其余真实质量门通过时成为完整 `TEST` 成果，但不能把 production flag 改为 true；`production_publish_permitted=true` 必须同时满足 `result_scope=PRODUCTION` 和普通 publish gate。普通导出不得修改这些文件。`tools/PriorMap/export_calibrated_trajectory.py` 先按 `version_manifest.json` 验证核心 CSV，再逐字节复制到 version 外的兼容目录并额外生成复核 PNG：
 
 ```text
 calibrated_trajectory_exports/

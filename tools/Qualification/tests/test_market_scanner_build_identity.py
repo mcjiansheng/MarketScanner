@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[3]
 def valid_governance() -> dict[str, str]:
     return {
         "wave": "mobile-only-v1-release-candidate-blocker-closeout",
-        "branch": "mobile-only-v1-release-candidate-blocker-closeout",
+        "branch": "fix.native-multilink-epoch-bridge",
         "base_branch": "mobile-only-v1r5-field-qualification-integrity-scale-closeout",
         "base_sha": "8" * 40,
         "implementation_sha": "<CODE_CONTRACT_TEST_BUILD_SHA>",
@@ -38,6 +38,8 @@ def valid_embedded_identity() -> dict[str, object]:
         "build_configuration": "release",
         "working_tree_state": "clean",
         "production_eligible": True,
+        "source_ref": "fix/native-multilink-epoch-bridge",
+        "source_patch_sha256": identity.EMPTY_PATCH_SHA256,
         **valid_governance(),
     }
 
@@ -157,6 +159,8 @@ class MarketScannerBuildIdentityTests(unittest.TestCase):
             "build_configuration": "profile",
             "working_tree_state": "unknown",
             "production_eligible": False,
+            "source_ref": "unsafe ref",
+            "source_patch_sha256": "B" * 64,
         }
         for field, bad_value in mutations.items():
             malformed = copy.deepcopy(valid)
@@ -182,6 +186,7 @@ class MarketScannerBuildIdentityTests(unittest.TestCase):
 
         debug_dirty = copy.deepcopy(debug_clean)
         debug_dirty["working_tree_state"] = "dirty"
+        debug_dirty["source_patch_sha256"] = "c" * 64
         identity.validate_fields(debug_dirty)
 
         release_dirty = copy.deepcopy(release)
@@ -209,6 +214,8 @@ class MarketScannerBuildIdentityTests(unittest.TestCase):
             self.assertEqual(release["build_configuration"], "release")
             self.assertEqual(release["working_tree_state"], "clean")
             self.assertIs(release["production_eligible"], True)
+            self.assertEqual(
+                release["source_patch_sha256"], identity.EMPTY_PATCH_SHA256)
 
             native = (
                 repo
@@ -221,6 +228,15 @@ class MarketScannerBuildIdentityTests(unittest.TestCase):
             self.assertEqual(debug["build_configuration"], "debug")
             self.assertEqual(debug["working_tree_state"], "dirty")
             self.assertIs(debug["production_eligible"], False)
+            self.assertNotEqual(
+                debug["source_patch_sha256"], identity.EMPTY_PATCH_SHA256)
+            first_patch_digest = debug["source_patch_sha256"]
+            native.write_text(
+                "int market_scanner_test = 3;\n", encoding="utf-8")
+            changed_debug = identity.build_identity(
+                str(repo), allow_dirty=True, build_configuration="Debug")
+            self.assertNotEqual(
+                changed_debug["source_patch_sha256"], first_patch_digest)
             self.assert_rejected(
                 lambda: identity.build_identity(
                     str(repo),

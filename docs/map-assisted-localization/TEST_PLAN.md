@@ -4,7 +4,7 @@
 
 ## 2026-08-15 通道/货架约束增量
 
-自动化必须覆盖：manifest v5 四流空/非空水位、未知字段/重复键/半行/超限、epoch bridge 正反例、component/side/window 交叉引用、两侧法向与 0.5 m/10°/70% 门、非主导与主导动态样本、point+swept-segment 0.4 m 穿架、top1 低 margin 的非阻塞 `LOW_CONFIDENCE`、人工重定位恢复、corridor route 成功转正与任一自洽项失败降级、accepted loop 生成 shelf-face 因子并回溯整圈、以及价签 raw/optimized/shelf-projected 三坐标和采集侧长边投影。epoch bridge 组必须同时证明：同一 native Statistics 事件的 exact Link 被 node/epoch/component 绑定；两组 node-disjoint 且 transform 一致的 global/local-space edge 可形成 v3 bridge；单 edge、重复或反向 pair、共享任一端点、错误 component、冲突 transform、旧 v2 aggregate counter 和多 epoch 链缺任一相邻 bridge 均拒绝；无 bridge transition 仍以空数组追加并保持 final newline/单调水位。发布测试必须断言 shelf 法向残差 ≤0.5 m、纵向在段内、结构内点/穿架段为 0，并继续断言 `CALIBRATION_PENDING` 使 `publish_permitted=false`。
+自动化必须覆盖：manifest v5 四流空/非空水位、未知字段/重复键/半行/超限、epoch bridge 正反例、component/side/window 交叉引用、两侧法向与 0.5 m/10°/70% 门、非主导与主导动态样本、point+swept-segment 0.4 m 穿架、top1 低 margin 的非阻塞 `LOW_CONFIDENCE`、人工重定位恢复、corridor route 成功转正与任一自洽项失败降级、accepted loop 生成 shelf-face 因子并回溯整圈、以及价签 raw/optimized/shelf-projected 三坐标和采集侧长边投影。epoch bridge 组必须同时证明：同一 native Statistics 事件的 exact Link 被 node/epoch/component 绑定；两组 node-disjoint 且 transform 一致的 global/local-space edge 可形成 v3 bridge；单 edge、重复或反向 pair、共享任一端点、错误 component、冲突 transform、旧 v2 aggregate counter 和多 epoch 链缺任一相邻 bridge 均拒绝；无 bridge transition 仍以空数组追加并保持 final newline/单调水位。结果测试必须分别断言：Debug + `CALIBRATION_PENDING` 在其余真实质量门通过时生成 `COMPLETE/TEST` 和全部最终成果，但 `production_publish_permitted=false`；clean Release + pending calibration 仍不可生产发布；任一低置信、空坐标、穿架、degradation 或 graph failure 在 Debug 中也不得被测试 override 洗白。
 
 当前主机执行结果：PriorMap **369/369（385.868 s）**、Map Studio **143/143（9.539 s）**、Qualification **30/30（13.062 s）**、生成合同 16 文件、native factor-graph/reprocess 增量构建、Python/JavaScript 语法、patch check 和 unsigned generic iphoneos Debug 全量编译/链接 PASS。规模门为 finalization 300,000 条 peak **13,303,808 bytes**，trace 1,728,000 条保留 172,801 / peak **59,179,008 bytes**，tag evidence 400,000 条接受 200,000 / peak **792,821,760 bytes**；tag evidence 仍低于 768 MiB 门，但余量约 12.5 MB。1280×720 真实浏览器检查通过；1024/390 的内置视口覆盖未生效，只能记为 CSS/源码合同覆盖，不能登记为真实视觉 PASS。
 
@@ -74,7 +74,7 @@ python3 -m unittest \
 
 朝向回归必须额外证明：`0°/90°/180°/-90°` 分别对应东/北/西/南；ARKit `+X/-Z/-X/+Z` camera forward 分别产生 `0/+π/2/π/-π/2`；首帧锚定后向前移动 1 m 必须沿用户选择的地图方向；配置 marker、人工重选箭头和实时 HUD 均以右向 artwork 加单次 `-yaw` 渲染。无签名构建不能替代真机四方向复测。
 
-2026-08-10 的历史源码结果为 **32/32 PASS**；当前合同继续证明同一 UX/startup 项，并把构建身份要求更新为：Debug 和 Release 都生成 version 4 identity、进入同一完整扫描链路；Debug 可用 `--allow-dirty` 记录测试工作区但不得声称 production eligible；默认 `RTABMapApp` 和 `RTABMapApp-QualifiedDevice` 的 Run 均保持 clean Release。新增合同还要求 setup transition 失败不得继续 commit、finalization 的 state/context 单次持久化、未完成的 `finalizing_scan` 不得直接进入后处理，以及条码失败 alert 去重。
+2026-08-10 的历史源码结果为 **32/32 PASS**；当前合同继续证明同一 UX/startup 项，并把构建身份要求更新为：Debug 和 Release 都生成 version 5 identity、进入同一完整扫描链路；Debug 可用 `--allow-dirty`，但必须记录实际 source ref、唯一 tracked patch SHA-256 和 `production_eligible=false`；默认 `RTABMapApp` 和 `RTABMapApp-QualifiedDevice` 的 Run 均保持 clean Release。新增合同还要求 setup transition 失败不得继续 commit、finalization 的 state/context 单次持久化、未完成的 `finalizing_scan` 不得直接进入后处理，以及条码失败 alert 去重。
 
 2026-08-10 历史扫描/ESL 布局增量中，`tools.PriorMap.tests.test_mobile_scan_ux_contract` 单组扩展为 **19/19 PASS**。新增断言要求：ESL status/payload 必须绑定 exact scan rect 上下边缘且不能恢复 `centerY` 魔数；历史列表必须显示独立导出按钮并使用 folder document picker；导出必须 finalized/live-checkpoint/hardlink/SHA/local-retention fail closed；snapshot 必须存在 iOS 私有 descriptor-copy fallback、exact stat identity cache 和临时副本清理。这个 19 项数字是该单组当前结果，不替代上面跨三个模块的历史 32/32 证据。
 
@@ -135,7 +135,7 @@ xcodebuild -quiet -project app/ios/RTABMapApp.xcodeproj \
 
 本轮真机手测必须补充：删除/停用 Xcode 的 `ViewController.updateState(state:)` 文件断点后冷启动，确认不会再被调试器停在黑色残缺界面；打开 ESL 扫描确认状态文字位于框外且 Dynamic Type/短屏无约束冲突；对截图中的真实 finalized 会话执行手机后处理，确认不再出现 `/dev/fd` 只读打开错误；不处理或故意处理失败后仍可把完整原始扫描导出到 Files/iCloud/外接存储，并在第二次导出时保留第一次目录。大型真实 DB 还要记录私有校验副本的额外空间、耗时、取消/锁屏和低磁盘行为。
 
-2026-08-10 的历史 unsigned generic iPhoneOS Debug 与 tracked-clean exact-HEAD Release 全量编译/链接均已 PASS；当时 Debug 产物没有 `MarketScannerBuildIdentity.json`。当前 version 4 合同要求 Debug/Release 两个产物都包含身份，因此必须重新执行至少一次 Debug 全量构建并检查 `debug/dirty-or-clean/production_eligible=false`，以及一次 clean Release 构建并检查 `release/clean/production_eligible=true`。无签名构建仍不是签名安装或真机运行资格。
+2026-08-10 的历史 unsigned generic iPhoneOS Debug 与 tracked-clean exact-HEAD Release 全量编译/链接均已 PASS；当时 Debug 产物没有 `MarketScannerBuildIdentity.json`。当前 version 5 合同要求 Debug/Release 两个产物都包含身份，因此必须重新执行至少一次 Debug 全量构建并检查 `debug/dirty-or-clean/source_ref/source_patch_sha256/production_eligible=false`，以及一次 clean exact-commit Release 构建并检查 `release/clean/empty-patch-digest/production_eligible=true`。无签名构建仍不是签名安装或真机运行资格。
 
 覆盖：
 

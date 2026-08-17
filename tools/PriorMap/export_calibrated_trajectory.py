@@ -392,6 +392,13 @@ def export(
             if isinstance(item, dict) and item.get("code") is not None
         ],
         "publish_permitted": report.get("publish_permitted") is True,
+        "production_publish_permitted": report.get(
+            "production_publish_permitted"
+        ) is True,
+        "result_scope": report.get("result_scope"),
+        "test_calibration_override_applied": report.get(
+            "test_calibration_override_applied"
+        ) is True,
         "artifacts": [
             {
                 "file": name,

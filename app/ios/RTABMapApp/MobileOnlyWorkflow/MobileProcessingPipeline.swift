@@ -77,6 +77,11 @@ enum MobileProcessingPipeline {
         var floorID: String
         var trackingSessionID: String
         var appGitSHA: String
+        var buildConfiguration: String = "unknown"
+        var workingTreeState: String = "unknown"
+        var sourceRef: String = "unknown"
+        var sourcePatchSHA256: String = "unknown"
+        var productionEligible: Bool = false
         var appVersion: String
         var deviceModel: String
         var osVersion: String
@@ -309,9 +314,41 @@ enum MobileProcessingPipeline {
         // reach a publishable session. Because task bootstrap is already
         // durable, this early rejection is recorded as a terminal failure
         // instead of leaving an orphan intent with no task.json.
-        guard request.appGitSHA != "unknown", !request.appGitSHA.isEmpty else {
+        func isLowercaseHex(_ value: String, length: Int) -> Bool {
+            guard value.count == length else { return false }
+            return value.unicodeScalars.allSatisfy { scalar in
+                (scalar.value >= 0x30 && scalar.value <= 0x39)
+                    || (scalar.value >= 0x61 && scalar.value <= 0x66)
+            }
+        }
+        func isSafeSourceRef(_ value: String) -> Bool {
+            guard !value.isEmpty, value.utf8.count <= 255 else { return false }
+            return value.unicodeScalars.enumerated().allSatisfy {
+                index, scalar in
+                let alphanumeric =
+                    (scalar.value >= 0x30 && scalar.value <= 0x39)
+                    || (scalar.value >= 0x41 && scalar.value <= 0x5A)
+                    || (scalar.value >= 0x61 && scalar.value <= 0x7A)
+                if index == 0 { return alphanumeric }
+                return alphanumeric || scalar == "." || scalar == "_"
+                    || scalar == "-" || scalar == "/"
+            }
+        }
+        let emptyPatchSHA256 =
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        guard isLowercaseHex(request.appGitSHA, length: 40),
+              ["debug", "release"].contains(request.buildConfiguration),
+              ["clean", "dirty"].contains(request.workingTreeState),
+              request.productionEligible
+                == (request.buildConfiguration == "release"
+                    && request.workingTreeState == "clean"),
+              isSafeSourceRef(request.sourceRef),
+              isLowercaseHex(request.sourcePatchSHA256, length: 64),
+              request.workingTreeState == "clean"
+                ? request.sourcePatchSHA256 == emptyPatchSHA256
+                : request.sourcePatchSHA256 != emptyPatchSHA256 else {
             throw MobileOnlyWorkflowError.invalidState(
-                "app build identity is unknown; processing is blocked")
+                "app build identity is incomplete; processing is blocked")
         }
         if case .committedResult(let entry) = recovery {
             guard let checkpoint = existingTaskRecord?.checkpoint else {
@@ -1052,19 +1089,30 @@ enum MobileProcessingPipeline {
             : "NOT_APPLICABLE"
         let shelfLocalizationCalibrationQualified = !shelfEvidenceBound
             || shelfLocalizationCalibrationStatus == "CALIBRATED"
+        let resultScopePolicy = MobileResultPublicationInvariant
+            .resultScopePolicy(
+                buildConfiguration: request.buildConfiguration,
+                productionEligible: request.productionEligible,
+                shelfLocalizationCalibrationStatus:
+                    shelfLocalizationCalibrationStatus,
+                shelfLocalizationCalibrationQualified:
+                    shelfLocalizationCalibrationQualified)
         let publishPermitted = MobileResultPublicationInvariant.permits(
             coordinatesArePriorMapFrame:
                 selectedTrajectory.coordinatesArePriorMapFrame,
             graphQualityPassed: graphQualityPassed,
             degradationCount: degradations.count,
-            shelfLocalizationCalibrationQualified:
-                shelfLocalizationCalibrationQualified,
+            shelfLocalizationCalibrationAcceptedForResult:
+                resultScopePolicy.calibrationAcceptedForResult,
             coordinateFrameAuditPassed: coordinateFrameAuditPassed,
             legacyCoordinateFrameCount: legacyTagCoordinateFrameCount,
             lowConfidenceTagCount: lowConfidenceTagCount,
             unpositionedTagCount: unpositionedTagCount,
             unassociatedTagCount: unassociatedTagCount,
             rescanTaskCount: rescanTasks.count)
+        let productionPublishPermitted = publishPermitted
+            && request.productionEligible
+            && shelfLocalizationCalibrationQualified
         let resultQualityStatus: ResultQualityStatus
         if !selectedTrajectory.coordinatesArePriorMapFrame {
             resultQualityStatus = .localFrameOnly
@@ -1198,6 +1246,11 @@ enum MobileProcessingPipeline {
             "result": [
                 "quality_status": resultQualityStatus.rawValue,
                 "publish_permitted": publishPermitted,
+                "production_publish_permitted":
+                    productionPublishPermitted,
+                "result_scope": resultScopePolicy.resultScope,
+                "test_calibration_override_applied":
+                    resultScopePolicy.testCalibrationOverrideApplied,
                 "partial_result": resultQualityStatus != .complete,
                 "degradation_count": degradations.count,
                 "degradations": degradations.map(\.reportPayload),
@@ -1205,6 +1258,8 @@ enum MobileProcessingPipeline {
                     shelfLocalizationCalibrationStatus,
                 "shelf_localization_calibration_qualified":
                     shelfLocalizationCalibrationQualified,
+                "calibration_accepted_for_result":
+                    resultScopePolicy.calibrationAcceptedForResult,
             ],
             "graph": [
                 "node_count": nativeOutcome.trajectory.count,
@@ -1345,6 +1400,10 @@ enum MobileProcessingPipeline {
             rescanTasks: rescanTasks,
             resultQualityStatus: resultQualityStatus,
             publishPermitted: publishPermitted,
+            productionPublishPermitted: productionPublishPermitted,
+            resultScope: resultScopePolicy.resultScope,
+            testCalibrationOverrideApplied:
+                resultScopePolicy.testCalibrationOverrideApplied,
             degradations: degradations,
             coordinateFrameAuditPassed: coordinateFrameAuditPassed,
             legacyTagCoordinateFrameCount: legacyTagCoordinateFrameCount)
@@ -1472,6 +1531,18 @@ enum MobileProcessingPipeline {
                     legacyTagCoordinateFrameCount,
                 "result_quality_status": resultQualityStatus.rawValue,
                 "publish_permitted": publishPermitted,
+                "production_publish_permitted":
+                    productionPublishPermitted,
+                "result_scope": resultScopePolicy.resultScope,
+                "test_calibration_override_applied":
+                    resultScopePolicy.testCalibrationOverrideApplied,
+                "source_app_git_sha": request.appGitSHA,
+                "source_build_configuration":
+                    request.buildConfiguration,
+                "source_working_tree_state": request.workingTreeState,
+                "source_production_eligible": request.productionEligible,
+                "source_ref": request.sourceRef,
+                "source_patch_sha256": request.sourcePatchSHA256,
                 "degradation_count": degradations.count,
                 "performance_sample_count": performanceSampleCount,
                 "performance_evidence_complete":
@@ -3228,6 +3299,9 @@ enum MobileProcessingPipeline {
         rescanTasks: [RescanTask],
         resultQualityStatus: ResultQualityStatus = .complete,
         publishPermitted: Bool = true,
+        productionPublishPermitted: Bool = false,
+        resultScope: String = "TEST",
+        testCalibrationOverrideApplied: Bool = false,
         degradations: [ProcessingDegradation] = [],
         coordinateFrameAuditPassed: Bool = true,
         legacyTagCoordinateFrameCount: Int = 0
@@ -3251,6 +3325,12 @@ enum MobileProcessingPipeline {
             qualityJSON: nativeOutcome.qualityJSON)
         return [
             "app_git_sha": request.appGitSHA,
+            "build_configuration": request.buildConfiguration,
+            "working_tree_state": request.workingTreeState,
+            "source_ref": request.sourceRef,
+            "source_patch_sha256": request.sourcePatchSHA256,
+            "source_production_eligible": request.productionEligible
+                ? "true" : "false",
             "app_version": request.appVersion,
             "device_model": request.deviceModel,
             "os_version": request.osVersion,
@@ -3291,6 +3371,11 @@ enum MobileProcessingPipeline {
             "rescan_tag_count": String(rescanTasks.count),
             "result_quality_status": resultQualityStatus.rawValue,
             "publish_permitted": publishPermitted ? "true" : "false",
+            "production_publish_permitted":
+                productionPublishPermitted ? "true" : "false",
+            "result_scope": resultScope,
+            "test_calibration_override_applied":
+                testCalibrationOverrideApplied ? "true" : "false",
             "degradation_count": String(degradations.count),
             "degradation_reasons": degradations.map(\.code)
                 .joined(separator: ","),

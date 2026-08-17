@@ -68,6 +68,6 @@
 - 二维 HUD 忽略 ARKit 竖直高度；原始连续数据库仍保留三维运动。
 - 当前扫描绑定一个楼层，不支持楼梯、电梯或其他跨楼层过程。
 - 预定路线编辑和无条件全图搜索仍属于后续增强；当前只在持续 weak/lost 或可靠闭环后启用有界恢复。
-- 2026-08-10 的历史 unsigned iPhoneOS Debug/Release 编译证据仍保留，但当时“Debug 身份被移除”的行为已由 2026-08-17 version 4 合同取代。当前 Debug/Release 都必须输出 `build identity verified`，并由新的源码/host/Xcode 回归证明 Debug 可进入完整扫描；默认 Release Run 或 `RTABMapApp-QualifiedDevice` 安装后的触控 p50/p95、首次权限、后台/前台、完整扫描和设备热/内存表现仍需真机复测。
+- 2026-08-10 的历史 unsigned iPhoneOS Debug/Release 编译证据仍保留，但当时“Debug 身份被移除”的行为已由 2026-08-17 version 5 合同取代。当前 Debug/Release 都必须输出 `build identity verified`，身份绑定实际 source ref 和 tracked patch digest；Debug 可进入完整扫描、处理并生成 `COMPLETE/TEST` 最终成果。默认 Release Run 或 `RTABMapApp-QualifiedDevice` 安装后的触控 p50/p95、首次权限、后台/前台、完整扫描和设备热/内存表现仍需真机复测。
 - Xcode Debug Navigator 若显示主线程停在 `ViewController.updateState(state:)` 的文件断点，App 会表现为黑底、网格或残缺旧控件；删除/停用断点并 Continue 即可。该现象是调试器暂停，不属于 App 状态机恢复路径。
 - 真实 LiDAR iPhone 的 30 秒性能、照明/反光/斜视/多价签矩阵和完整现场确认尚未执行；低影响增强与明日测试见 [`ESL_CAPTURE_TODO.md`](ESL_CAPTURE_TODO.md) 与 [`MAPCASE02_TODO.md`](MAPCASE02_TODO.md)。当前不得宣称 ESL FIELD CAPTURE UX COMPLETE 或 Production Ready。

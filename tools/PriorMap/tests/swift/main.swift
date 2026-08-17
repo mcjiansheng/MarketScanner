@@ -11818,13 +11818,15 @@ catch {
 do {
     func permits(
         low: Int = 0, unpositioned: Int = 0, unassociated: Int = 0,
-        rescans: Int = 0, legacy: Int = 0, calibrationQualified: Bool = true
+        rescans: Int = 0, legacy: Int = 0,
+        calibrationAcceptedForResult: Bool = true
     ) -> Bool {
         MobileResultPublicationInvariant.permits(
             coordinatesArePriorMapFrame: true,
             graphQualityPassed: true,
             degradationCount: 0,
-            shelfLocalizationCalibrationQualified: calibrationQualified,
+            shelfLocalizationCalibrationAcceptedForResult:
+                calibrationAcceptedForResult,
             coordinateFrameAuditPassed: legacy == 0,
             legacyCoordinateFrameCount: legacy,
             lowConfidenceTagCount: low,
@@ -11839,8 +11841,29 @@ do {
     require(!permits(rescans: 1), "rescan task must block COMPLETE")
     require(!permits(legacy: 1), "legacy coordinate frame must block COMPLETE")
     require(
-        !permits(calibrationQualified: false),
-        "CALIBRATION_PENDING shelf evidence must block COMPLETE")
+        !permits(calibrationAcceptedForResult: false),
+        "unaccepted calibration evidence must block COMPLETE")
+    let debugPendingPolicy = MobileResultPublicationInvariant
+        .resultScopePolicy(
+            buildConfiguration: "debug",
+            productionEligible: false,
+            shelfLocalizationCalibrationStatus: "CALIBRATION_PENDING",
+            shelfLocalizationCalibrationQualified: false)
+    require(
+        debugPendingPolicy.resultScope == "TEST"
+            && debugPendingPolicy.calibrationAcceptedForResult
+            && debugPendingPolicy.testCalibrationOverrideApplied,
+        "Debug must run the complete result path with pending calibration")
+    let releasePendingPolicy = MobileResultPublicationInvariant
+        .resultScopePolicy(
+            buildConfiguration: "release",
+            productionEligible: true,
+            shelfLocalizationCalibrationStatus: "CALIBRATION_PENDING",
+            shelfLocalizationCalibrationQualified: false)
+    require(
+        !releasePendingPolicy.calibrationAcceptedForResult
+            && !releasePendingPolicy.testCalibrationOverrideApplied,
+        "Release must still require frozen calibration for production")
     let tamperedComplete: [String: Any] = [
         "result_quality_status": "COMPLETE",
         "publish_permitted": true,
@@ -11861,7 +11884,7 @@ do {
         "result_quality_status": "COMPLETE",
         "publish_permitted": true,
         "coordinate_contract_version": 2,
-        "publication_invariant_version": 2,
+        "publication_invariant_version": 3,
         "coordinate_frame_audit_passed": true,
         "legacy_tag_coordinate_frame_count": 0,
         "degradation_count": 0,
@@ -11871,11 +11894,31 @@ do {
         "rescan_count": 0,
         "shelf_localization_calibration_status": "CALIBRATION_PENDING",
         "shelf_localization_calibration_qualified": false,
+        "result_scope": "TEST",
+        "production_publish_permitted": false,
+        "test_calibration_override_applied": true,
+        "source_app_git_sha": String(repeating: "a", count: 40),
+        "source_build_configuration": "debug",
+        "source_working_tree_state": "clean",
+        "source_production_eligible": false,
+        "source_ref": "host-tests",
+        "source_patch_sha256":
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     ]
     require(
-        !MobileResultPublicationInvariant.manifestIsConsistent(
+        MobileResultPublicationInvariant.manifestIsConsistent(
             pendingCalibrationComplete),
-        "reader must reject COMPLETE while shelf calibration is pending")
+        "reader must retain a complete Debug TEST result while calibration is pending")
+    var forgedProduction = pendingCalibrationComplete
+    forgedProduction["result_scope"] = "PRODUCTION"
+    forgedProduction["source_build_configuration"] = "release"
+    forgedProduction["source_production_eligible"] = true
+    forgedProduction["test_calibration_override_applied"] = false
+    forgedProduction["production_publish_permitted"] = true
+    require(
+        !MobileResultPublicationInvariant.manifestIsConsistent(
+            forgedProduction),
+        "pending calibration must never be promoted to production publication")
 }
 
 // =====================================================================
@@ -14792,7 +14835,13 @@ do {
             storeID: "s1",
             floorID: "1",
             trackingSessionID: "E2E-SESSION",
-            appGitSHA: "e2e",
+            appGitSHA: String(repeating: "e", count: 40),
+            buildConfiguration: "debug",
+            workingTreeState: "clean",
+            sourceRef: "host-tests",
+            sourcePatchSHA256:
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            productionEligible: false,
             appVersion: "1.0",
             deviceModel: "host",
             osVersion: "macos",
@@ -14986,7 +15035,13 @@ do {
             storeID: "s1",
             floorID: "1",
             trackingSessionID: "E2E-SESSION",
-            appGitSHA: "e2e",
+            appGitSHA: String(repeating: "e", count: 40),
+            buildConfiguration: "debug",
+            workingTreeState: "clean",
+            sourceRef: "host-tests",
+            sourcePatchSHA256:
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            productionEligible: false,
             appVersion: "1.0",
             deviceModel: "host",
             osVersion: "macos",
@@ -15261,7 +15316,13 @@ do {
             storeID: "s1",
             floorID: "1",
             trackingSessionID: "E2E-SESSION",
-            appGitSHA: "e2e",
+            appGitSHA: String(repeating: "e", count: 40),
+            buildConfiguration: "debug",
+            workingTreeState: "clean",
+            sourceRef: "host-tests",
+            sourcePatchSHA256:
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            productionEligible: false,
             appVersion: "1.0",
             deviceModel: "host",
             osVersion: "macos",

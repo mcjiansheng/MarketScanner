@@ -865,7 +865,14 @@ class LocalizedVersionStoreTests(unittest.TestCase):
         )
         return authority
 
-    def write_valid_current_staging(self, *, revision: int = 1) -> Path:
+    def write_valid_current_staging(
+        self,
+        *,
+        revision: int = 1,
+        complete_scope: str | None = None,
+    ) -> Path:
+        if complete_scope not in {None, "TEST", "PRODUCTION"}:
+            raise ValueError("complete_scope must be TEST, PRODUCTION, or None")
         staging = self.write_valid_staging(revision=revision)
         prior_map_id = "prior-test"
         prior_map_package_sha = self.identity_hashes["prior_map_sha256"]
@@ -932,26 +939,42 @@ class LocalizedVersionStoreTests(unittest.TestCase):
         ) as handle:
             writer = csv.DictWriter(handle, fieldnames=second_fieldnames)
             writer.writeheader()
-            writer.writerow(
-                {
-                    "timestamp_unix_s": 1_700_000_000,
-                    "x_m": 0.0,
-                    "y_m": 0.0,
-                    "yaw_rad": 0.0,
-                    "position_status": "LOW_CONFIDENCE",
-                    "position_degradation_code": "",
-                }
-            )
-            writer.writerow(
-                {
-                    "timestamp_unix_s": 1_700_000_001,
-                    "x_m": "",
-                    "y_m": "",
-                    "yaw_rad": "",
-                    "position_status": "UNAVAILABLE",
-                    "position_degradation_code": "synthetic_gap",
-                }
-            )
+            if complete_scope is None:
+                writer.writerow(
+                    {
+                        "timestamp_unix_s": 1_700_000_000,
+                        "x_m": 0.0,
+                        "y_m": 0.0,
+                        "yaw_rad": 0.0,
+                        "position_status": "LOW_CONFIDENCE",
+                        "position_degradation_code": "",
+                    }
+                )
+                writer.writerow(
+                    {
+                        "timestamp_unix_s": 1_700_000_001,
+                        "x_m": "",
+                        "y_m": "",
+                        "yaw_rad": "",
+                        "position_status": "UNAVAILABLE",
+                        "position_degradation_code": "synthetic_gap",
+                    }
+                )
+            else:
+                for timestamp, x_m in (
+                    (1_700_000_000, 0.0),
+                    (1_700_000_001, 1.0),
+                ):
+                    writer.writerow(
+                        {
+                            "timestamp_unix_s": timestamp,
+                            "x_m": x_m,
+                            "y_m": 0.0,
+                            "yaw_rad": 0.0,
+                            "position_status": "AVAILABLE",
+                            "position_degradation_code": "",
+                        }
+                    )
         def file_entry(name: str, row_count: int) -> dict[str, object]:
             path = staging / name
             return {
@@ -962,7 +985,7 @@ class LocalizedVersionStoreTests(unittest.TestCase):
             }
         manifest = {
             "format": "MarketScannerCalibratedDeliverablesManifest",
-            "version": 1,
+            "version": 2,
             "input_identity_id": self.input_identity_id,
             "session_input_bundle_sha256": self.identity_hashes[
                 "session_input_bundle_sha256"
@@ -980,7 +1003,9 @@ class LocalizedVersionStoreTests(unittest.TestCase):
             "source_node_count": 2,
             "exported_node_count": 2,
             "one_second_row_count": 2,
-            "one_second_unavailable_count": 1,
+            "one_second_unavailable_count": (
+                1 if complete_scope is None else 0
+            ),
             "clock_unavailable_node_count": 0,
             "source_tag_count": 0,
             "retained_tag_count": 0,
@@ -989,9 +1014,20 @@ class LocalizedVersionStoreTests(unittest.TestCase):
             "shelf_associated_tag_count": 0,
             "unassociated_tag_count": 0,
             "low_confidence_tag_count": 0,
-            "result_quality_status": "PARTIAL_REVIEW_REQUIRED",
-            "publish_permitted": False,
-            "algorithm_degradation_codes": ["synthetic_low_confidence"],
+            "result_quality_status": (
+                "PARTIAL_REVIEW_REQUIRED"
+                if complete_scope is None
+                else "COMPLETE"
+            ),
+            "publish_permitted": complete_scope is not None,
+            "production_publish_permitted": complete_scope == "PRODUCTION",
+            "result_scope": complete_scope or "TEST",
+            "test_calibration_override_applied": complete_scope == "TEST",
+            "algorithm_degradation_codes": (
+                ["synthetic_low_confidence"]
+                if complete_scope is None
+                else []
+            ),
             "files": [
                 file_entry("calibrated_positions_by_node.csv", 2),
                 file_entry("calibrated_positions_1s.csv", 2),
@@ -1840,7 +1876,9 @@ class LocalizedVersionStoreTests(unittest.TestCase):
             self.store.current()
 
     def test_state_transitions_create_new_versions_and_publication_audit(self) -> None:
-        staging = self.write_valid_staging()
+        staging = self.write_valid_current_staging(
+            complete_scope="PRODUCTION"
+        )
         self.upgrade_to_final_trajectory_authority(staging)
         manifest = self.store.validate_staging(staging, parent_version=None)
         draft = self.store.commit(
@@ -1921,8 +1959,57 @@ class LocalizedVersionStoreTests(unittest.TestCase):
             (revoked.version_dir / "audit_log.jsonl").read_text(),
         )
 
+    def test_complete_test_result_is_retained_but_formal_publication_is_rejected(
+        self,
+    ) -> None:
+        staging = self.write_valid_current_staging(complete_scope="TEST")
+        self.upgrade_to_final_trajectory_authority(staging)
+        manifest = self.store.validate_staging(staging, parent_version=None)
+        self.store.commit(
+            staging,
+            manifest,
+            update_current=True,
+            local_input_record=self.local_input_record,
+        )
+        review = self.store.transition_current(
+            "review", actor="reviewer", reason="complete debug result"
+        )
+        artifacts = self.store.read_verified_artifacts(
+            review,
+            (
+                "calibrated_deliverables_manifest.json",
+                "calibrated_positions_by_node.csv",
+                "calibrated_positions_1s.csv",
+                "localized_price_tags.json",
+                "localized_price_tags.csv",
+            ),
+        )
+        deliverables = json.loads(
+            artifacts["calibrated_deliverables_manifest.json"].decode("utf-8")
+        )
+        self.assertEqual(deliverables["result_quality_status"], "COMPLETE")
+        self.assertEqual(deliverables["result_scope"], "TEST")
+        self.assertTrue(deliverables["publish_permitted"])
+        self.assertFalse(deliverables["production_publish_permitted"])
+        self.assertTrue(deliverables["test_calibration_override_applied"])
+        with self.assertRaisesRegex(
+            LocalizedStoreError, "COMPLETE PRODUCTION result scope"
+        ):
+            self.store.publish_current(
+                actor="publisher",
+                reason="test result must not become formal publication",
+                qualification_evidence_path=self.output / "unused-evidence.json",
+                expected_field_evidence_sha256="a" * 64,
+                expected_release_identity={},
+                expected_version=review.version_id,
+            )
+        self.assertEqual(self.store.current(), review)
+        self.assertIsNone(self.store.published())
+
     def test_publication_rejects_rehashed_forged_trajectory_metrics(self) -> None:
-        staging = self.write_valid_staging()
+        staging = self.write_valid_current_staging(
+            complete_scope="PRODUCTION"
+        )
         self.upgrade_to_final_trajectory_authority(staging)
         manifest = self.store.validate_staging(staging, parent_version=None)
         self.store.commit(

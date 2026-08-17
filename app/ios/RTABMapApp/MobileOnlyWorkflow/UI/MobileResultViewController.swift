@@ -78,9 +78,17 @@ final class MobileResultViewController: UIViewController, UITableViewDataSource,
             ?? "COMPLETE"
         let publish = StrictJSONScalar.boolean(
             entry.manifest["publish_permitted"]) ?? false
-        cell.textLabel?.text = publish
-            ? "\(entry.resultID) · 可发布"
-            : "\(entry.resultID) · 需要复核"
+        let productionPublish = StrictJSONScalar.boolean(
+            entry.manifest["production_publish_permitted"]) ?? publish
+        let scope = entry.manifest["result_scope"] as? String
+            ?? (productionPublish ? "PRODUCTION" : "TEST")
+        if productionPublish {
+            cell.textLabel?.text = "\(entry.resultID) · 生产结果"
+        } else if publish && scope == "TEST" {
+            cell.textLabel?.text = "\(entry.resultID) · 完整测试结果"
+        } else {
+            cell.textLabel?.text = "\(entry.resultID) · 需要复核"
+        }
         cell.textLabel?.textColor = .label
         let positions = StrictJSONScalar.integer(
             entry.manifest["coordinate_position_count"])

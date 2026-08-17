@@ -7812,6 +7812,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                             finalizationBuildIdentity.buildConfiguration,
                         appWorkingTreeState:
                             finalizationBuildIdentity.workingTreeState,
+                        appSourceRef:
+                            finalizationBuildIdentity.sourceRef,
+                        appSourcePatchSHA256:
+                            finalizationBuildIdentity.sourcePatchSHA256,
                         appProductionEligible:
                             finalizationBuildIdentity.productionEligible,
                         initialMapPose: scanSession.scanConfiguration.initialMapPose,
@@ -9285,6 +9289,8 @@ extension ViewController: MobileOnlyScanStarting {
                 "appGitSHA": buildIdentity.appGitSHA,
                 "buildConfiguration": buildIdentity.buildConfiguration,
                 "workingTreeState": buildIdentity.workingTreeState,
+                "sourceRef": buildIdentity.sourceRef,
+                "sourcePatchSHA256": buildIdentity.sourcePatchSHA256,
                 "productionEligible": buildIdentity.productionEligible
                     ? "true" : "false",
             ])

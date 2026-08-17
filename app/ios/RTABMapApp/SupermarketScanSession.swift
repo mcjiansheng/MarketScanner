@@ -90,6 +90,8 @@ struct ScanSegmentMetadata: Codable {
     let appGitSHA: String?
     let appBuildConfiguration: String?
     let appWorkingTreeState: String?
+    let appSourceRef: String?
+    let appSourcePatchSHA256: String?
     let appProductionEligible: Bool?
     let initialMapPose: PriorMapPose2D?
     let localizationTrace: String?

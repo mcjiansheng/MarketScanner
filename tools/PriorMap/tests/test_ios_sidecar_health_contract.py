@@ -170,7 +170,7 @@ class IOSLocalizationSidecarHealthContractTests(unittest.TestCase):
             "maximumBridgeLinks = 16",
             "Legacy aggregate counters did not bind native node pairs",
             "endpoints.insert(link.fromNodeID).inserted",
-            "CALIBRATION_PENDING remains an unconditional blocker",
+            "CALIBRATION_PENDING remains a production publication blocker",
         ):
             self.assertIn(token, evidence)
         self.assertIn("allowDuringFinalization: Bool = false", session)

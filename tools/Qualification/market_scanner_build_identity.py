@@ -13,13 +13,16 @@ Digest contract (byte-exact, frozen):
         b"market_scanner_factor_graph.h\\0"   + h_bytes
     )
 
-The embedded version-4 JSON carries the exact governance descriptor
+The embedded version-5 JSON carries the exact governance descriptor
 (`wave`, `branch`, `base_branch`, and its three SHA bindings), the app Git
 SHA (40 lowercase hex), the native-core SHA-256 (64 lowercase hex), and the
-build configuration / tracked-working-tree state. Debug and Release both
-receive a traceable identity and execute the same scan path. Release remains
-the only production-qualified configuration, while a dirty Debug build is
-explicitly labelled instead of being blocked from end-to-end testing.
+build configuration / tracked-working-tree state. It also records the actual
+checked-out source ref and a SHA-256 of the complete tracked diff against
+HEAD, so two dirty Debug builds cannot collapse to the same identity. Debug
+and Release both receive a traceable identity and execute the same scan path.
+Release remains the only production-qualified configuration, while a dirty
+Debug build is explicitly labelled instead of being blocked from end-to-end
+testing.
 Unknown, missing, duplicate, unsafe, or malformed fields fail closed.
 
 Usage:
@@ -39,7 +42,7 @@ import sys
 import tempfile
 
 FORMAT = "MarketScannerBuildIdentity"
-VERSION = 4
+VERSION = 5
 CPP_REL = os.path.join("core", "MarketScannerFactorGraph", "market_scanner_factor_graph.cpp")
 H_REL = os.path.join("core", "MarketScannerFactorGraph", "market_scanner_factor_graph.h")
 WAVE_REL = os.path.join(".github", "marketscanner-repair-v2-wave.json")
@@ -59,21 +62,20 @@ IDENTITY_KEYS = GOVERNANCE_KEYS | {
     "build_configuration",
     "working_tree_state",
     "production_eligible",
+    "source_ref",
+    "source_patch_sha256",
 }
 SAFE_GOVERNANCE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 LOWER_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 LOWER_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+SAFE_SOURCE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$")
 UNBOUND_SHA_PLACEHOLDERS = {
     "implementation_sha": "<CODE_CONTRACT_TEST_BUILD_SHA>",
     "validation_sha": "<EVIDENCE_DOCS_SHA>",
 }
 BUILD_CONFIGURATIONS = {"debug", "release"}
 WORKING_TREE_STATES = {"clean", "dirty"}
-TRACKED_DIRTY_EXCLUSIONS = (
-    ".github/marketscanner-repair-v2-wave.json",
-    "docs/mobile-only/",
-    "docs/map-assisted-localization/reviews/CURRENT_REVIEW.md",
-)
+EMPTY_PATCH_SHA256 = hashlib.sha256(b"").hexdigest()
 
 
 def fail(message: str) -> None:
@@ -106,15 +108,38 @@ def _tracked_dirty_lines(repo_root: str) -> list[str]:
         ).stdout.decode()
     except Exception:
         fail("git status failed")
-    return [
-        line for line in status.splitlines()
-        if line.strip()
-        and not line[3:].strip().startswith(TRACKED_DIRTY_EXCLUSIONS)
-    ]
+    return [line for line in status.splitlines() if line.strip()]
 
 
 def working_tree_state(repo_root: str) -> str:
     return "dirty" if _tracked_dirty_lines(repo_root) else "clean"
+
+
+def source_ref(repo_root: str) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
+            cwd=repo_root, check=False, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        fail("git symbolic-ref failed")
+    value = result.stdout.decode().strip() if result.returncode == 0 else "detached"
+    if not SAFE_SOURCE_REF_RE.fullmatch(value):
+        fail("source_ref is not a safe Git ref: %r" % value)
+    return value
+
+
+def source_patch_sha256(repo_root: str) -> str:
+    try:
+        payload = subprocess.run(
+            ["git", "diff", "--binary", "HEAD", "--"],
+            cwd=repo_root, check=True, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        ).stdout
+    except Exception:
+        fail("git diff HEAD failed")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def canonical_build_configuration(value: object) -> str:
@@ -238,6 +263,8 @@ def build_identity(
         "native_core_sha256": native_core_digest(repo_root),
         "build_configuration": configuration,
         "working_tree_state": tree_state,
+        "source_ref": source_ref(repo_root),
+        "source_patch_sha256": source_patch_sha256(repo_root),
         "production_eligible": (
             configuration == "release" and tree_state == "clean"
         ),
@@ -263,6 +290,17 @@ def validate_fields(identity: dict) -> None:
     digest = identity.get("native_core_sha256", "")
     if not isinstance(digest, str) or not LOWER_DIGEST_RE.fullmatch(digest):
         fail("native_core_sha256 not 64 lowercase hex: %r" % digest)
+    source_ref_value = identity.get("source_ref")
+    if (
+        not isinstance(source_ref_value, str)
+        or not SAFE_SOURCE_REF_RE.fullmatch(source_ref_value)
+    ):
+        fail("source_ref is not a safe Git ref: %r" % source_ref_value)
+    patch_digest = identity.get("source_patch_sha256")
+    if not isinstance(patch_digest, str) or not LOWER_DIGEST_RE.fullmatch(
+        patch_digest
+    ):
+        fail("source_patch_sha256 not 64 lowercase hex: %r" % patch_digest)
     configuration = identity.get("build_configuration")
     if configuration != canonical_build_configuration(configuration):
         fail("build_configuration must use canonical lowercase form")
@@ -271,6 +309,10 @@ def validate_fields(identity: dict) -> None:
         fail("working_tree_state must be clean or dirty: %r" % tree_state)
     if configuration == "release" and tree_state != "clean":
         fail("Release identity requires a clean tracked tree")
+    if tree_state == "clean" and patch_digest != EMPTY_PATCH_SHA256:
+        fail("clean identity requires the empty tracked-patch digest")
+    if tree_state == "dirty" and patch_digest == EMPTY_PATCH_SHA256:
+        fail("dirty identity requires a non-empty tracked-patch digest")
     production_eligible = identity.get("production_eligible")
     if type(production_eligible) is not bool:
         fail("production_eligible is not a Boolean")

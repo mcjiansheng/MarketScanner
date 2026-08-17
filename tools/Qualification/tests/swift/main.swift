@@ -77,7 +77,7 @@ func placeholderIdentity() -> MobileBuildIdentity {
     return MobileBuildIdentity(
         appGitSHA: String(repeating: "a", count: 40),
         wave: "mobile-only-v1-release-candidate-blocker-closeout",
-        branch: "mobile-only-v1-release-candidate-blocker-closeout",
+        branch: "fix.native-multilink-epoch-bridge",
         baseBranch: "mobile-only-v1r5-field-qualification-integrity-scale-closeout",
         baseSHA: String(repeating: "8", count: 40),
         implementationSHA: "<CODE_CONTRACT_TEST_BUILD_SHA>",
@@ -85,6 +85,9 @@ func placeholderIdentity() -> MobileBuildIdentity {
         nativeCoreSHA256: String(repeating: "b", count: 64),
         buildConfiguration: "release",
         workingTreeState: "clean",
+        sourceRef: "fix/native-multilink-epoch-bridge",
+        sourcePatchSHA256:
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         productionEligible: true)
 }
 
@@ -117,12 +120,14 @@ do {
 
     var debugDirty = debugClean
     debugDirty.workingTreeState = "dirty"
+    debugDirty.sourcePatchSHA256 = String(repeating: "c", count: 64)
     require(
         debugDirty.canStartScan && !debugDirty.isProductionQualified,
         "dirty Debug identity must remain scan-capable and auditable")
 
     var releaseDirty = bound
     releaseDirty.workingTreeState = "dirty"
+    releaseDirty.sourcePatchSHA256 = String(repeating: "c", count: 64)
     releaseDirty.productionEligible = false
     require(
         !releaseDirty.canStartScan && !releaseDirty.isProductionQualified,
@@ -139,6 +144,8 @@ do {
         ("native digest", { $0.nativeCoreSHA256 = String(repeating: "B", count: 64) }),
         ("configuration", { $0.buildConfiguration = "profile" }),
         ("tree state", { $0.workingTreeState = "unknown" }),
+        ("source ref", { $0.sourceRef = "unsafe ref" }),
+        ("source patch", { $0.sourcePatchSHA256 = String(repeating: "B", count: 64) }),
         ("eligibility consistency", { $0.productionEligible = false }),
     ]
     for (field, mutate) in invalidMutations {

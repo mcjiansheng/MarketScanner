@@ -132,13 +132,23 @@ final class MobileProcessingViewController: UIViewController,
                     ?? "COMPLETE"
                 let publish = StrictJSONScalar.boolean(
                     entry.manifest["publish_permitted"]) ?? false
+                let productionPublish = StrictJSONScalar.boolean(
+                    entry.manifest["production_publish_permitted"])
+                    ?? publish
+                let resultScope = entry.manifest["result_scope"] as? String
+                    ?? (productionPublish ? "PRODUCTION" : "TEST")
                 let positions = StrictJSONScalar.integer(
                     entry.manifest["coordinate_position_count"])
                     ?? StrictJSONScalar.integer(
                         entry.manifest["available_position_count"]) ?? 0
                 let tags = StrictJSONScalar.integer(
                     entry.manifest["tag_count"]) ?? 0
-                if publish {
+                if publish && resultScope == "TEST" {
+                    self.statusLabel.text =
+                        "完整测试结果已生成：已保留 \(positions) 条每秒坐标、"
+                        + "\(tags) 个价签；可查看和导出全部成果，"
+                        + "生产资格需使用 clean Release 与已冻结标定。"
+                } else if productionPublish {
                     self.statusLabel.text =
                         "处理完成：已保留 \(positions) 条每秒坐标、\(tags) 个价签。"
                 } else {

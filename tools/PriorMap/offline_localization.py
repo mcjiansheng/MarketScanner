@@ -249,6 +249,81 @@ def _shelf_localization_calibration_gate(
         return "NOT_APPLICABLE", True
     status = str(metadata.get("shelfLocalizationCalibrationStatus") or "MISSING")
     return status, status == "CALIBRATED"
+
+
+def _result_scope_policy(
+    metadata: dict[str, Any],
+    *,
+    calibration_status: str,
+    calibration_qualified: bool,
+) -> dict[str, Any]:
+    """Separate complete test results from production qualification.
+
+    A Debug session is allowed to exercise the exact production processing
+    path and use the explicitly-labelled CALIBRATION_PENDING starting values
+    to produce a complete TEST result. Production publication remains a
+    separate flag and still requires a clean Release identity plus calibrated
+    thresholds. Older/unbound sessions keep the conservative review behavior.
+    """
+
+    configuration = metadata.get("appBuildConfiguration")
+    working_tree_state = metadata.get("appWorkingTreeState")
+    app_git_sha = metadata.get("appGitSHA")
+    source_ref = metadata.get("appSourceRef")
+    source_patch_sha256 = metadata.get("appSourcePatchSHA256")
+    declared_production_eligible = metadata.get("appProductionEligible") is True
+    empty_patch_sha256 = hashlib.sha256(b"").hexdigest()
+    source_ref_valid = (
+        isinstance(source_ref, str)
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,254}", source_ref)
+        is not None
+    )
+    patch_valid = (
+        isinstance(source_patch_sha256, str)
+        and re.fullmatch(r"[0-9a-f]{64}", source_patch_sha256) is not None
+        and (
+            source_patch_sha256 == empty_patch_sha256
+            if working_tree_state == "clean"
+            else source_patch_sha256 != empty_patch_sha256
+        )
+    )
+    identity_consistent = (
+        isinstance(app_git_sha, str)
+        and re.fullmatch(r"[0-9a-f]{40}", app_git_sha) is not None
+        and configuration in {"debug", "release"}
+        and working_tree_state in {"clean", "dirty"}
+        and source_ref_valid
+        and patch_valid
+        and declared_production_eligible
+        == (configuration == "release" and working_tree_state == "clean")
+    )
+    production_eligible = bool(
+        identity_consistent and declared_production_eligible
+    )
+    debug_test_mode = (
+        identity_consistent
+        and not declared_production_eligible
+        and configuration == "debug"
+        and working_tree_state in {"clean", "dirty"}
+    )
+    test_override = (
+        debug_test_mode
+        and calibration_status == "CALIBRATION_PENDING"
+        and not calibration_qualified
+    )
+    return {
+        "result_scope": "PRODUCTION" if production_eligible else "TEST",
+        "source_app_git_sha": app_git_sha,
+        "source_build_configuration": configuration,
+        "source_working_tree_state": working_tree_state,
+        "source_production_eligible": production_eligible,
+        "source_ref": source_ref,
+        "source_patch_sha256": source_patch_sha256,
+        "test_calibration_override_applied": test_override,
+        "calibration_accepted_for_result": (
+            calibration_qualified or test_override
+        ),
+    }
 EDITABLE_TAG_FIELDS = frozenset(
     {
         "shelf_code",
@@ -7464,7 +7539,7 @@ def write_calibrated_deliverables_manifest(
         )
     manifest = {
         "format": "MarketScannerCalibratedDeliverablesManifest",
-        "version": 1,
+        "version": 2,
         "input_identity_id": report.get("input_identity_id"),
         "session_input_bundle_sha256": report.get(
             "session_input_bundle_sha256"
@@ -7501,6 +7576,13 @@ def write_calibrated_deliverables_manifest(
         ),
         "result_quality_status": report.get("result_quality_status"),
         "publish_permitted": report.get("publish_permitted") is True,
+        "production_publish_permitted": report.get(
+            "production_publish_permitted"
+        ) is True,
+        "result_scope": report.get("result_scope"),
+        "test_calibration_override_applied": report.get(
+            "test_calibration_override_applied"
+        ) is True,
         "algorithm_degradation_codes": report.get(
             "algorithm_degradation_codes", []
         ),
@@ -10552,7 +10634,13 @@ def _render_localized_version(
     report["shelf_localization_calibration_qualified"] = (
         shelf_calibration_qualified
     )
-    if not shelf_calibration_qualified:
+    result_scope_policy = _result_scope_policy(
+        metadata,
+        calibration_status=shelf_calibration_status,
+        calibration_qualified=shelf_calibration_qualified,
+    )
+    report.update(result_scope_policy)
+    if not result_scope_policy["calibration_accepted_for_result"]:
         publish_blockers.append(
             {
                 "code": "shelf_localization_calibration_pending",
@@ -10613,6 +10701,11 @@ def _render_localized_version(
         "blockers": publish_blockers,
     }
     report["publish_permitted"] = report["publish_gate"]["passed"]
+    report["production_publish_permitted"] = bool(
+        report["publish_permitted"]
+        and result_scope_policy["source_production_eligible"]
+        and shelf_calibration_qualified
+    )
     report["clock_evidence"] = {
         **input_snapshot.jsonl_diagnostics.get("clock_correlations.jsonl", {}),
         "degradation_codes": list(input_snapshot.clock_evidence.degradation_codes),
@@ -10623,6 +10716,12 @@ def _render_localized_version(
     if publish_blockers:
         report["result_quality_status"] = "PARTIAL_REVIEW_REQUIRED"
         report["partial_result"] = True
+    elif result_scope_policy["test_calibration_override_applied"]:
+        report["warnings"].append(
+            "Debug 测试构建已使用 CALIBRATION_PENDING 初值生成完整测试结果；"
+            "全部成果可查看和导出，但 production_publish_permitted=false，"
+            "正式生产资格仍需 clean Release 与现场冻结阈值。"
+        )
     if tag_evidence_degradations:
         report["warnings"].append(
             "部分价签 burst、节点绑定或确认材料不完整；轨迹和可恢复价签已保留，"
@@ -11034,6 +11133,13 @@ def _render_localized_version(
         "input_identity_id": input_identity_id,
         "result_quality_status": report.get("result_quality_status"),
         "publish_permitted": report.get("publish_permitted") is True,
+        "production_publish_permitted": report.get(
+            "production_publish_permitted"
+        ) is True,
+        "result_scope": report.get("result_scope"),
+        "test_calibration_override_applied": report.get(
+            "test_calibration_override_applied"
+        ) is True,
         "algorithm_degradation_codes": report.get(
             "algorithm_degradation_codes", []
         ),

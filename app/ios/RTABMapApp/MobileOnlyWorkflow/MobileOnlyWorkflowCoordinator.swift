@@ -1002,6 +1002,15 @@ final class MobileOnlyWorkflowCoordinator {
             floorID: floorID,
             trackingSessionID: trackingSessionID,
             appGitSHA: appGitSHA,
+            buildConfiguration: buildIdentity?.buildConfiguration
+                ?? "unknown",
+            workingTreeState: buildIdentity?.workingTreeState
+                ?? "unknown",
+            sourceRef: buildIdentity?.sourceRef ?? "unknown",
+            sourcePatchSHA256: buildIdentity?.sourcePatchSHA256
+                ?? "unknown",
+            productionEligible: buildIdentity?.productionEligible
+                ?? false,
             appVersion: appVersion,
             deviceModel: deviceModel,
             osVersion: osVersion,

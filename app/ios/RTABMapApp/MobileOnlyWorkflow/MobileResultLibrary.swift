@@ -8,13 +8,64 @@ import Foundation
 /// full processing pipeline translation unit.
 enum MobileResultPublicationInvariant {
     static let coordinateContractVersion = 2
-    static let publicationInvariantVersion = 2
+    static let publicationInvariantVersion = 3
+    private static let emptyPatchSHA256 =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+    struct ResultScopePolicy: Equatable {
+        var resultScope: String
+        var calibrationAcceptedForResult: Bool
+        var testCalibrationOverrideApplied: Bool
+    }
+
+    /// Debug executes the production processing path and may produce a
+    /// complete TEST result using the explicit CALIBRATION_PENDING starting
+    /// values. This keeps field/developer testing end-to-end while the
+    /// independent production flag remains false until a clean Release and
+    /// frozen calibration are both present.
+    static func resultScopePolicy(
+        buildConfiguration: String,
+        productionEligible: Bool,
+        shelfLocalizationCalibrationStatus: String,
+        shelfLocalizationCalibrationQualified: Bool
+    ) -> ResultScopePolicy {
+        let debugTestMode = buildConfiguration == "debug"
+            && !productionEligible
+        let overrideApplied = debugTestMode
+            && shelfLocalizationCalibrationStatus == "CALIBRATION_PENDING"
+            && !shelfLocalizationCalibrationQualified
+        return ResultScopePolicy(
+            resultScope: productionEligible ? "PRODUCTION" : "TEST",
+            calibrationAcceptedForResult:
+                shelfLocalizationCalibrationQualified || overrideApplied,
+            testCalibrationOverrideApplied: overrideApplied)
+    }
+
+    private static func isLowercaseHex(_ value: String, length: Int) -> Bool {
+        guard value.count == length else { return false }
+        return value.unicodeScalars.allSatisfy { scalar in
+            (scalar.value >= 0x30 && scalar.value <= 0x39)
+                || (scalar.value >= 0x61 && scalar.value <= 0x66)
+        }
+    }
+
+    private static func isSafeSourceRef(_ value: String) -> Bool {
+        guard !value.isEmpty, value.utf8.count <= 255 else { return false }
+        return value.unicodeScalars.enumerated().allSatisfy { index, scalar in
+            let alphanumeric = (scalar.value >= 0x30 && scalar.value <= 0x39)
+                || (scalar.value >= 0x41 && scalar.value <= 0x5A)
+                || (scalar.value >= 0x61 && scalar.value <= 0x7A)
+            if index == 0 { return alphanumeric }
+            return alphanumeric || scalar == "." || scalar == "_"
+                || scalar == "-" || scalar == "/"
+        }
+    }
 
     static func permits(
         coordinatesArePriorMapFrame: Bool,
         graphQualityPassed: Bool,
         degradationCount: Int,
-        shelfLocalizationCalibrationQualified: Bool,
+        shelfLocalizationCalibrationAcceptedForResult: Bool,
         coordinateFrameAuditPassed: Bool,
         legacyCoordinateFrameCount: Int,
         lowConfidenceTagCount: Int,
@@ -25,7 +76,7 @@ enum MobileResultPublicationInvariant {
         coordinatesArePriorMapFrame
             && graphQualityPassed
             && degradationCount == 0
-            && shelfLocalizationCalibrationQualified
+            && shelfLocalizationCalibrationAcceptedForResult
             && coordinateFrameAuditPassed
             && legacyCoordinateFrameCount == 0
             && lowConfidenceTagCount == 0
@@ -95,8 +146,61 @@ enum MobileResultPublicationInvariant {
         } else {
             calibrationQualified = true
         }
+        if publicationVersion >= 3 {
+            guard let resultScope = manifest["result_scope"] as? String,
+                  ["PRODUCTION", "TEST"].contains(resultScope),
+                  let buildConfiguration = manifest[
+                    "source_build_configuration"] as? String,
+                  ["debug", "release"].contains(buildConfiguration),
+                  let workingTreeState = manifest[
+                    "source_working_tree_state"] as? String,
+                  ["clean", "dirty"].contains(workingTreeState),
+                  let sourceProductionEligible = StrictJSONScalar.boolean(
+                    manifest["source_production_eligible"]),
+                  sourceProductionEligible
+                    == (buildConfiguration == "release"
+                        && workingTreeState == "clean"),
+                  resultScope
+                    == (sourceProductionEligible ? "PRODUCTION" : "TEST"),
+                  let testOverride = StrictJSONScalar.boolean(
+                    manifest["test_calibration_override_applied"]),
+                  let productionPublish = StrictJSONScalar.boolean(
+                    manifest["production_publish_permitted"]),
+                  let sourceSHA = manifest["source_app_git_sha"] as? String,
+                  isLowercaseHex(sourceSHA, length: 40),
+                  let sourceRef = manifest["source_ref"] as? String,
+                  isSafeSourceRef(sourceRef),
+                  let sourcePatchSHA = manifest[
+                    "source_patch_sha256"] as? String,
+                  isLowercaseHex(sourcePatchSHA, length: 64),
+                  workingTreeState == "clean"
+                    ? sourcePatchSHA == emptyPatchSHA256
+                    : sourcePatchSHA != emptyPatchSHA256 else {
+                return false
+            }
+            let calibrationStatus = manifest[
+                "shelf_localization_calibration_status"] as? String
+            let expectedOverride = buildConfiguration == "debug"
+                && !sourceProductionEligible
+                && calibrationStatus == "CALIBRATION_PENDING"
+                && !calibrationQualified
+            guard testOverride == expectedOverride else { return false }
+            let calibrationAccepted = calibrationQualified || testOverride
+            if publish && !calibrationAccepted { return false }
+            let expectedProductionPublish = publish
+                && sourceProductionEligible && calibrationQualified
+            guard productionPublish == expectedProductionPublish else {
+                return false
+            }
+        } else if publish && !calibrationQualified {
+            return false
+        }
         if publish {
-            return degradationCount == 0 && calibrationQualified
+            let calibrationAccepted = calibrationQualified
+                || publicationVersion >= 3
+                    && (StrictJSONScalar.boolean(manifest[
+                        "test_calibration_override_applied"]) ?? false)
+            return degradationCount == 0 && calibrationAccepted
                 && coordinateAuditPassed
                 && legacyCount == 0
                 && lowConfidenceCount == 0
@@ -338,6 +442,11 @@ enum MobileResultLibrary {
         "performance_sample_count", "performance_evidence_complete",
         "shelf_localization_calibration_status",
         "shelf_localization_calibration_qualified",
+        "result_scope", "production_publish_permitted",
+        "test_calibration_override_applied",
+        "source_app_git_sha", "source_build_configuration",
+        "source_working_tree_state", "source_production_eligible",
+        "source_ref", "source_patch_sha256",
     ]
 
     /// Test/embedding hook; see `MobileMapLibrary.rootOverride`.

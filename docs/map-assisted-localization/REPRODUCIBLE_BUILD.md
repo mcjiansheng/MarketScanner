@@ -25,13 +25,13 @@ macOS 使用 `tools/SupermarketMapStudio/configure_pc_macos.sh` 安装/发现 Ho
 
 ## iOS 内嵌 Build Identity
 
-`tools/Qualification/market_scanner_build_identity.py` 是 Xcode 脚本阶段、CI 和字节复核共用的唯一生成/验证入口。当前 `MarketScannerBuildIdentity` 为 version 4，必须精确包含 `format`、`version`、`app_git_sha`、`native_core_sha256`、`wave`、`branch`、`base_branch`、`base_sha`、`implementation_sha`、`validation_sha`、`build_configuration`、`working_tree_state`、`production_eligible`；多字段、少字段、JSON 重复 key 或任意字段格式错误均阻断构建/验证。
+`tools/Qualification/market_scanner_build_identity.py` 是 Xcode 脚本阶段、CI 和字节复核共用的唯一生成/验证入口。当前 `MarketScannerBuildIdentity` 为 version 5，必须精确包含 `format`、`version`、`app_git_sha`、`native_core_sha256`、`wave`、`branch`、`base_branch`、`base_sha`、`implementation_sha`、`validation_sha`、`build_configuration`、`working_tree_state`、`source_ref`、`source_patch_sha256`、`production_eligible`；多字段、少字段、JSON 重复 key 或任意字段格式错误均阻断构建/验证。
 
-`wave`、`branch`、`base_branch` 只接受 `^[a-z0-9][a-z0-9._-]{0,127}$`，当前 RC `mobile-only-v1-release-candidate-blocker-closeout` 是合法值，不得再用历史 `mobile-only-v1r4-` 前缀判断当前 wave。`app_git_sha`、`base_sha` 及已绑定的 implementation/validation SHA 必须是 40 位小写十六进制，`native_core_sha256` 必须是 64 位小写十六进制。implementation/validation 提交尚未产生时，Python 生成/治理验证阶段分别只允许精确占位符 `<CODE_CONTRACT_TEST_BUILD_SHA>` 和 `<EVIDENCE_DOCS_SHA>`；任意其他占位文本均 fail closed。Swift `MobileBuildIdentity` 可加载该 exact schema 供诊断，但运行时 `isUsable` 要求 implementation/validation 两个字段均已绑定为 40 位小写 SHA；包含任一占位符的 App 都不得进入 eligible processing session。
+`wave`、治理 `branch`、`base_branch` 只接受 `^[a-z0-9][a-z0-9._-]{0,127}$`；当前治理 branch 为 `fix.native-multilink-epoch-bridge`。动态 `source_ref` 单独记录实际 Git ref，可包含 `/`，不得把治理 branch 误解为 checkout ref。`app_git_sha`、`base_sha` 及已绑定的 implementation/validation SHA 必须是 40 位小写十六进制，`native_core_sha256` 与 `source_patch_sha256` 必须是 64 位小写十六进制。implementation/validation 提交尚未产生时，Python 生成/治理验证阶段分别只允许精确占位符 `<CODE_CONTRACT_TEST_BUILD_SHA>` 和 `<EVIDENCE_DOCS_SHA>`；任意其他占位文本均 fail closed。Swift `MobileBuildIdentity` 可加载该 exact schema 供诊断，但运行时 `isUsable` 要求 implementation/validation 两个字段均已绑定为 40 位小写 SHA；包含任一占位符的 App 都不得进入 eligible processing session。
 
 普通共享 `RTABMapApp` scheme 的 Run、Profile 和 Archive 使用 Release；Test 和 Analyze 使用 Debug。两个配置现在都执行同一个 build-identity 生成与验证阶段，并进入同一套真实扫描、存储、finalization、处理和结果代码。Debug 使用 `--allow-dirty` 仅表示允许把当前 tracked tree 状态记录为 `dirty`，身份固定为 `production_eligible=false`；它不是跳过字段/schema/native digest 验证。`MobileBuildIdentity.canStartScan` 对合法 Debug/Release 均为 true，`isProductionQualified` 只对 clean Release 为 true。
 
-功能测试可以手动选择 Debug：clean/dirty tracked tree 都会生成可用身份并允许完整扫描；配置页、`scan_events.jsonl` 和 finalized metadata 会保留构建配置、tree 状态和 production eligibility。真实性能、签名真机与现场资格仍应使用共享 `RTABMapApp` 默认 Run 或 `RTABMapApp-QualifiedDevice` 的 clean Release；Release 不使用 `--allow-dirty`，tracked 源码有未提交修改时构建继续失败。两种配置都要求治理 SHA、app SHA、native digest 和 exact schema 合法。
+功能测试可以手动选择 Debug：clean/dirty tracked tree 都会生成可用身份并允许完整扫描；配置页、`scan_events.jsonl` 和 finalized metadata 会保留构建配置、tree 状态、实际 `source_ref`、tracked patch SHA-256 和 production eligibility。`source_patch_sha256` 是 `git diff --binary HEAD --` 的字节摘要，clean tree 必须等于空内容 SHA-256，dirty tree 必须为非空摘要；因此同一 HEAD 上两组不同的未提交测试代码不会再共享同一身份。真实性能、签名真机与现场资格仍应使用共享 `RTABMapApp` 默认 Run 或 `RTABMapApp-QualifiedDevice` 的 clean Release；Release 不使用 `--allow-dirty`，任意 tracked 文件（包括治理描述和当前文档）有未提交修改时构建继续失败。两种配置都要求治理 SHA、app SHA、native digest 和 exact schema 合法。
 
 推荐真机步骤：
 
@@ -52,7 +52,7 @@ xcodebuild \
   clean build
 ```
 
-手动 Debug 与 Release Run 使用同一 target 和 Bundle ID；再次安装任一配置都会替换设备上的另一配置，但两者都应包含 version 4 build identity。若设备端报告身份缺失或损坏，说明构建阶段未执行、旧 App 未被替换或 bundle schema 不匹配，应 clean build 后重新安装。Debug 可用 `--allow-dirty` 生成明确标记的测试身份；Release、Profile、Archive 和 QualifiedDevice 仍严格拒绝脏 tracked tree。资格验证只认 `production_eligible=true` 的 clean Release，但 Debug 不再因此失去完整功能。
+手动 Debug 与 Release Run 使用同一 target 和 Bundle ID；再次安装任一配置都会替换设备上的另一配置，但两者都应包含 version 5 build identity。若设备端报告身份缺失或损坏，说明构建阶段未执行、旧 App 未被替换或 bundle schema 不匹配，应 clean build 后重新安装。Debug 可用 `--allow-dirty` 生成明确标记且具有 patch digest 的测试身份；Release、Profile、Archive 和 QualifiedDevice 仍拒绝脏 tracked tree。资格验证只认 `production_eligible=true` 的 clean Release，但 Debug 不再因此失去完整功能或最终测试成果。
 
 ## iOS native dependency cache
 

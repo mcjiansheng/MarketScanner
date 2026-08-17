@@ -1,6 +1,7 @@
 # MarketScanner current code-review entry point
 
-> Document status: **当前有效 / current and authoritative**. Last reconciled: 2026-08-14.
+> Document status: **当前有效 / current and authoritative**. Last reconciled: 2026-08-17.
+> Current implementation branch: `fix.native-multilink-epoch-bridge` (Git ref `fix/native-multilink-epoch-bridge`); Debug produces complete auditable TEST results while formal production publication remains separately gated.
 > Current aisle/shelf constrained-localization review input: `AISLE_SHELF_CONSTRAINED_LOCALIZATION_DESIGN_REVIEW_2026-08-14.md`; remediation record: [`../AISLE_SHELF_CONSTRAINED_LOCALIZATION_REMEDIATION_2026-08-14.md`](../AISLE_SHELF_CONSTRAINED_LOCALIZATION_REMEDIATION_2026-08-14.md).
 > Current external review input: `MarketScanner_Mobile_Only_V1R5_Second_Independent_Full_Code_Review_NO_GO.md`.
 > Current implementation input: `MarketScanner_Mobile_Only_V1_Release_Candidate_Blocker_Closeout_Prompt_V2.md`.
