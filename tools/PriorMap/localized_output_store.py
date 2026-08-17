@@ -18,6 +18,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from tools.PriorMap.localized_file_lock import FileLock, FileLockTimeout
+from tools.PriorMap.final_trajectory_authority import (
+    PROCESSING_CONTRACT_VERSION as FINAL_TRAJECTORY_PROCESSING_VERSION,
+    FinalTrajectoryAuthorityError,
+    validate_final_trajectory_bindings,
+)
 from tools.Qualification.qualification import (
     QualificationError,
     inspect_field_evidence,
@@ -804,7 +809,10 @@ class LocalizedVersionStore:
             # exact source manifest and must accept both frozen versions.
             "prior_map_manifest.json": ("MarketScannerPriorMap", {1, 2}),
             "source_manifest.json": ("MarketScannerLocalizedSourceManifest", 2),
-            "processing_manifest.json": ("MarketScannerLocalizedProcessing", 2),
+            "processing_manifest.json": (
+                "MarketScannerLocalizedProcessing",
+                {2, FINAL_TRAJECTORY_PROCESSING_VERSION},
+            ),
             "localization_constraints.json": ("MarketScannerOfflineLocalizationConstraints", 1),
             "localization_report.json": ("MarketScannerLocalizationReport", 1),
             "factor_graph_report.json": (
@@ -1018,6 +1026,46 @@ class LocalizedVersionStore:
         publish_gate = report.get("publish_gate")
         if not isinstance(solver, dict) or not isinstance(publish_gate, dict):
             raise LocalizedStoreError("Localized solver or publish gate is invalid.")
+        trajectory_geojson = parsed["optimized_map_trajectory.geojson"]
+        final_authority_marker_present = (
+            "final_trajectory_authority" in factor_graph
+            or any(
+                key.startswith("final_trajectory_")
+                for key in processing
+            )
+            or any(
+                key.startswith("final_trajectory_")
+                for key in solver
+            )
+            or any(
+                key.startswith("final_trajectory_")
+                for key in trajectory_geojson
+            )
+            or "final_trajectory_authority_v1"
+            in str(processing.get("algorithm_version") or "")
+        )
+        if (
+            final_authority_marker_present
+            and processing.get("version")
+            != FINAL_TRAJECTORY_PROCESSING_VERSION
+        ):
+            raise LocalizedStoreError(
+                "Final trajectory authority cannot be downgraded to a legacy contract."
+            )
+        final_trajectory_authority: dict[str, Any] | None = None
+        if processing.get("version") == FINAL_TRAJECTORY_PROCESSING_VERSION:
+            try:
+                final_trajectory_authority = validate_final_trajectory_bindings(
+                    trajectory_geojson=trajectory_geojson,
+                    factor_graph_report=factor_graph,
+                    localization_report=report,
+                    processing_manifest=processing,
+                    require_passed=state == "published",
+                )
+            except FinalTrajectoryAuthorityError as exc:
+                raise LocalizedStoreError(
+                    f"Final trajectory authority is invalid: {exc}"
+                ) from exc
         full_solver = (
             solver.get("type") == "relative_se2_factor_graph"
             and solver.get("full_factor_graph") is True
@@ -1044,7 +1092,15 @@ class LocalizedVersionStore:
                 "Localized solver capability differs from the native factor report."
             )
         if publish_gate.get("passed") is True and (
-            not full_solver or publish_gate.get("blockers") != []
+            not full_solver
+            or publish_gate.get("blockers") != []
+            or (
+                processing.get("version") == FINAL_TRAJECTORY_PROCESSING_VERSION
+                and (
+                    not isinstance(final_trajectory_authority, dict)
+                    or final_trajectory_authority.get("passed") is not True
+                )
+            )
         ):
             raise LocalizedStoreError(
                 "Localized publish gate cannot pass without a verified full factor graph."
@@ -1530,14 +1586,39 @@ class LocalizedVersionStore:
                 raise LocalizedStoreError("Only a review version can be published.")
             if expected_version is not None and current.version_id != expected_version:
                 raise LocalizedStoreError("Localized current version changed before publication.")
+            processing = self.read_verified_json(
+                current, "processing_manifest.json"
+            )
+            report = self.read_verified_json(
+                current, "localization_report.json"
+            )
+            factor_graph = self.read_verified_json(
+                current, "factor_graph_report.json"
+            )
+            trajectory_geojson = self.read_verified_json(
+                current, "optimized_map_trajectory.geojson"
+            )
+            if processing.get("version") != FINAL_TRAJECTORY_PROCESSING_VERSION:
+                raise LocalizedStoreError(
+                    "Publication requires final trajectory authority contract v3."
+                )
+            try:
+                validate_final_trajectory_bindings(
+                    trajectory_geojson=trajectory_geojson,
+                    factor_graph_report=factor_graph,
+                    localization_report=report,
+                    processing_manifest=processing,
+                    require_passed=True,
+                )
+            except FinalTrajectoryAuthorityError as exc:
+                raise LocalizedStoreError(
+                    f"Publication final trajectory authority is invalid: {exc}"
+                ) from exc
             active = self.published()
             if active is not None and active.state == "published":
                 raise LocalizedStoreError(
                     "An active published version already exists; revoke it before publishing again."
                 )
-            report = self.read_verified_json(
-                current, "localization_report.json"
-            )
             review_evidence_sha256 = hashlib.sha256(
                 self.read_verified_artifacts(
                     current, ("localized_review.json",)
@@ -1555,7 +1636,6 @@ class LocalizedVersionStore:
                     "Field qualification evidence changed after inspection."
                 )
             source = self.read_verified_json(current, "source_manifest.json")
-            factor_graph = self.read_verified_json(current, "factor_graph_report.json")
             quality = factor_graph.get("quality_policy") if isinstance(factor_graph, dict) else None
             if (
                 not isinstance(source, dict)

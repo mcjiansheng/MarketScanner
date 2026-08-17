@@ -17,6 +17,7 @@ import tools.PriorMap.localized_file_lock as localized_file_lock
 import tools.PriorMap.localized_output_store as localized_store
 import tools.Qualification.qualification as qualification
 
+from tools.PriorMap.final_trajectory_authority import attest_final_trajectory
 from tools.PriorMap.localized_file_lock import (
     FileLockError,
     PosixFileLock,
@@ -34,6 +35,7 @@ from tools.Qualification.qualification import (
     QualificationError,
     build_trajectory_qualification_evidence,
 )
+from tools.PriorMap.tests.test_factor_graph_schema import POLICY, valid_report
 
 
 def _canonical_sha(value: object) -> str:
@@ -198,13 +200,15 @@ def write_valid_field_evidence(
     release_git_sha: str,
     product_version: str,
     prior_map_sha256: str,
+    quality_policy_sha256: str = TEST_QUALITY_POLICY_SHA,
+    quality_policy_data: bytes = TEST_QUALITY_POLICY_DATA,
 ) -> tuple[str, dict[str, object]]:
     release_value: dict[str, object] = {
         "format": "MarketScannerReleaseManifest",
         "version": 2,
         "git_sha": release_git_sha,
         "product_version": product_version,
-        "factor_graph_quality_policy_sha256": TEST_QUALITY_POLICY_SHA,
+        "factor_graph_quality_policy_sha256": quality_policy_sha256,
     }
     release_value["manifest_body_sha256"] = _canonical_sha(release_value)
     release_data = json.dumps(release_value, sort_keys=True).encode("utf-8")
@@ -228,7 +232,7 @@ def write_valid_field_evidence(
             release_git_sha=release_git_sha,
             product_version=product_version,
             prior_map_sha256=prior_map_sha256,
-            quality_policy_sha256=TEST_QUALITY_POLICY_SHA,
+            quality_policy_sha256=quality_policy_sha256,
         )
         tag_stream = io.StringIO(newline="")
         tag_writer = csv.writer(tag_stream)
@@ -349,7 +353,7 @@ def write_valid_field_evidence(
         "releaseManifest": "release-manifest.json",
         "releaseManifestSha256": release_manifest_sha256,
         "qualityPolicy": "quality-policy.json",
-        "qualityPolicySha256": TEST_QUALITY_POLICY_SHA,
+        "qualityPolicySha256": quality_policy_sha256,
         "priorMapId": "prior-test",
         "priorMapSha256": prior_map_sha256,
         "siteId": "store-test",
@@ -366,7 +370,7 @@ def write_valid_field_evidence(
         release_name="release-manifest.json",
         release_data=release_data,
         policy_name="quality-policy.json",
-        policy_data=TEST_QUALITY_POLICY_DATA,
+        policy_data=quality_policy_data,
     )
     evidence: dict[str, object] = {
         "format": "MarketScannerFieldQualificationEvidence",
@@ -383,8 +387,8 @@ def write_valid_field_evidence(
         },
         "qualityPolicy": {
             "name": "quality-policy.json",
-            "bytes": len(TEST_QUALITY_POLICY_DATA),
-            "sha256": TEST_QUALITY_POLICY_SHA,
+            "bytes": len(quality_policy_data),
+            "sha256": quality_policy_sha256,
             "policyVersion": "test-frozen-1",
             "status": "frozen",
         },
@@ -748,6 +752,119 @@ class LocalizedVersionStoreTests(unittest.TestCase):
         )
         return staging
 
+    def upgrade_to_final_trajectory_authority(self, staging: Path) -> dict[str, object]:
+        factor_path = staging / "factor_graph_report.json"
+        authority_policy = {
+            **POLICY,
+            "policy_version": "test-frozen-1",
+        }
+        policy_document = json.dumps(
+            authority_policy, sort_keys=True, separators=(",", ":")
+        )
+        policy_sha256 = hashlib.sha256(
+            policy_document.encode("utf-8")
+        ).hexdigest()
+        factor_graph = valid_report()
+        factor_graph.update(
+            {
+                "input_identity_id": self.input_identity_id,
+                "optimized_database_sha256": self.identity_hashes[
+                    "optimized_database_sha256"
+                ],
+                "graph_quality_passed": True,
+                "published_capable": True,
+                "native_published_capable": True,
+                "quality_policy_limits": POLICY["limits"],
+                "quality_policy_document": policy_document,
+                "quality_policy": {
+                    "policy_format": authority_policy["format"],
+                    "policy_sha256": policy_sha256,
+                    "policy_version": "test-frozen-1",
+                    "policy_status": "frozen",
+                    "passed": True,
+                    "blockers": [],
+                },
+            }
+        )
+        authority = attest_final_trajectory(
+            factor_graph,
+            factor_graph["poses"],
+            post_solver="native_relative_se2",
+        )
+        self.assertTrue(authority["passed"])
+        factor_graph["final_trajectory_authority"] = authority
+        factor_path.write_text(
+            json.dumps(factor_graph, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        trajectory_path = staging / "optimized_map_trajectory.geojson"
+        trajectory = {
+            "type": "FeatureCollection",
+            "final_trajectory_authority_version": 1,
+            "final_trajectory_sha256": authority["trajectory_sha256"],
+            "final_trajectory_factor_set_sha256": authority[
+                "factor_set_sha256"
+            ],
+            "final_trajectory_factor_authority_passed": True,
+            "features": [
+                {
+                    "type": "Feature",
+                    "properties": {
+                        "layer": "prior_map_offline_optimized",
+                        "node_ids": [
+                            pose["node_id"] for pose in factor_graph["poses"]
+                        ],
+                        "yaws_rad": [
+                            pose["yaw"] for pose in factor_graph["poses"]
+                        ],
+                    },
+                    "geometry": {
+                        "type": "LineString",
+                        "coordinates": [
+                            [pose["x"], pose["y"]]
+                            for pose in factor_graph["poses"]
+                        ],
+                    },
+                }
+            ],
+        }
+        trajectory_path.write_text(
+            json.dumps(trajectory, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        report_path = staging / "localization_report.json"
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        report["solver"].update(
+            {
+                "factor_set_sha256": authority["factor_set_sha256"],
+                "final_trajectory_authority_version": 1,
+                "final_trajectory_sha256": authority["trajectory_sha256"],
+                "final_trajectory_factor_authority_passed": True,
+            }
+        )
+        report_path.write_text(
+            json.dumps(report, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        processing_path = staging / "processing_manifest.json"
+        processing = json.loads(processing_path.read_text(encoding="utf-8"))
+        processing.update(
+            {
+                "version": 3,
+                "factor_graph_quality_policy_sha256": policy_sha256,
+                "final_trajectory_authority_version": 1,
+                "final_trajectory_sha256": authority["trajectory_sha256"],
+                "final_trajectory_factor_set_sha256": authority[
+                    "factor_set_sha256"
+                ],
+                "final_trajectory_factor_authority_passed": True,
+            }
+        )
+        processing_path.write_text(
+            json.dumps(processing, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        return authority
+
     def write_valid_current_staging(self, *, revision: int = 1) -> Path:
         staging = self.write_valid_staging(revision=revision)
         prior_map_id = "prior-test"
@@ -1069,6 +1186,95 @@ class LocalizedVersionStoreTests(unittest.TestCase):
                 self.store.validate_staging(invalid, parent_version=None)
         finally:
             self.store.abort(invalid)
+
+    def test_processing_v3_binds_exact_final_trajectory_and_factor_inventory(
+        self,
+    ) -> None:
+        staging = self.write_valid_staging()
+        try:
+            authority = self.upgrade_to_final_trajectory_authority(staging)
+            manifest = self.store.validate_staging(staging, parent_version=None)
+            self.assertEqual(manifest["state"], "draft")
+            self.assertEqual(len(authority["trajectory_sha256"]), 64)
+        finally:
+            self.store.abort(staging)
+
+    def test_processing_v3_rejects_final_trajectory_or_factor_tampering(self) -> None:
+        mutations = {
+            "coordinate": (
+                "optimized_map_trajectory.geojson",
+                lambda payload: payload["features"][0]["geometry"][
+                    "coordinates"
+                ][1].__setitem__(0, 2.0),
+            ),
+            "yaw": (
+                "optimized_map_trajectory.geojson",
+                lambda payload: payload["features"][0]["properties"][
+                    "yaws_rad"
+                ].__setitem__(1, 0.25),
+            ),
+            "node_id": (
+                "optimized_map_trajectory.geojson",
+                lambda payload: payload["features"][0]["properties"][
+                    "node_ids"
+                ].__setitem__(1, 4),
+            ),
+            "report_hash": (
+                "processing_manifest.json",
+                lambda payload: payload.__setitem__(
+                    "final_trajectory_sha256", "0" * 64
+                ),
+            ),
+            "contract_downgrade": (
+                "processing_manifest.json",
+                lambda payload: payload.__setitem__("version", 2),
+            ),
+            "factor": (
+                "factor_graph_report.json",
+                lambda payload: payload["factors"][0]["measurement"].__setitem__(
+                    0, 2.0
+                ),
+            ),
+        }
+        for name, (artifact_name, mutate) in mutations.items():
+            with self.subTest(name=name):
+                staging = self.write_valid_staging()
+                try:
+                    self.upgrade_to_final_trajectory_authority(staging)
+                    path = staging / artifact_name
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    mutate(payload)
+                    path.write_text(
+                        json.dumps(payload, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(
+                        LocalizedStoreError, "Final trajectory authority"
+                    ):
+                        self.store.validate_staging(staging, parent_version=None)
+                finally:
+                    self.store.abort(staging)
+
+    def test_publish_operation_rejects_legacy_v2_without_final_authority(
+        self,
+    ) -> None:
+        draft = self.commit_valid()
+        review = self.store.transition_current(
+            "review", actor="reviewer", reason="legacy authority gate"
+        )
+        self.assertEqual(review.state, "review")
+        with self.assertRaisesRegex(
+            LocalizedStoreError, "authority contract v3"
+        ):
+            self.store.publish_current(
+                actor="publisher",
+                reason="must fail before qualification input",
+                qualification_evidence_path=self.output / "missing-evidence.json",
+                expected_field_evidence_sha256="a" * 64,
+                expected_release_identity={},
+                expected_version=review.version_id,
+            )
+        self.assertEqual(draft.version_id, "v000001")
 
     def rewrite_session_bundle(
         self,
@@ -1634,7 +1840,15 @@ class LocalizedVersionStoreTests(unittest.TestCase):
             self.store.current()
 
     def test_state_transitions_create_new_versions_and_publication_audit(self) -> None:
-        draft = self.commit_valid()
+        staging = self.write_valid_staging()
+        self.upgrade_to_final_trajectory_authority(staging)
+        manifest = self.store.validate_staging(staging, parent_version=None)
+        draft = self.store.commit(
+            staging,
+            manifest,
+            update_current=True,
+            local_input_record=self.local_input_record,
+        )
         review = self.store.transition_current(
             "review", actor="reviewer", reason="quality checks complete"
         )
@@ -1646,18 +1860,29 @@ class LocalizedVersionStoreTests(unittest.TestCase):
             )["publish_state"],
             "review",
         )
+        authority_factor_report = json.loads(
+            (review.version_dir / "factor_graph_report.json").read_text()
+        )
+        authority_quality_sha = authority_factor_report["quality_policy"][
+            "policy_sha256"
+        ]
+        authority_quality_data = authority_factor_report[
+            "quality_policy_document"
+        ].encode("utf-8")
         evidence_path = self.output / "field-evidence.json"
         evidence_sha, evidence = write_valid_field_evidence(
             evidence_path,
             release_git_sha="3" * 40,
             product_version="test",
             prior_map_sha256=self.identity_hashes["prior_map_sha256"],
+            quality_policy_sha256=authority_quality_sha,
+            quality_policy_data=authority_quality_data,
         )
         release_identity = {
             "release_manifest_sha256": evidence["releaseManifest"]["sha256"],
             "git_sha": "3" * 40,
             "product_version": "test",
-            "quality_policy_sha256": TEST_QUALITY_POLICY_SHA,
+            "quality_policy_sha256": authority_quality_sha,
         }
         published = self.store.publish_current(
             actor="publisher",
@@ -1697,16 +1922,35 @@ class LocalizedVersionStoreTests(unittest.TestCase):
         )
 
     def test_publication_rejects_rehashed_forged_trajectory_metrics(self) -> None:
-        self.commit_valid()
+        staging = self.write_valid_staging()
+        self.upgrade_to_final_trajectory_authority(staging)
+        manifest = self.store.validate_staging(staging, parent_version=None)
+        self.store.commit(
+            staging,
+            manifest,
+            update_current=True,
+            local_input_record=self.local_input_record,
+        )
         review = self.store.transition_current(
             "review", actor="reviewer", reason="quality checks complete"
         )
+        authority_factor_report = json.loads(
+            (review.version_dir / "factor_graph_report.json").read_text()
+        )
+        authority_quality_sha = authority_factor_report["quality_policy"][
+            "policy_sha256"
+        ]
+        authority_quality_data = authority_factor_report[
+            "quality_policy_document"
+        ].encode("utf-8")
         evidence_path = self.output / "forged-field-evidence.json"
         _evidence_sha, evidence = write_valid_field_evidence(
             evidence_path,
             release_git_sha="3" * 40,
             product_version="test",
             prior_map_sha256=self.identity_hashes["prior_map_sha256"],
+            quality_policy_sha256=authority_quality_sha,
+            quality_policy_data=authority_quality_data,
         )
         trajectory = evidence["runs"][0]["trajectoryEvidence"]
         assert isinstance(trajectory, dict)
@@ -1731,7 +1975,7 @@ class LocalizedVersionStoreTests(unittest.TestCase):
                     ],
                     "git_sha": "3" * 40,
                     "product_version": "test",
-                    "quality_policy_sha256": TEST_QUALITY_POLICY_SHA,
+                    "quality_policy_sha256": authority_quality_sha,
                 },
                 expected_version=review.version_id,
             )

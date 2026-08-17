@@ -45,6 +45,11 @@ from .localized_output_store import (
 )
 from .prior_map_schema import load_json, validate_package
 from .factor_graph_runner import FactorGraphRunnerError, run_relative_se2_factor_graph
+from .final_trajectory_authority import (
+    AUTHORITY_VERSION as FINAL_TRAJECTORY_AUTHORITY_VERSION,
+    PROCESSING_CONTRACT_VERSION as LOCALIZED_PROCESSING_CONTRACT_VERSION,
+    attest_final_trajectory,
+)
 from .generated_mobile_evidence_contracts import MOBILE_EVIDENCE_CONTRACTS
 from .corridor_route_matcher import (
     RouteAnchor,
@@ -6683,6 +6688,7 @@ def _trajectory_geojson(
     baseline: Sequence[Pose],
     optimized: Sequence[Pose],
     online: Sequence[dict[str, Any]],
+    final_trajectory_authority: dict[str, Any],
 ) -> dict[str, Any]:
     online_points = [
         pose
@@ -6743,7 +6749,20 @@ def _trajectory_geojson(
                 },
             },
         )
-    return {"type": "FeatureCollection", "features": features}
+    return {
+        "type": "FeatureCollection",
+        "final_trajectory_authority_version": FINAL_TRAJECTORY_AUTHORITY_VERSION,
+        "final_trajectory_sha256": final_trajectory_authority.get(
+            "trajectory_sha256"
+        ),
+        "final_trajectory_factor_set_sha256": final_trajectory_authority.get(
+            "factor_set_sha256"
+        ),
+        "final_trajectory_factor_authority_passed": (
+            final_trajectory_authority.get("passed") is True
+        ),
+        "features": features,
+    }
 
 
 def manual_anchor_statuses(
@@ -9613,6 +9632,35 @@ def _render_localized_version(
                 "reason": "no_connected_collision_free_route_hypothesis",
             }
 
+    if corridor_route_audit.get("status") in {"matched", "matched_low_confidence"}:
+        final_trajectory_post_solver = (
+            "gauge_neutral_motion_plus_corridor_envelope_correction_v2"
+        )
+    elif full_factor_graph:
+        final_trajectory_post_solver = "native_relative_se2"
+    elif continuity_fallback_reason:
+        final_trajectory_post_solver = "bounded_correction_field_banded_v3"
+    else:
+        final_trajectory_post_solver = "bounded_draft_fallback"
+    final_trajectory_authority = attest_final_trajectory(
+        factor_graph_report,
+        optimized,
+        post_solver=final_trajectory_post_solver,
+    )
+    factor_graph_published_capable = (
+        factor_graph_published_capable
+        and final_trajectory_authority.get("passed") is True
+    )
+    factor_graph_report = {
+        **factor_graph_report,
+        "native_published_capable": factor_graph_report.get(
+            "native_published_capable",
+            factor_graph_report.get("published_capable") is True,
+        ),
+        "published_capable": factor_graph_published_capable,
+        "final_trajectory_authority": final_trajectory_authority,
+    }
+
     elements_payload = load_json(prior_map / "elements.json")
     elements = elements_payload.get("elements", []) if isinstance(elements_payload, dict) else []
     final_tags: list[dict[str, Any]] = []
@@ -10242,6 +10290,15 @@ def _render_localized_version(
             "continuity_fallback_reason": continuity_fallback_reason,
             "native_solver": factor_graph_report.get("solver"),
             "factor_set_sha256": factor_graph_report.get("factor_set_sha256"),
+            "final_trajectory_authority_version": (
+                FINAL_TRAJECTORY_AUTHORITY_VERSION
+            ),
+            "final_trajectory_sha256": final_trajectory_authority.get(
+                "trajectory_sha256"
+            ),
+            "final_trajectory_factor_authority_passed": (
+                final_trajectory_authority.get("passed") is True
+            ),
             "huber_translation_m": HUBER_TRANSLATION_M,
             "huber_yaw_deg": math.degrees(HUBER_YAW_RAD),
             "relative_trajectory_authority": relative_trajectory_authority,
@@ -10540,6 +10597,17 @@ def _render_localized_version(
                 "value": quality_blockers if isinstance(quality_blockers, list) else [],
             },
         )
+    if (
+        full_factor_graph
+        and final_trajectory_authority.get("passed") is not True
+    ):
+        publish_blockers.insert(
+            0,
+            {
+                "code": "final_trajectory_factor_authority_not_passed",
+                "value": final_trajectory_authority.get("blockers", []),
+            },
+        )
     report["publish_gate"] = {
         "passed": factor_graph_published_capable and not publish_blockers,
         "blockers": publish_blockers,
@@ -10645,7 +10713,7 @@ def _render_localized_version(
         output / "processing_manifest.json",
         {
             "format": "MarketScannerLocalizedProcessing",
-            "version": 2,
+            "version": LOCALIZED_PROCESSING_CONTRACT_VERSION,
             "input_identity_id": input_identity_id,
             "session_input_bundle_sha256": expected_bundle_sha256,
             "session_input_manifest_version": input_manifest_version,
@@ -10683,15 +10751,31 @@ def _render_localized_version(
             "factor_graph_quality_policy_version": (
                 factor_graph_report.get("quality_policy") or {}
             ).get("policy_version"),
+            "final_trajectory_authority_version": (
+                FINAL_TRAJECTORY_AUTHORITY_VERSION
+            ),
+            "final_trajectory_sha256": final_trajectory_authority.get(
+                "trajectory_sha256"
+            ),
+            "final_trajectory_factor_set_sha256": (
+                final_trajectory_authority.get("factor_set_sha256")
+            ),
+            "final_trajectory_factor_authority_passed": (
+                final_trajectory_authority.get("passed") is True
+            ),
             "tool_version": TOOL_VERSION,
             "algorithm_version": (
-                "relative_se2_factor_graph_v2"
+                "relative_se2_factor_graph_final_trajectory_authority_v1"
                 if full_factor_graph
                 else (
-                    "gauge_neutral_corridor_envelope_correction_v2"
+                    "gauge_neutral_corridor_envelope_correction_"
+                    "final_trajectory_authority_v1"
                     if corridor_route_audit.get("status")
                     in {"matched", "matched_low_confidence"}
-                    else "bounded_correction_field_banded_v3"
+                    else (
+                        "bounded_correction_field_banded_"
+                        "final_trajectory_authority_v1"
+                    )
                 )
             ),
             "coordinate_contract_version": COORDINATE_CONTRACT_VERSION,
@@ -10716,7 +10800,9 @@ def _render_localized_version(
         },
     )
     _json_write(output / "online_localization_trace.json", trace)
-    trajectory_payload = _trajectory_geojson(baseline, optimized, trace)
+    trajectory_payload = _trajectory_geojson(
+        baseline, optimized, trace, final_trajectory_authority
+    )
     _json_write(output / "optimized_map_trajectory.geojson", trajectory_payload)
     _json_write(
         output / "localization_constraints.json",

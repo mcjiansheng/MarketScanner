@@ -333,7 +333,11 @@ def run_relative_se2_factor_graph(
     ):
         raise FactorGraphRunnerError("Factor graph robust hard gates are invalid.")
     try:
-        quality_policy, quality_policy_sha256 = load_quality_policy(quality_policy_path)
+        (
+            quality_policy,
+            quality_policy_sha256,
+            quality_policy_document,
+        ) = load_quality_policy(quality_policy_path)
     except ValueError as exc:
         raise FactorGraphRunnerError(str(exc)) from exc
     selected, rejected = _select_absolute_priors(
@@ -490,6 +494,12 @@ def run_relative_se2_factor_graph(
     ]
     report = {
         **report,
+        # Freeze the exact limits used to validate the native result.  The
+        # final exported trajectory authority reuses these values instead of
+        # introducing a second, potentially drifting threshold set.
+        "quality_policy_limits": dict(limits),
+        "quality_policy_document": quality_policy_document,
+        "native_published_capable": report.get("published_capable") is True,
         "absolute_constraint_count": len(selected),
         "absolute_constraint_rejected_count": len(rejected),
         "absolute_prior_uncertainty_schema": "translation_sigma_m_and_yaw_sigma_rad_v2",

@@ -37,10 +37,13 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def load_quality_policy(path: Path = DEFAULT_POLICY_PATH) -> tuple[dict[str, Any], str]:
+def load_quality_policy(
+    path: Path = DEFAULT_POLICY_PATH,
+) -> tuple[dict[str, Any], str, str]:
     try:
         raw = path.read_bytes()
-        value = json.loads(raw)
+        document = raw.decode("utf-8")
+        value = json.loads(document)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise FactorGraphQualityError("factor graph quality policy is unreadable") from exc
     if (
@@ -81,7 +84,7 @@ def load_quality_policy(path: Path = DEFAULT_POLICY_PATH) -> tuple[dict[str, Any
         raise FactorGraphQualityError("high residual loop ratio must be within [0, 1]")
     if not 0.0 <= float(limits["minimum_objective_improvement_ratio"]) <= 1.0:
         raise FactorGraphQualityError("objective improvement ratio must be within [0, 1]")
-    return value, hashlib.sha256(raw).hexdigest()
+    return value, hashlib.sha256(raw).hexdigest(), document
 
 
 def evaluate_graph_quality(

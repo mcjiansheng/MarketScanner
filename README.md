@@ -1,6 +1,6 @@
 # RTAB-Map 大型超市扫描与地图工作台
 
-> 文档状态：**当前有效**。最后一次与源码交叉核对日期：2026-08-15。
+> 文档状态：**当前有效**。最后一次与源码交叉核对日期：2026-08-17。
 
 本项目是在开源 **RTAB-Map** 基础上进行的业务化改造，面向大型超市、仓储卖场等室内场景，形成从 iPhone Pro 连续采集，到 PC 端离线优化，再到二维地图、彩色俯视图和三维预览的一套本地工作流。
 
@@ -72,6 +72,8 @@ Android 目录中的部分 C++ 原生实现也因共享移动渲染和数据库�
 长距离累计漂移后的手机人工重选位置按“严格绑定的绝对地图锚点”处理，而不是手机物理瞬移。更重要的是，`localization_trace.rawPose` 本身已经经过当时可变的 ARKit→地图 alignment 投影，自动结构校正、人工重定位和坐标 epoch 重置都会改变这个 map gauge。PC 因而先从相邻 `rawPose` 相对运动恢复 gauge-neutral 物理轨迹：自动 correction 后以下一帧相对前一帧 `estimatedPose` 计算增量，人工重定位后的首个 post-reset sample 物理位移记为零；人工锚点只改变整条连续路线在地图中的放置，不制造相邻节点跳变。恢复结果按数据库节点时间戳重采样，保留手机真实相对运动、回头和 U-turn。手机 v3/exact-node/身份与时间证据，以及 PC 从不可变复核轨迹重新验证唯一 exact node/time/floor/coordinate-contract/bounds 的锚点，都是约 3 米平移、20°航向不确定度的可信地图证据；旧 v2、历史 timestamp-only 或无 exact binding 的事件仍受兼容门约束。若 RTAB‑Map 全局图不完整，完整、有限、时间有序的原始轨迹仍可进入明确禁止发布的诊断草稿；原始数据库始终只读。
 
 长距离轨迹不再先使用通道方向场做整体旋转，也不再逐点吸附最近通道。PC 使用 gauge-neutral 物理移动、严格人工绝对锚点、`road_graph` 连通性以及货架/固定结构多边形的自由空间硬约束，执行全局道路身份序列匹配；有限道路边、真实路口和可达转移只回答“处于哪条通道、何时可以换到相邻通道”，道路中心线不是手机位置观测。最终 X/Y 保留优化手机位姿的局部曲线、横向偏移、停顿、回头和 U-turn；exact 人工锚点的平移残差按物理里程连续传播，自由空间只施加低频最小修正。只有点落入结构或相邻线段穿越货架时，才使用货架边界驱动的最近安全侧、局部刚体平移和经碰撞验证的修正渐变；任何步骤都不得把坐标或 yaw 改写成道路中心/切线。周期性平行通道无法唯一确定、绝对修正过大或少数修正梯度无法在不穿架的条件下继续摊平时，完整 CSV、价签、预览和审计仍保留并标记 `LOW_CONFIDENCE` / `PARTIAL_REVIEW_REQUIRED`，只关闭发布资格。`optimized_map_trajectory.geojson` 显式保存每个节点的 `yaws_rad`；节点级/本地时间秒级 CSV 的 yaw 始终来自优化后的手机位姿。
+
+native 因子图和 corridor/free-space 后处理不再证明不同的轨迹。后处理完成后，PC 对最终导出的严格递增 node ID、X/Y/yaw 清单计算 canonical SHA-256，并使用 native 报告中的同一 canonical factor inventory 重新计算全部相对、闭环、绝对/货架因子残差和加权目标；质量阈值只接受与 release policy 原文 SHA-256 完全一致的文档。localized processing contract v3 在 `processing_manifest.json`、`localization_report.json`、`factor_graph_report.json` 和 `optimized_map_trajectory.geojson` 之间重复绑定最终轨迹 SHA、factor-set SHA 和 authority 结论。任一坐标、yaw、node ID、factor、policy limits 或跨文件绑定不一致都会关闭 publish gate；历史 v2 localized version 继续只读兼容，但不能重新执行发布操作。
 
 地图辅助处理的四个核心业务表直接写入不可变 localized version：`calibrated_positions_by_node.csv`、`calibrated_positions_1s.csv`、`localized_price_tags.json` 和 `localized_price_tags.csv`，并由 `calibrated_deliverables_manifest.json` 对源节点数、导出节点数、源价签数、保留价签数、逐文件字节数和 SHA‑256 做核账。生成核心表与“是否允许自动发布”是两个独立决定：平行通道多解、局部时钟绑定缺口、部分优化图恢复、价签位置/货架关联不完整等普通算法退化会保留完整草稿并关闭 publish gate，不会删除节点、价签或整个版本。无法确定的坐标留空并标记 `UNAVAILABLE` / `LOW_CONFIDENCE`，禁止伪造 `(0,0)`。
 

@@ -135,6 +135,9 @@ class FactorGraphRunnerTests(unittest.TestCase):
         self.assertEqual(len(accepted), 1)
         self.assertEqual(rejected, [])
         self.assertEqual(report["initial_map_pose_constraint_count"], 1)
+        self.assertEqual(report["quality_policy_limits"], POLICY["limits"])
+        self.assertEqual(json.loads(report["quality_policy_document"]), POLICY)
+        self.assertFalse(report["native_published_capable"])
         self.assertIn("--loop-quarantine-translation-m", command)
         self.assertEqual(
             command[command.index("--loop-quarantine-translation-m") + 1],

@@ -1285,7 +1285,14 @@ class RobustSE2OptimizerTests(unittest.TestCase):
             Pose(3, 3.0, 2.0, 0.0, 1.25),
         ]
         trajectory = offline_localization._trajectory_geojson(
-            baseline, baseline, []
+            baseline,
+            baseline,
+            [],
+            {
+                "trajectory_sha256": "a" * 64,
+                "factor_set_sha256": "b" * 64,
+                "passed": True,
+            },
         )
         bounded = offline_localization._bounded_review_trajectory(
             trajectory, maximum_points_per_layer=2
@@ -1304,6 +1311,11 @@ class RobustSE2OptimizerTests(unittest.TestCase):
             [Pose(1, 1.0, 0.0, 0.0, 0.5)],
             [Pose(1, 1.0, 0.0, 0.0, 0.5)],
             [],
+            {
+                "trajectory_sha256": "a" * 64,
+                "factor_set_sha256": "b" * 64,
+                "passed": True,
+            },
         )
         feature = next(
             item
@@ -1347,6 +1359,11 @@ class RobustSE2OptimizerTests(unittest.TestCase):
                 [Pose(1, 1.0, 0.0, 0.0, 0.25), Pose(2, 2.0, 1.0, 0.0, 0.5)],
                 [Pose(1, 1.0, 0.0, 0.0, 0.25), Pose(2, 2.0, 1.0, 0.0, 0.5)],
                 [],
+                {
+                    "trajectory_sha256": "a" * 64,
+                    "factor_set_sha256": "b" * 64,
+                    "passed": True,
+                },
             )
             report = {
                 "prior_map_id": "map",
@@ -3252,7 +3269,7 @@ class LocalizedPipelineTests(unittest.TestCase):
         )
         self.assertEqual(session_input_bundle_sha256(session_input), session_input["bundle_sha256"])
         self.assertEqual(source_manifest["version"], 2)
-        self.assertEqual(processing_manifest["version"], 2)
+        self.assertEqual(processing_manifest["version"], 3)
         self.assertEqual(manual_edits["version"], 4)
         self.assertEqual(
             {
