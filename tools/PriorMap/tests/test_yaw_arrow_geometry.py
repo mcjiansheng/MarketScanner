@@ -279,6 +279,14 @@ class YawArrowGeometryGolden(unittest.TestCase):
         self.assertIn("shelfEvidenceCandidateLimit:", host)
         self.assertIn("computeShelfGeometryEvidence:", host)
         self.assertIn("latestShelfGeometryCandidates.removeAll()", overlay)
+        self.assertIn("safeCandidates.prefix(evidenceCandidateLimit)", overlay)
+        self.assertNotIn("candidates.prefix(3)", overlay)
+        self.assertIn(
+            "if let selected = roadEvidence.first, selected.topologyReachable",
+            overlay,
+        )
+        self.assertIn("nodeID == pending.endNodeID", host)
+        self.assertIn("observationNodeCount: completed.sampleCount", host)
 
     def test_start_yaw_reaches_initial_map_pose_without_conversion(self) -> None:
         setup = (

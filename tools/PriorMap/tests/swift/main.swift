@@ -20049,13 +20049,17 @@ do {
         id: String,
         side: String,
         normal: ShelfFaceNormal,
-        nodeStart: Int64
+        nodeStart: Int64,
+        nodeEnd: Int64? = nil,
+        observationNodeCount: Int = 5,
+        dynamicRejectionCount: Int = 1
     ) -> ShelfObservationWindowRecord {
         ShelfObservationWindowRecord(
             format: ShelfObservationWindowRecord.formatName,
             version: ShelfLocalizationPolicy.contractVersion,
             trackingSessionID: sessionID, sequence: sequence,
-            windowID: id, nodeRange: [nodeStart, nodeStart + 4],
+            windowID: id,
+            nodeRange: [nodeStart, nodeEnd ?? nodeStart + 4],
             timeRange: [Double(nodeStart), Double(nodeStart) + 2],
             epoch: 1, component: 0, side: side,
             faceNormalMap: normal,
@@ -20063,11 +20067,13 @@ do {
                 ShelfCandidateEvidence(shelfSegmentID: "shelf-12", score: 0.9),
                 ShelfCandidateEvidence(shelfSegmentID: "shelf-14", score: 0.5),
             ],
+            observationNodeCount: observationNodeCount,
             geometry: ShelfWindowGeometryEvidence(
                 sampleCount: 20, inlierCount: 17, inlierRatio: 0.85,
                 residualMedianM: 0.2, residualMaximumM: 0.3),
             coverageAngleRad: 1.9, endcapVisible: false,
-            dynamicRejectionCount: 1, priorMapSHA256: shaA,
+            dynamicRejectionCount: dynamicRejectionCount,
+            priorMapSHA256: shaA,
             distanceFieldSHA256: shaB, writeWatermark: sequence)
     }
     let firstWindow = shelfWindow(
@@ -20097,22 +20103,28 @@ do {
         writeWatermark: 1)
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.sortedKeys]
-    func writeJSONL<T: Encodable>(_ values: [T], name: String) throws {
+    func writeJSONL<T: Encodable>(
+        _ values: [T], name: String, directory: URL
+    ) throws {
         var payload = Data()
         for value in values {
             payload.append(try encoder.encode(value))
             payload.append(0x0a)
         }
         try payload.write(
-            to: evidenceDirectory.appendingPathComponent(name),
+            to: directory.appendingPathComponent(name),
             options: .atomic)
     }
     try writeJSONL([PoseEpochTransitionRecord](),
-                   name: PoseEpochTransitionRecord.fileName)
-    try writeJSONL([corridor], name: CorridorHypothesesRecord.fileName)
+                   name: PoseEpochTransitionRecord.fileName,
+                   directory: evidenceDirectory)
+    try writeJSONL([corridor], name: CorridorHypothesesRecord.fileName,
+                   directory: evidenceDirectory)
     try writeJSONL([firstWindow, secondWindow],
-                   name: ShelfObservationWindowRecord.fileName)
-    try writeJSONL([loop], name: ShelfLoopEventRecord.fileName)
+                   name: ShelfObservationWindowRecord.fileName,
+                   directory: evidenceDirectory)
+    try writeJSONL([loop], name: ShelfLoopEventRecord.fileName,
+                   directory: evidenceDirectory)
     let summary = try ShelfLocalizationEvidenceParser.validateBundle(
         directory: evidenceDirectory, trackingSessionID: sessionID,
         poseEpochTransitionCount: 0, corridorHypothesisCount: 1,
@@ -20122,6 +20134,60 @@ do {
             && summary.shelfObservationWindowCount == 2
             && summary.shelfLoopEventCount == 1,
         "manifest-v5 Swift parser must accept a valid two-sided shelf loop")
+
+    func requireShelfBundleRejection(
+        directoryName: String,
+        windows: [ShelfObservationWindowRecord],
+        loop: ShelfLoopEventRecord,
+        message: String
+    ) throws {
+        let directory = try p7r6FreshDirectory(directoryName)
+        try writeJSONL([PoseEpochTransitionRecord](),
+                       name: PoseEpochTransitionRecord.fileName,
+                       directory: directory)
+        try writeJSONL([corridor], name: CorridorHypothesesRecord.fileName,
+                       directory: directory)
+        try writeJSONL(windows, name: ShelfObservationWindowRecord.fileName,
+                       directory: directory)
+        try writeJSONL([loop], name: ShelfLoopEventRecord.fileName,
+                       directory: directory)
+        var rejected = false
+        do {
+            _ = try ShelfLocalizationEvidenceParser.validateBundle(
+                directory: directory, trackingSessionID: sessionID,
+                poseEpochTransitionCount: 0, corridorHypothesisCount: 1,
+                shelfObservationWindowCount: 2, shelfLoopEventCount: 1)
+        }
+        catch {
+            rejected = true
+        }
+        require(rejected, message)
+    }
+    let unboundLoop = ShelfLoopEventRecord(
+        format: loop.format, version: loop.version,
+        trackingSessionID: loop.trackingSessionID, sequence: loop.sequence,
+        shelfSegmentID: loop.shelfSegmentID, windowIDs: loop.windowIDs,
+        sides: loop.sides, epoch: loop.epoch, component: loop.component,
+        loopFromNode: 999, loopToNode: loop.loopToNode,
+        rtabLoopID: loop.rtabLoopID,
+        legacyRtabLoopResidualM: ShelfLegacyLoopResidualNull(),
+        rtabGraphOptimizationMaxError: loop.rtabGraphOptimizationMaxError,
+        phoneShelfSE2: loop.phoneShelfSE2, consistency: loop.consistency,
+        accepted: loop.accepted, reason: loop.reason,
+        calibrationStatus: loop.calibrationStatus,
+        writeWatermark: loop.writeWatermark)
+    try requireShelfBundleRejection(
+        directoryName: "shelf-evidence-unbound-loop",
+        windows: [firstWindow, secondWindow], loop: unboundLoop,
+        message: "shelf loop nodes must bind to their exact windows")
+    let sparseDynamicWindow = shelfWindow(
+        sequence: 1, id: "sow-1", side: "right",
+        normal: ShelfFaceNormal(x: 0, y: 1), nodeStart: 20,
+        nodeEnd: 36, observationNodeCount: 5, dynamicRejectionCount: 3)
+    try requireShelfBundleRejection(
+        directoryName: "shelf-evidence-sparse-dynamic",
+        windows: [sparseDynamicWindow, secondWindow], loop: loop,
+        message: "sparse node ids must not hide dominant dynamic evidence")
 
     // The same immutable fixture is consumed by the Python reader test.
     // This guards field-set/version/category parity instead of maintaining

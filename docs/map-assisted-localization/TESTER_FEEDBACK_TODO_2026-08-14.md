@@ -8,7 +8,7 @@
 
 - **P0 坐标框重复变换：代码与自动化已关闭。** 新 observation v2 保存 exact-bound-node local 3D，手机/PC 使用 `P_final=T_final_node×P_node`；历史 v1 清空可发布坐标并要求重扫。尚缺签名真机、非零初始地图位姿、人工重定位/真实 loop correction 和货架控制点共同组成的现场端到端精度证明，因此不能把“算法错误已修”扩大为“最终价签现场精度已合格”。
 - **P1-A 发布门漏检：代码与自动化已关闭。** coordinate contract v2 把 degradation、coordinate audit、legacy、低置信、空坐标、未关联和 rescan 全部纳入 `COMPLETE/publish_permitted`，并在结果读取/任务恢复时二次验证。
-- **P1-B～P1-E 与 P2 已进入代码但仍未关闭资格。** manifest v5、epoch/component、通道/货架/侧状态、手机点+扫掠线段 free-space、PC shelf factor 和 concrete shelf loop 已有严格实现；2026-08-17 sidecar v2 又关闭了“当前位置附近货架自证”和普通视觉 loop 指标冒充货架几何证据的问题，并持久化 LOW_CONFIDENCE 原因。尚未关闭的阻断是：跨 epoch 缺少 native 多链路共识正向 bridge、C-1/C-2/C-3 真机标定、24→12→降频性能链的真机证据、动态顾客/购物车与 `map_mismatch` 现场矩阵。`CALIBRATION_PENDING` 已在手机 coordinate contract v2 上的 publication invariant v2 和 PC 发布门显式阻断，只允许 review/partial result，不能提升发布资格。
+- **P1-B～P1-E 与 P2 已进入代码但仍未关闭资格。** manifest v5、epoch/component、通道/货架/侧状态、手机点+扫掠线段 free-space、PC shelf factor 和 concrete shelf loop 已有严格实现；2026-08-17 sidecar v2 又关闭了“当前位置附近货架自证”和普通视觉 loop 指标冒充货架几何证据的问题，并持久化 LOW_CONFIDENCE 原因。后续代码审查继续修复了固定 top-3 冒充 24→12、拓扑不可达 top1 下一帧自洗白、重复 node binding 重置窗口、降频后用稀疏 node span 低估动态占比、无关 RTAB loop 引用旧窗口，以及当前 shelf/side 残留。尚未关闭的阻断是：跨 epoch 缺少 native 多链路共识正向 bridge、C-1/C-2/C-3 真机标定、24→12→降频性能链的真机证据、动态顾客/购物车与 `map_mismatch` 现场矩阵。`CALIBRATION_PENDING` 已在手机 coordinate contract v2 上的 publication invariant v2 和 PC 发布门显式阻断，只允许 review/partial result，不能提升发布资格。
 
 ## 本轮已确认并修复的关键问题
 

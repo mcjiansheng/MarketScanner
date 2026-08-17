@@ -315,6 +315,11 @@ struct ShelfObservationWindowRecord: Codable, Equatable {
     let side: String
     let faceNormalMap: ShelfFaceNormal
     let shelfCandidates: [ShelfCandidateEvidence]
+    /// Number of distinct accepted RTAB-Map nodes summarized by this window.
+    /// This is deliberately separate from geometry.sample_count (depth
+    /// residuals) and from the numeric node-id span, which becomes sparse
+    /// under the 1/2 and 1/4 evidence cadence.
+    let observationNodeCount: Int
     let geometry: ShelfWindowGeometryEvidence
     let coverageAngleRad: Double
     let endcapVisible: Bool
@@ -331,6 +336,7 @@ struct ShelfObservationWindowRecord: Codable, Equatable {
         case timeRange = "time_range"
         case faceNormalMap = "face_normal_map"
         case shelfCandidates = "shelf_candidates"
+        case observationNodeCount = "observation_node_count"
         case geometry
         case coverageAngleRad = "coverage_angle_rad"
         case endcapVisible = "endcap_visible"
@@ -348,6 +354,9 @@ struct ShelfObservationWindowRecord: Codable, Equatable {
             && timeRange.allSatisfy(\.isFinite) && timeRange[1] >= timeRange[0]
             && epoch >= 0 && component >= 0 && ["left", "right"].contains(side)
             && faceNormalMap.isFiniteUnit && !shelfCandidates.isEmpty
+            && observationNodeCount >= 1
+            && Int64(observationNodeCount)
+                <= nodeRange[1] - nodeRange[0] + 1
             && geometry.isValid
             && shelfCandidates.count <= ShelfLocalizationPolicy.maximumShelfCandidates
             && shelfCandidates.allSatisfy {
@@ -361,6 +370,7 @@ struct ShelfObservationWindowRecord: Codable, Equatable {
             }
             && coverageAngleRad.isFinite && coverageAngleRad >= 0
             && dynamicRejectionCount >= 0
+            && dynamicRejectionCount <= observationNodeCount
             && ShelfLocalizationPolicy.isLowercaseSHA256(priorMapSHA256)
             && ShelfLocalizationPolicy.isLowercaseSHA256(distanceFieldSHA256)
             && writeWatermark == sequence
@@ -867,7 +877,7 @@ enum ShelfLocalizationEvidenceParser {
         "format", "version", "tracking_session_id", "sequence", "window_id",
         "node_range", "time_range", "epoch", "component", "side",
         "face_normal_map", "shelf_candidates", "coverage_angle_rad",
-        "geometry",
+        "observation_node_count", "geometry",
         "endcap_visible", "dynamic_rejection_count", "prior_map_sha256",
         "distance_field_sha256", "write_watermark",
     ]
@@ -977,7 +987,11 @@ enum ShelfLocalizationEvidenceParser {
                   loop.sides == [first.side, second.side],
                   first.component == second.component,
                   loop.component == first.component,
-                  loop.epoch == first.epoch || loop.epoch == second.epoch else {
+                  loop.epoch == first.epoch || loop.epoch == second.epoch,
+                  first.nodeRange[0] <= loop.loopFromNode,
+                  loop.loopFromNode <= first.nodeRange[1],
+                  second.nodeRange[0] <= loop.loopToNode,
+                  loop.loopToNode <= second.nodeRange[1] else {
                 throw ParseError.record(
                     ShelfLoopEventRecord.fileName, loop.sequence,
                     "loop_window_identity_mismatch")
@@ -988,13 +1002,11 @@ enum ShelfLocalizationEvidenceParser {
                 || (lowerEpoch..<upperEpoch).allSatisfy {
                     bridgedFromEpochs.contains($0)
                 }
-            let firstSampleCount = Int(
-                first.nodeRange[1] - first.nodeRange[0] + 1)
-            let secondSampleCount = Int(
-                second.nodeRange[1] - second.nodeRange[0] + 1)
             let dominantDynamicEvidence =
-                first.dynamicRejectionCount * 2 > firstSampleCount
-                || second.dynamicRejectionCount * 2 > secondSampleCount
+                first.dynamicRejectionCount * 2
+                    > first.observationNodeCount
+                || second.dynamicRejectionCount * 2
+                    > second.observationNodeCount
             let qualifies = ShelfLoopVerifier.accepts(
                 first: first,
                 second: second,

@@ -92,6 +92,7 @@ def window(sequence: int, side: str, normal_x: float) -> dict[str, object]:
         "side": side,
         "face_normal_map": {"x": normal_x, "y": 0.0},
         "shelf_candidates": [{"shelf_segment_id": "shelf-1", "score": 0.9}],
+        "observation_node_count": 5,
         "geometry": {
             "sample_count": 20, "inlier_count": 16, "inlier_ratio": 0.8,
             "residual_median_m": 0.1, "residual_maximum_m": 0.2,
@@ -286,6 +287,27 @@ class ShelfLocalizationEvidenceTests(unittest.TestCase):
         event["rtab_loop_residual_m"] = 0.1
         records["shelf_loop_events.jsonl"] = (event,)
         with self.assertRaisesRegex(ShelfEvidenceError, "must be null"):
+            validate_shelf_localization_records(records, metadata())
+
+    def test_loop_nodes_must_belong_to_the_referenced_windows(self) -> None:
+        records = values()
+        event = dict(records["shelf_loop_events.jsonl"][0])
+        event["loop_from_node"] = 999
+        records["shelf_loop_events.jsonl"] = (event,)
+        with self.assertRaisesRegex(ShelfEvidenceError, "identity mismatch"):
+            validate_shelf_localization_records(records, metadata())
+
+    def test_sparse_node_span_cannot_hide_dominant_dynamic_samples(self) -> None:
+        records = values()
+        first = dict(records["shelf_observation_windows.jsonl"][0])
+        first["node_range"] = [1, 17]
+        first["observation_node_count"] = 5
+        first["dynamic_rejection_count"] = 3
+        records["shelf_observation_windows.jsonl"] = (
+            first,
+            records["shelf_observation_windows.jsonl"][1],
+        )
+        with self.assertRaisesRegex(ShelfEvidenceError, "frozen criteria"):
             validate_shelf_localization_records(records, metadata())
 
     def test_unknown_field_and_watermark_fail_closed(self) -> None:

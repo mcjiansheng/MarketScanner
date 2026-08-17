@@ -3545,6 +3545,11 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             ])
     }
 
+    private func clearSelectedShelfEvidence() {
+        selectedShelfSegmentID = ""
+        selectedShelfSide = "unknown"
+    }
+
     @discardableResult
     private func persistCorridorHypotheses(
         update: PriorMapLocalizationUpdate,
@@ -3652,10 +3657,17 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     ) -> Bool {
         let policy = shelfEvidenceResourcePolicy()
         guard Int64(binding.nodeId) % Int64(policy.nodeStride) == 0 else {
+            // A skipped evidence tick has no current shelf geometry authority.
+            // Keep the bounded pending window, but never publish its previous
+            // shelf/side as if it described this accepted node.
+            clearSelectedShelfEvidence()
             return true
         }
         guard let package = activePriorMapPackage,
-              !package.distanceFieldSha256.isEmpty else { return false }
+              !package.distanceFieldSha256.isEmpty else {
+            clearSelectedShelfEvidence()
+            return false
+        }
         let candidates = localizer.nearbyShelfIdentityCandidates(
             limit: min(
                 ShelfLocalizationPolicy.maximumShelfCandidates,
@@ -3669,6 +3681,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
               segment.frontNormal.count == 2,
               segment.backNormal.count == 2 else {
             pendingShelfObservationWindow = nil
+            clearSelectedShelfEvidence()
             return true
         }
         let toPhoneX = update.estimatedPose.xM - top.nearestXM
@@ -3678,7 +3691,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         let side = onFront ? "right" : "left"
         let rawNormal = onFront ? segment.frontNormal : segment.backNormal
         let normalLength = hypot(rawNormal[0], rawNormal[1])
-        guard normalLength > 0 else { return false }
+        guard normalLength > 0 else {
+            clearSelectedShelfEvidence()
+            return false
+        }
         let normal = ShelfFaceNormal(
             x: rawNormal[0] / normalLength,
             y: rawNormal[1] / normalLength)
@@ -3687,6 +3703,18 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
               update.estimatedPose.yM.isFinite,
               update.estimatedPose.yawRad.isFinite else {
             pendingShelfObservationWindow = nil
+            clearSelectedShelfEvidence()
+            return true
+        }
+        selectedShelfSegmentID = top.shelfSegmentId
+        selectedShelfSide = side
+        // The prior-map queue can observe the same native binding on more than
+        // one 1-2 Hz localization tick. That is one accepted node, not a new
+        // sample and not a reason to discard the window accumulated so far.
+        if let pending = pendingShelfObservationWindow,
+           pending.epoch == epoch,
+           pending.component == component,
+           nodeID == pending.endNodeID {
             return true
         }
         let phonePose = update.estimatedPose
@@ -3774,6 +3802,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             side: completed.side,
             faceNormalMap: completed.faceNormal,
             shelfCandidates: evidenceCandidates,
+            observationNodeCount: completed.sampleCount,
             geometry: ShelfWindowGeometryEvidence(
                 sampleCount: orderedGeometryResiduals.count,
                 inlierCount: completed.geometryInlierCount,
@@ -3793,8 +3822,6 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         pendingShelfObservationWindow = nil
         if succeeded {
             shelfObservationWindowSequence = sequence
-            selectedShelfSegmentID = completed.shelfSegmentID
-            selectedShelfSide = completed.side
             let phonePoseCount = Double(max(1, completed.phonePoseSampleCount))
             let meanPhoneX = completed.phonePoseXSum / phonePoseCount
             let meanPhoneY = completed.phonePoseYSum / phonePoseCount
@@ -3857,9 +3884,15 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     ) -> Bool {
         guard let top = shelfCandidates.first,
               let windows = recentShelfObservationWindows[top.shelfSegmentId],
-              let latest = windows.last,
+              let latest = windows.reversed().first(where: {
+                $0.nodeRange[0] <= Int64(loopFromNode)
+                    && Int64(loopFromNode) <= $0.nodeRange[1]
+              }),
               let opposite = windows.reversed().first(where: {
-                $0.windowID != latest.windowID && $0.side != latest.side
+                $0.windowID != latest.windowID
+                    && $0.side != latest.side
+                    && $0.nodeRange[0] <= Int64(loopToNode)
+                    && Int64(loopToNode) <= $0.nodeRange[1]
               }),
               let oppositeRelative = recentShelfWindowRelativePoses[
                 opposite.windowID],
@@ -3892,9 +3925,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             hasEpochBridge: opposite.epoch == latest.epoch,
             dominantDynamicEvidence:
                 opposite.dynamicRejectionCount * 2
-                    > Int(opposite.nodeRange[1] - opposite.nodeRange[0] + 1)
+                    > opposite.observationNodeCount
                 || latest.dynamicRejectionCount * 2
-                    > Int(latest.nodeRange[1] - latest.nodeRange[0] + 1))
+                    > latest.observationNodeCount)
         let reason: String
         if accepted {
             reason = "two_sided_consistency_confirmed"
@@ -3906,9 +3939,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     < ShelfLocalizationPolicy.calibrationPendingLowConfidenceMargin {
             reason = "margin_insufficient"
         } else if opposite.dynamicRejectionCount * 2
-                    > Int(opposite.nodeRange[1] - opposite.nodeRange[0] + 1)
+                    > opposite.observationNodeCount
                     || latest.dynamicRejectionCount * 2
-                    > Int(latest.nodeRange[1] - latest.nodeRange[0] + 1) {
+                    > latest.observationNodeCount {
             reason = "dynamic_evidence_dominant"
         } else if relativeDeltaM
                     > ShelfLocalizationPolicy.calibrationPendingLoopTranslationM
@@ -3928,8 +3961,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             trackingSessionID: scanSession.trackingSessionId,
             sequence: sequence,
             shelfSegmentID: top.shelfSegmentId,
-            windowIDs: [opposite.windowID, latest.windowID],
-            sides: [opposite.side, latest.side],
+            windowIDs: [latest.windowID, opposite.windowID],
+            sides: [latest.side, opposite.side],
             epoch: latest.epoch,
             component: latest.component,
             loopFromNode: Int64(loopFromNode),
@@ -4072,17 +4105,17 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             if let binding = priceTagNodeBinding {
                 self.auditShelfEvidenceResourcePolicyIfNeeded(
                     scanSession: scanSession)
-                _ = self.persistCorridorHypotheses(
-                    update: update,
-                    binding: binding,
-                    scanSession: scanSession,
-                    trackingSessionID: trackingSessionId,
-                    epoch: Int(localizationEpoch),
-                    component: localizationComponent)
                 _ = self.consumeShelfObservationWindow(
                     update: update,
                     binding: binding,
                     localizer: localizer,
+                    scanSession: scanSession,
+                    trackingSessionID: trackingSessionId,
+                    epoch: Int(localizationEpoch),
+                    component: localizationComponent)
+                _ = self.persistCorridorHypotheses(
+                    update: update,
+                    binding: binding,
                     scanSession: scanSession,
                     trackingSessionID: trackingSessionId,
                     epoch: Int(localizationEpoch),

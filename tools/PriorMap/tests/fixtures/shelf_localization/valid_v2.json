@@ -49,6 +49,7 @@
           {"shelf_segment_id": "shelf-12", "score": 0.9},
           {"shelf_segment_id": "shelf-14", "score": 0.5}
         ],
+        "observation_node_count": 5,
         "geometry": {"sample_count": 20, "inlier_count": 17, "inlier_ratio": 0.85, "residual_median_m": 0.2, "residual_maximum_m": 0.3},
         "coverage_angle_rad": 1.9,
         "endcap_visible": false,
@@ -73,6 +74,7 @@
           {"shelf_segment_id": "shelf-12", "score": 0.9},
           {"shelf_segment_id": "shelf-14", "score": 0.5}
         ],
+        "observation_node_count": 5,
         "geometry": {"sample_count": 20, "inlier_count": 17, "inlier_ratio": 0.85, "residual_median_m": 0.2, "residual_maximum_m": 0.3},
         "coverage_angle_rad": 1.9,
         "endcap_visible": false,

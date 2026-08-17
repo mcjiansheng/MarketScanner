@@ -68,7 +68,7 @@ ROOT_FIELDS: dict[str, frozenset[str]] = {
         "format", "version", "tracking_session_id", "sequence", "window_id",
         "node_range", "time_range", "epoch", "component", "side",
         "face_normal_map", "shelf_candidates", "coverage_angle_rad",
-        "geometry",
+        "observation_node_count", "geometry",
         "endcap_visible", "dynamic_rejection_count", "prior_map_sha256",
         "distance_field_sha256", "write_watermark",
     }),
@@ -345,7 +345,8 @@ def _validate_window(value: dict[str, Any], prior_map_sha256: str) -> None:
     if not isinstance(times, list) or len(times) != 2:
         raise ShelfEvidenceError("time_range is invalid")
     start_node = _integer(nodes[0], "node_range[0]", minimum=1)
-    if _integer(nodes[1], "node_range[1]", minimum=1) < start_node:
+    end_node = _integer(nodes[1], "node_range[1]", minimum=1)
+    if end_node < start_node:
         raise ShelfEvidenceError("node_range is reversed")
     start_time = _number(times[0], "time_range[0]")
     if _number(times[1], "time_range[1]") < start_time:
@@ -379,7 +380,18 @@ def _validate_window(value: dict[str, Any], prior_map_sha256: str) -> None:
     _number(value["coverage_angle_rad"], "coverage_angle_rad", minimum=0.0)
     if type(value["endcap_visible"]) is not bool:
         raise ShelfEvidenceError("endcap_visible must be boolean")
-    _integer(value["dynamic_rejection_count"], "dynamic_rejection_count")
+    observation_node_count = _integer(
+        value["observation_node_count"],
+        "observation_node_count",
+        minimum=1,
+    )
+    if observation_node_count > end_node - start_node + 1:
+        raise ShelfEvidenceError("observation_node_count exceeds node span")
+    dynamic_rejection_count = _integer(
+        value["dynamic_rejection_count"], "dynamic_rejection_count"
+    )
+    if dynamic_rejection_count > observation_node_count:
+        raise ShelfEvidenceError("dynamic_rejection_count exceeds observations")
     if value["prior_map_sha256"] != prior_map_sha256:
         raise ShelfEvidenceError("window prior-map identity mismatch")
     if SHA256_RE.fullmatch(str(value["distance_field_sha256"])) is None:
@@ -513,6 +525,16 @@ def _validate_loop_references(
         or first["side"] == second["side"]
         or loop["sides"] != [first["side"], second["side"]]
         or loop["epoch"] not in {first["epoch"], second["epoch"]}
+        or not (
+            int(first["node_range"][0])
+            <= int(loop["loop_from_node"])
+            <= int(first["node_range"][1])
+        )
+        or not (
+            int(second["node_range"][0])
+            <= int(loop["loop_to_node"])
+            <= int(second["node_range"][1])
+        )
     ):
         raise ShelfEvidenceError("loop shelf/side/component identity mismatch")
     if not _has_epoch_bridge(transitions, first["epoch"], second["epoch"]):
@@ -545,15 +567,11 @@ def _validate_loop_references(
             > 1.0e-9
     ):
         raise ShelfEvidenceError("loop geometry summary mismatch")
-    first_sample_count = int(first["node_range"][1]) - int(
-        first["node_range"][0]
-    ) + 1
-    second_sample_count = int(second["node_range"][1]) - int(
-        second["node_range"][0]
-    ) + 1
     dominant_dynamic = (
-        int(first["dynamic_rejection_count"]) * 2 > first_sample_count
-        or int(second["dynamic_rejection_count"]) * 2 > second_sample_count
+        int(first["dynamic_rejection_count"]) * 2
+            > int(first["observation_node_count"])
+        or int(second["dynamic_rejection_count"]) * 2
+            > int(second["observation_node_count"])
     )
     qualifies = (
         normal_angle > CALIBRATION_PENDING_OPPOSING_NORMAL_RAD

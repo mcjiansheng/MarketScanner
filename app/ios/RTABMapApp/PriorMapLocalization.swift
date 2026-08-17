@@ -921,7 +921,28 @@ final class PriorMapStageOneLocalizer {
                 ? first.segment.id < second.segment.id
                 : first.distanceM < second.distanceM
         }
-        let topCandidates = Array(candidates.prefix(3))
+        let evidenceCandidateLimit = max(
+            1,
+            min(
+                ShelfLocalizationPolicy.maximumCorridorHypotheses,
+                shelfEvidenceCandidateLimit))
+        // Candidate scoring must follow the advertised 24 -> 12 resource
+        // policy. Keeping the historical prefix(3) here made the degradation
+        // audit inaccurate and discarded parallel-aisle alternatives before
+        // structure/topology scoring could evaluate them.
+        let safeCandidates = candidates.filter { candidate in
+            let audit = ShelfFreeSpaceAuditor.audit(
+                previous: latestEstimatedPose,
+                current: PriorMapPose2D(
+                    xM: candidate.point.x,
+                    yM: candidate.point.y,
+                    yawRad: rawPose.yawRad),
+                shelfPolygons: shelfPolygons)
+            return audit.nodeInsideShelfCount == 0
+                && audit.segmentCrossingCount == 0
+        }
+        let topCandidates = Array(
+            safeCandidates.prefix(evidenceCandidateLimit))
         let unique = topCandidates.count == 1
             || (topCandidates.count > 1
                 && topCandidates[1].distanceM - topCandidates[0].distanceM
@@ -1200,7 +1221,13 @@ final class PriorMapStageOneLocalizer {
                 ? first.edgeId < second.edgeId
                 : first.combinedScore > second.combinedScore
         }
-        lastSelectedRoadEdgeID = roadEvidence.first?.edgeId
+        // A disconnected top candidate remains visible as LOW_CONFIDENCE but
+        // cannot become the next topology authority merely by winning once.
+        // Otherwise the following frame would compare against the jumped edge
+        // and silently relabel the discontinuity as reachable.
+        if let selected = roadEvidence.first, selected.topologyReachable {
+            lastSelectedRoadEdgeID = selected.edgeId
+        }
         latestEstimatedPose = estimatedPose
         if computeShelfGeometryEvidence {
             latestShelfGeometryCandidates = shelfGeometryCandidates(
