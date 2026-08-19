@@ -549,29 +549,86 @@ struct PriorMapTagObservationRecord: Codable {
             guard let point else { return true }
             return point.xM.isFinite && point.yM.isFinite && point.zM.isFinite
         }
+        guard normalizedBounds.count == 4 else { return false }
+        let x = normalizedBounds[0]
+        let y = normalizedBounds[1]
+        let width = normalizedBounds[2]
+        let height = normalizedBounds[3]
+        let boundsValid = [x, y, width, height].allSatisfy { $0.isFinite }
+            && x >= 0 && x <= 1
+            && y >= 0 && y <= 1
+            && width > 0 && width <= 1
+            && height > 0 && height <= 1
+            && x + width <= 1 + 1.0e-9
+            && y + height <= 1 + 1.0e-9
+        let expectedInlierRatio = depthSampleCount == 0
+            ? 0 : Double(depthInlierCount) / Double(depthSampleCount)
+        let normalValid = surfaceNormalCamera.map { normal in
+            guard normal.count == 3,
+                  normal.allSatisfy({ $0.isFinite }) else { return false }
+            let norm = sqrt(normal.reduce(0) { $0 + $1 * $1 })
+            return norm.isFinite && abs(norm - 1) <= 1.0e-3
+        } ?? true
+        let isDepthMeasurement = measurementMethod == "scene_depth"
+            || measurementMethod == "smoothed_scene_depth"
+        let isNonDepthMeasurement = measurementMethod == "shelf_plane_ray"
+            || measurementMethod == "unavailable"
+        let epochComponentValid = if epoch == nil && component == nil {
+            true
+        }
+        else if let epoch, let component, let boundNodeMapId {
+            epoch >= 0 && component == Int64(boundNodeMapId)
+        }
+        else {
+            false
+        }
+        let v2CoordinateContractValid = version != 2 || (
+            boundNodeId.map { $0 > 0 } == true
+                && (boundNodeStamp?.isFinite ?? false)
+                && boundNodeMapId != nil
+                && coordinateFrame == "RTABMAP_BOUND_NODE_LOCAL"
+                && epochComponentValid
+                && (!isDepthMeasurement || pointInBoundNodeFrame != nil)
+                && (!isNonDepthMeasurement || pointInBoundNodeFrame == nil)
+        )
         return timestamp.isFinite
-            && normalizedBounds.count == 4
-            && normalizedBounds.allSatisfy { $0.isFinite }
+            && boundsValid
             && frameTimestamp.isFinite
             && nodeTimebaseFrameTimestamp.isFinite
             && nodeTimebaseOffsetSeconds.isFinite
+            && abs(
+                frameTimestamp + nodeTimebaseOffsetSeconds
+                    - nodeTimebaseFrameTimestamp) <= 1.0e-6
             && poseTimestampDeltaMs.isFinite
             && poseTimestampDeltaMs >= 0
+            && alignmentVersion > 0
+            && alignmentVersionLag >= 0
+            && alignmentVersionLag < alignmentVersion
             && alignmentSnapshotTimestamp.isFinite
             && alignmentAgeMs.isFinite
             && alignmentAgeMs >= 0
             && measurementConfidence.isFinite
             && measurementConfidence >= 0
             && measurementConfidence <= 1
+            && (measurementMethod != "unavailable"
+                || measurementConfidence == 0)
+            && depthSampleCount >= 0
+            && depthInlierCount >= 0
+            && depthInlierCount <= depthSampleCount
             && depthInlierRatio.isFinite
             && depthInlierRatio >= 0
             && depthInlierRatio <= 1
-            && (depthMedianM?.isFinite ?? true)
-            && (depthMadM?.isFinite ?? true)
-            && (planeResidualM?.isFinite ?? true)
-            && (surfaceNormalCamera.map {
-                $0.count == 3 && $0.allSatisfy { $0.isFinite }
-            } ?? true)
+            && abs(depthInlierRatio - expectedInlierRatio) <= 1.0e-6
+            && (depthMedianM.map { $0.isFinite && $0 >= 0.2 && $0 <= 8 }
+                ?? true)
+            && (depthMadM.map { $0.isFinite && $0 >= 0 && $0 <= 8 }
+                ?? true)
+            && (planeResidualM.map { $0.isFinite && $0 >= 0 && $0 <= 8 }
+                ?? true)
+            && (depthSampleCount != 0
+                || (depthMedianM == nil && depthMadM == nil
+                    && planeResidualM == nil))
+            && normalValid
             && localizationConfidence.isFinite
             && localizationConfidence >= 0
             && localizationConfidence <= 1
@@ -579,6 +636,7 @@ struct PriorMapTagObservationRecord: Codable {
             && (boundNodeStamp?.isFinite ?? true)
             && validNodePoint(pointInBoundNodeFrame)
             && (measurementHeightM?.isFinite ?? true)
+            && v2CoordinateContractValid
     }
 
     /// V1R5: returns a copy bound to the durable burst/frame identity

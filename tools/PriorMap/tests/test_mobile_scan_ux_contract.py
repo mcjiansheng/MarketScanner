@@ -236,6 +236,35 @@ class MobileScanUXContractTests(unittest.TestCase):
         self.assertIn("let entry = try register(", library)
         self.assertIn("MobileScanSetupViewController(selectedMap:", library_ui)
 
+        picker_start = library_ui.index(
+            "private final class ExistingPriorMapPackagePicker"
+        )
+        picker = library_ui[picker_start:]
+        self.assertIn("forOpeningContentTypes: [.folder]", picker)
+        self.assertIn("asCopy: false", picker)
+        self.assertNotIn("asCopy: true", picker)
+        self.assertIn("startAccessingSecurityScopedResource", picker)
+        self.assertIn("installVerifiedPackage", picker)
+        self.assertIn("viewIfLoaded?.window != nil", picker)
+
+        install_start = library.index("static func installVerifiedPackage(")
+        install_end = library.index(
+            "private static func verifyImportedStagingPackage", install_start
+        )
+        install = library[install_start:install_end]
+        self.assertIn("try autoreleasepool", install)
+        self.assertIn("let identity:", install)
+        self.assertLess(
+            install.index("try autoreleasepool"),
+            install.index("verifyImportedStagingPackage"),
+        )
+
+        action_start = library_ui.index('title: "导入已有 PC 地图包"')
+        action_end = library_ui.index('title: "取消"', action_start)
+        action = library_ui[action_start:action_end]
+        self.assertIn("self.preparedImportController = nil", action)
+        self.assertIn("DispatchQueue.main.async", action)
+
     def test_scan_start_reuses_one_prepared_package(self) -> None:
         coordinator = self.source(
             "app/ios/RTABMapApp/MobileOnlyWorkflow/"

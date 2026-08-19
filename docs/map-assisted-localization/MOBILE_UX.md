@@ -6,6 +6,7 @@
 
 - 首页大型“新建扫描”和菜单首项“开始门店扫描”先打开轻量地图选择页，不再自动验证并加载 registry 第一张地图。用户可选择已注册地图或直接点击“导入新地图”；确认后才加载 exact package 并进入配置页。
 - “门店地图”和扫描选择页使用同一个地图库。手机现场编译的 XLSX/CSV/JSON 与 PC 生成的正式 v2 prior-map package 在完成严格验证后都注册到该地图库，并进入同一个配置页、同一个 coordinator 和同一个真实扫描 host。
+- “导入已有 PC 地图包”使用文件夹 open-in-place picker 和 security-scoped URL；不把 `.folder` 交给不受所有 FileProvider 支持的 document-copy 模式。选择动作会先释放未显示的预热文件 picker，等 action sheet 完成本轮 dismissal 后再展示文件夹 picker，避免两个 provider presentation 重叠。选中后仍在后台完成单快照验证、App 私有 staging、复验和原子注册，外部目录只读且不直接参与扫描。
 - 自由扫描建图和原始数据录制保留在“实验与兼容工具”，用于旧流程回归和诊断，不是发布版主要作业入口。NFC 入口继续保持关闭。
 - 地图选择页作为 modal root 显示“关闭”；配置页总是由选择页 push，保留系统返回按钮和返回手势。需要换图时先返回选择页，不在配置页内触发另一张地图的完整加载。页面离开时会取消 queued/running 启动 operation；已成功进入 scanning 后不会误取消。
 

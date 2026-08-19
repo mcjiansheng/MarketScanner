@@ -282,7 +282,16 @@ final class MobileMapLibraryViewController: UIViewController,
             title: "导入已有 PC 地图包",
             style: .default
         ) { [weak self] _ in
-            self?.beginExistingPackageImport()
+            guard let self else { return }
+            // Do not keep the pre-warmed file-import picker alive while a
+            // second FileProvider controller is being presented. Some
+            // providers abort if a folder picker is opened during the
+            // action-sheet dismissal while another hidden picker still owns
+            // a provider session.
+            self.preparedImportController = nil
+            DispatchQueue.main.async { [weak self] in
+                self?.beginExistingPackageImport()
+            }
         })
         alert.addAction(UIAlertAction(
             title: "取消",
@@ -337,6 +346,13 @@ final class MobileMapLibraryViewController: UIViewController,
     }
 
     private func beginExistingPackageImport() {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.beginExistingPackageImport()
+            }
+            return
+        }
+        guard packagePicker == nil else { return }
         setBusy(true, message: "请选择 PriorMap 地图包文件夹…")
         let picker = ExistingPriorMapPackagePicker(
             progress: { [weak self] _, message in
@@ -458,6 +474,7 @@ private final class ExistingPriorMapPackagePicker: NSObject,
     private let progress: (Double, String) -> Void
     private let completion: (Result<MobileMapLibrary.MapEntry, Error>) -> Void
     private let cancelled: () -> Void
+    private let pickerViewController: UIDocumentPickerViewController
     private let queue = DispatchQueue(
         label: "MarketScanner.ExistingPriorMapPackageImport",
         qos: .userInitiated)
@@ -470,15 +487,69 @@ private final class ExistingPriorMapPackagePicker: NSObject,
         self.progress = progress
         self.completion = completion
         self.cancelled = cancelled
+        // A folder is opened in place. Document-import/copy mode is not
+        // valid for every FileProvider folder
+        // representation; affected providers can raise an Objective-C
+        // exception before Swift has an Error to catch. The selected folder
+        // still never becomes scan input: the worker takes one validated
+        // snapshot and writes it to private staging before registration.
+        self.pickerViewController = UIDocumentPickerViewController(
+            forOpeningContentTypes: [.folder],
+            asCopy: false)
+        super.init()
+        pickerViewController.delegate = self
+        pickerViewController.allowsMultipleSelection = false
     }
 
     func present(from viewController: UIViewController) {
-        let picker = UIDocumentPickerViewController(
-            forOpeningContentTypes: [.folder],
-            asCopy: true)
-        picker.delegate = self
-        picker.allowsMultipleSelection = false
-        viewController.present(picker, animated: true)
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self, weak viewController] in
+                guard let self, let viewController else { return }
+                self.present(from: viewController)
+            }
+            return
+        }
+        presentWhenReady(from: viewController, attempt: 0)
+    }
+
+    /// UIAlertController invokes its action before the animated dismissal is
+    /// necessarily complete. Wait a bounded number of main-run-loop turns
+    /// instead of presenting a FileProvider controller over the departing
+    /// sheet (which UIKit treats as an invalid presentation race).
+    private func presentWhenReady(
+        from viewController: UIViewController,
+        attempt: Int
+    ) {
+        guard viewController.viewIfLoaded?.window != nil,
+              viewController.navigationController?.topViewController
+                === viewController else {
+            completion(.failure(NSError(
+                domain: "MarketScanner.ExistingPriorMapPackagePicker",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "地图包选择器暂时无法显示，请返回地图列表后重试。"])))
+            return
+        }
+        if viewController.presentedViewController != nil {
+            guard attempt < 20 else {
+                completion(.failure(NSError(
+                    domain: "MarketScanner.ExistingPriorMapPackagePicker",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "另一个窗口尚未关闭，请稍后重新选择地图包。"])))
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                [weak self, weak viewController] in
+                guard let self, let viewController else { return }
+                self.presentWhenReady(
+                    from: viewController,
+                    attempt: attempt + 1)
+            }
+            return
+        }
+        pickerViewController.delegate = self
+        viewController.present(pickerViewController, animated: true)
     }
 
     func documentPicker(

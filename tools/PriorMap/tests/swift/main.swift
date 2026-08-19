@@ -480,7 +480,10 @@ func runESLBarcodeCaptureFocusedTests() {
         "a degenerate depth plane must remain JSON encodable")
 
     func persistenceObservation(
-        planeResidualM: Double? = 0.01
+        planeResidualM: Double? = 0.01,
+        normalizedBounds: [Double] = [0.4, 0.4, 0.2, 0.1],
+        pointInBoundNodeFrame: PriorMapTagNodeLocalPoint3D? =
+            PriorMapTagNodeLocalPoint3D(xM: 0.1, yM: 0.2, zM: -1.2)
     ) -> PriorMapTagObservationRecord {
         return PriorMapTagObservationRecord(
             format: "MarketScannerPriceTagObservation",
@@ -489,7 +492,7 @@ func runESLBarcodeCaptureFocusedTests() {
             timestamp: 1_700_000_000,
             payload: "981115951",
             symbology: "VNBarcodeSymbologyCode128",
-            normalizedBounds: [0.4, 0.4, 0.2, 0.1],
+            normalizedBounds: normalizedBounds,
             frameTimestamp: 10,
             nodeTimebaseFrameTimestamp: 10,
             nodeTimebaseOffsetSeconds: 0,
@@ -523,8 +526,7 @@ func runESLBarcodeCaptureFocusedTests() {
             boundNodeStamp: 10,
             boundNodeMapId: 0,
             coordinateFrame: "RTABMAP_BOUND_NODE_LOCAL",
-            pointInBoundNodeFrame: PriorMapTagNodeLocalPoint3D(
-                xM: 0.1, yM: 0.2, zM: -1.2),
+            pointInBoundNodeFrame: pointInBoundNodeFrame,
             measurementHeightM: 1.2)
     }
     let finiteObservation = persistenceObservation()
@@ -535,6 +537,16 @@ func runESLBarcodeCaptureFocusedTests() {
     require(
         !nonFiniteObservation.hasFinitePersistenceNumbers,
         "non-finite ESL observation numbers must fail before JSONL persistence")
+    let outOfRangeBoundsObservation = persistenceObservation(
+        normalizedBounds: [0.9, 0.4, 0.2, 0.1])
+    require(
+        !outOfRangeBoundsObservation.hasFinitePersistenceNumbers,
+        "out-of-range ESL bounds must fail before JSONL persistence")
+    let missingNodeLocalPointObservation = persistenceObservation(
+        pointInBoundNodeFrame: nil)
+    require(
+        !missingNodeLocalPointObservation.hasFinitePersistenceNumbers,
+        "depth ESL evidence without its exact node-local point must be deferred")
     require(
         (try? JSONEncoder().encode(nonFiniteObservation)) == nil,
         "the regression fixture must reproduce JSONEncoder's Infinity rejection")
@@ -17854,6 +17866,70 @@ if CommandLine.arguments.count == 3,
             storeId: "s1",
             mapName: "Piaseczno")
         require(report.elementCount == 3, "CAS import must yield 3 elements")
+
+        // The PC-package compatibility entry uses a folder picker followed
+        // by this exact install API. Exercise the full immutable
+        // source -> snapshot -> private staging -> validation -> registry
+        // chain independently from the phone-compile registration below.
+        var formalPCSource = report.canonicalSource
+        formalPCSource.version = CanonicalPriorMapBusinessSourceV3.versionValue
+        formalPCSource.sourceMapInfo = SourceMapInfo(
+            mapName: report.mapName,
+            storeCode: report.storeId,
+            widthCm: 1_000,
+            heightCm: 1_000,
+            scale: 1)
+        formalPCSource.importSummary = SourceImportSummary(
+            sourceElementCount: formalPCSource.elements.count,
+            presentationIgnoredCount: 0,
+            unsupportedIgnoredCount: 0,
+            hiddenElementCount: 0,
+            invalidGeometryIgnoredCount: 0,
+            ignoredByShapeType: [:],
+            legacyShelfInfoPresent: false,
+            legacyShelfInfoRowCount: 0,
+            malformedRowCount: 0)
+        formalPCSource.source.canonicalSourceSha256 =
+            CanonicalSourceHasher.sha256(
+                try CanonicalJSONEncoder.encode(formalPCSource.canonicalPayload))
+        let pcPackageSource = temporary.appendingPathComponent(
+            "pc-package-source", isDirectory: true)
+        let pcCompileResult = try MobilePriorMapCompiler.compile(
+            canonicalSource: formalPCSource,
+            outputDirectory: pcPackageSource)
+        let importLibraryRoot = temporary.appendingPathComponent(
+            "ImportedPCMaps", isDirectory: true)
+        MobileMapLibrary.rootOverride = importLibraryRoot
+        var importProgress: [Double] = []
+        let importedPCMap = try MobileMapLibrary.installVerifiedPackage(
+            from: pcPackageSource,
+            progress: { fraction, _ in importProgress.append(fraction) })
+        require(
+            importedPCMap.priorMapID == pcCompileResult.priorMapID
+                && importedPCMap.packageSHA256
+                    == pcCompileResult.packageSHA256
+                && importedPCMap.canonicalSourceSHA256
+                    == formalPCSource.source.canonicalSourceSha256
+                && importedPCMap.compilerVersion == "imported-pc-v2",
+            "PC package import must preserve exact compiled identity")
+        require(
+            importProgress == importProgress.sorted()
+                && importProgress.first == 0.05
+                && importProgress.last == 1,
+            "PC package import progress must be monotonic and complete")
+        let importedPCMaps = try MobileMapLibrary.listMaps()
+        let exactImportedPCMap = try MobileMapLibrary.map(
+            priorMapID: importedPCMap.priorMapID,
+            packageSHA256: importedPCMap.packageSHA256)
+        let sourcePackageSHA = try PriorMapPackageIntegrity.validate(
+            directory: pcPackageSource)
+        require(
+            importedPCMaps == [importedPCMap]
+                && exactImportedPCMap == importedPCMap
+                && sourcePackageSHA == pcCompileResult.packageSHA256,
+            "PC package import must register exact private bytes without mutating the source")
+
+        MobileMapLibrary.rootOverride = temporary.appendingPathComponent("Maps")
         let compileDir = try MobileMapLibrary.stagingDirectory(for: "cas-compile")
         let compileResult = try MobilePriorMapCompiler.compile(
             canonicalSource: report.canonicalSource,

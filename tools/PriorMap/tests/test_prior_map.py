@@ -1411,6 +1411,15 @@ class IOSCoreContractTests(unittest.TestCase):
         self.assertIn("deferEvidenceUntilUsableMeasurement", barcode_flow)
         self.assertIn("hasFinitePersistenceNumbers", barcode_flow)
         self.assertIn("planeResidualM: finiteResidual", localization_core)
+        self.assertIn(
+            "CVPixelBufferLockBaseAddress(buffer, .readOnly)", scanner
+        )
+        self.assertIn("== kCVReturnSuccess", scanner)
+        self.assertIn("confidenceLocked", scanner)
+        self.assertIn("kCVPixelFormatType_DepthFloat32", scanner)
+        self.assertIn("kCVPixelFormatType_OneComponent8", scanner)
+        self.assertIn("bytesPerRow >= width", scanner)
+        self.assertIn("boundsAreUsable", scanner)
         self.assertIn("PriceTagBarcodeBusinessPolicy.classify", ui)
         self.assertIn("Possible product barcode", ui)
         self.assertIn("It is printed on the ESL, save selected shelf", ui)

@@ -5380,7 +5380,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     phase: "numeric_preflight",
                     payload: detection.payload,
                     symbology: detection.symbology,
-                    sourceReason: "non_finite_measurement_frame_skipped",
+                    sourceReason:
+                        "non_persistable_measurement_frame_skipped",
                     terminal: false,
                     minimumInterval: 0.5)
                 let action = self.priceTagCaptureCoordinator

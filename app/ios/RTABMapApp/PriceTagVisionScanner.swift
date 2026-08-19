@@ -402,24 +402,54 @@ struct PriceTagFrameMeasurement {
         let buffer = depth.depthMap
         let width = CVPixelBufferGetWidth(buffer)
         let height = CVPixelBufferGetHeight(buffer)
-        guard width > 1, height > 1 else { return (nil, .unavailable) }
-        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        guard width > 1, height > 1,
+              CVPixelBufferGetPixelFormatType(buffer)
+                == kCVPixelFormatType_DepthFloat32,
+              CVPixelBufferLockBaseAddress(buffer, .readOnly)
+                == kCVReturnSuccess else {
+            return (nil, .unavailable)
+        }
         let confidence = depth.confidenceMap
-        if let confidence = confidence {
-            CVPixelBufferLockBaseAddress(confidence, .readOnly)
+        var confidenceLocked = false
+        if let confidence {
+            guard CVPixelBufferGetWidth(confidence) == width,
+                  CVPixelBufferGetHeight(confidence) == height,
+                  CVPixelBufferGetPixelFormatType(confidence)
+                    == kCVPixelFormatType_OneComponent8,
+                  CVPixelBufferLockBaseAddress(confidence, .readOnly)
+                    == kCVReturnSuccess else {
+                CVPixelBufferUnlockBaseAddress(buffer, .readOnly)
+                return (nil, .unavailable)
+            }
+            confidenceLocked = true
         }
         defer {
-            if let confidence = confidence {
+            if let confidence, confidenceLocked {
                 CVPixelBufferUnlockBaseAddress(confidence, .readOnly)
             }
             CVPixelBufferUnlockBaseAddress(buffer, .readOnly)
         }
-        guard let base = CVPixelBufferGetBaseAddress(buffer) else {
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
+        let confidenceBytesPerRow = confidence.map(
+            CVPixelBufferGetBytesPerRow) ?? 0
+        let confidenceBase = confidence.flatMap(CVPixelBufferGetBaseAddress)
+        let boundsAreUsable = bounds.minX.isFinite
+            && bounds.minY.isFinite
+            && bounds.width.isFinite
+            && bounds.height.isFinite
+            && bounds.minX >= 0
+            && bounds.minY >= 0
+            && bounds.width > 0
+            && bounds.height > 0
+            && bounds.maxX <= 1
+            && bounds.maxY <= 1
+        guard boundsAreUsable,
+              bytesPerRow >= width * MemoryLayout<Float32>.stride,
+              confidence == nil || confidenceBytesPerRow >= width,
+              let base = CVPixelBufferGetBaseAddress(buffer),
+              confidence == nil || confidenceBase != nil else {
             return (nil, .unavailable)
         }
-        let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
-        let confidenceBase = confidence.flatMap(CVPixelBufferGetBaseAddress)
-        let confidenceBytesPerRow = confidence.map(CVPixelBufferGetBytesPerRow) ?? 0
         // Vision boxes often include shelf/background pixels. Sample a dense,
         // inset 9x9 grid so evidence comes from the barcode interior.
         var sampleOffsets: [(CGFloat, CGFloat)] = []

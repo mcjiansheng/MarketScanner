@@ -2,12 +2,20 @@
 
 > 文档状态：**当前有效**。最后核对日期：2026-08-19。
 
+## 2026-08-19 — PC 地图包文件夹导入防崩溃
+
+- 修复“导入已有 PC 地图包”点击后可能由 FileProvider/DocumentPicker 直接终止的问题：文件夹选择不再使用 `asCopy: true` 的 document-import 模式，改为受支持的 open-in-place security scope；地图包仍只读，选中后由后台单快照验证并写入 App 私有 staging。
+- 在展示文件夹 picker 前释放未展示的 XLSX/CSV/JSON 预热 picker，并延迟到 action sheet 完成本轮 dismissal 后展示；同时加入主线程、可见 window、无重叠 presentation 和单实例门，无法展示时返回可恢复提示，不再把 UIKit 异常路径暴露给操作者。
+- 安装器不再同时持有 provider 原始包和 App staging 包的两份完整 Data/JSON 快照；来源快照完成验证与 exact-byte copy 后先释放，再复验私有副本，降低合法大包在导入时因瞬时双倍内存被 iOS jetsam 的风险。
+- Swift host 新增正式 v2 package 的 source → snapshot → private staging → revalidation → immutable register → exact ID/SHA read 回归；源码合同固定 `.folder + asCopy: false`、security scope 和单一地图库入口。该主机/Xcode 证据不能代替 Files/iCloud/第三方 provider 真机矩阵。
+
 ## 2026-08-19 — ESL 现场触发、商品码提示与连续扫描修复
 
 - 新增 `Scan ESL` App Intent/App Shortcut。iPhone 15 Pro 及更新机型可把 Action Button 配置为该 Shortcut；它打开 App 后只转发到现有 `startPriceTagCapture()`，不创建第二路相机，也不绕过扫描/定位/sidecar 门。传统静音拨片和音量键没有受支持的 raw-key API，明确不采用系统音量劫持。
 - 保持 ARKit continuous autofocus，扫码框提示约 25–45 cm 工作距离。软件不能控制 ARKit 相机同时又另行锁定 `AVCaptureDevice`，也不能突破镜头最短对焦距离。
 - Vision 能高效识别商品正面的 EAN/UPC/QR 属正常现象。EAN/UPC/ITF 与 URL 型 QR 现在显示“疑似商品码”，确认页要求操作员明确证明该码印在 ESL 上；Code128 不按长度/前缀静默拒绝，因为山姆现场 9 位 ESL 也使用 Code128。完全自动区分仍需要门店级 payload 合同、ESL 主数据或服务端校验。
 - 关闭连续扫描现场故障：退化 depth plane 过去把 `+Infinity` 作为 residual 传入 observation，导致 `JSONEncoder` 写 `tag_observations.jsonl` 失败并把当前会话标成 required-evidence failure。现在非有限 residual/normal 变为缺失、持久化前执行有限数预检，单帧退化只释放 evidence slot 并等待后续 frame；真正的磁盘/framing/身份/burst 故障仍 fail closed。源码没有“三个通道”切库限制，生产仍是 `continuous_streaming` 单库。
+- 完整审查继续收紧 frame-local 防崩溃边界：depth/confidence pixel buffer 必须成功加锁、具有预期像素格式/尺寸/行跨度和有效 base address 才读取，并只解锁已经成功锁定的 buffer；ROI、depth count/ratio、unit normal、node timebase 和 v2 node-local 合同也在 writer 前复核。异常帧只等待下一帧，不越界读取、不写入 PC 严格解析必然拒绝的记录。
 - 已加入 Swift host/source 回归和中文本地化；当前 PriorMap **370/370 PASS（373.417 s）**，并通过 Swift parse、localization plist 校验、patch check 和 unsigned generic iphoneos QualifiedDevice Debug 全量编译/链接，AppIntents metadata 与中英文 Shortcut 训练成功。Action Button、25–45 cm 对焦矩阵与连续三个以上通道仍需签名 LiDAR 真机验证，整体保持 **NO-GO / NOT PRODUCTION READY**。
 
 ## 2026-08-19 — 人工位置更新的请求后节点保留

@@ -386,34 +386,6 @@ enum MobileMapLibrary {
         progress: ((Double, String) -> Void)? = nil
     ) throws -> MapEntry {
         progress?(0.05, "正在读取已有地图包")
-        let snapshot = try PriorMapPackageSnapshotReader.read(
-            directory: sourceDirectory)
-        let packageSHA = try PriorMapPackageIntegrity.validate(
-            snapshot: snapshot)
-        guard let manifest = snapshot.artifactsByName["manifest.json"]?
-                .parsedJSON,
-              StrictJSONScalar.integer(manifest["version"]) == 2,
-              let priorMapID = manifest["prior_map_id"] as? String,
-              let name = manifest["name"] as? String,
-              let storeID = manifest["store_id"] as? String,
-              let canonicalSourceSHA = manifest["canonical_source_sha256"]
-                as? String,
-              let floors = manifest["floors"] as? [[String: Any]],
-              let elementCount = StrictJSONScalar.integer(
-                manifest["element_count"]),
-              isSafeIdentifier(priorMapID),
-              isSHA256(packageSHA),
-              isSHA256(canonicalSourceSHA),
-              MapSourceBusinessIdentityPolicy.isValidStoreID(storeID),
-              MapSourceBusinessIdentityPolicy.isValidMapName(name),
-              !floors.isEmpty,
-              elementCount >= 0 else {
-            throw LibraryError.packageVerificationFailed(
-                "仅支持带正式 store_id/canonical identity 的 v2 地图包；"
-                    + "请在当前 PC 工作台重新生成后再导入")
-        }
-
-        progress?(0.28, "地图包完整性验证通过，正在复制到应用私有目录")
         let taskID = "package-import-\(UUID().uuidString)"
         let staging = try stagingDirectory(for: taskID)
         let fileManager = FileManager.default
@@ -424,42 +396,90 @@ enum MobileMapLibrary {
             }
         }
 
-        for name in snapshot.artifactNames.sorted() {
-            guard let artifact = snapshot.artifactsByName[name] else {
+        // Keep at most one full package snapshot alive. The old path retained
+        // every source Data/JSON object while immediately constructing a
+        // second staging snapshot, so a valid large PC package could briefly
+        // use more than twice its bounded size and be terminated by iOS
+        // memory pressure without a Swift crash. The autorelease scope copies
+        // the exact validated bytes and returns only compact identity fields;
+        // the private re-validation starts after the provider snapshot dies.
+        let identity: (
+            packageSHA: String,
+            priorMapID: String,
+            name: String,
+            floorCount: Int,
+            elementCount: Int,
+            canonicalSourceSHA: String
+        ) = try autoreleasepool {
+            let snapshot = try PriorMapPackageSnapshotReader.read(
+                directory: sourceDirectory)
+            let packageSHA = try PriorMapPackageIntegrity.validate(
+                snapshot: snapshot)
+            guard let manifest = snapshot.artifactsByName["manifest.json"]?
+                    .parsedJSON,
+                  StrictJSONScalar.integer(manifest["version"]) == 2,
+                  let priorMapID = manifest["prior_map_id"] as? String,
+                  let name = manifest["name"] as? String,
+                  let storeID = manifest["store_id"] as? String,
+                  let canonicalSourceSHA =
+                    manifest["canonical_source_sha256"] as? String,
+                  let floors = manifest["floors"] as? [[String: Any]],
+                  let elementCount = StrictJSONScalar.integer(
+                    manifest["element_count"]),
+                  isSafeIdentifier(priorMapID),
+                  isSHA256(packageSHA),
+                  isSHA256(canonicalSourceSHA),
+                  MapSourceBusinessIdentityPolicy.isValidStoreID(storeID),
+                  MapSourceBusinessIdentityPolicy.isValidMapName(name),
+                  !floors.isEmpty,
+                  elementCount >= 0 else {
                 throw LibraryError.packageVerificationFailed(
-                    "地图包快照缺少 \(name)")
+                    "仅支持带正式 store_id/canonical identity 的 v2 地图包；"
+                        + "请在当前 PC 工作台重新生成后再导入")
             }
-            let destination = staging.appendingPathComponent(name)
-            try artifact.bytes.write(to: destination, options: [.atomic])
-            try syncFile(destination)
+
+            progress?(0.28, "地图包完整性验证通过，正在复制到应用私有目录")
+            for artifactName in snapshot.artifactNames.sorted() {
+                guard let artifact = snapshot.artifactsByName[artifactName] else {
+                    throw LibraryError.packageVerificationFailed(
+                        "地图包快照缺少 \(artifactName)")
+                }
+                let destination = staging.appendingPathComponent(artifactName)
+                try artifact.bytes.write(to: destination, options: [.atomic])
+                try syncFile(destination)
+            }
+            let packageManifestURL = staging.appendingPathComponent(
+                PriorMapPackageSnapshotReader.packageManifestName)
+            try CanonicalJSONEncoder.encode(snapshot.packageManifest)
+                .write(to: packageManifestURL, options: [.atomic])
+            try syncFile(packageManifestURL)
+            try syncDirectory(staging)
+            return (
+                packageSHA, priorMapID, name, floors.count, elementCount,
+                canonicalSourceSHA)
         }
-        let packageManifestURL = staging.appendingPathComponent(
-            PriorMapPackageSnapshotReader.packageManifestName)
-        try CanonicalJSONEncoder.encode(snapshot.packageManifest)
-            .write(to: packageManifestURL, options: [.atomic])
-        try syncFile(packageManifestURL)
-        try syncDirectory(staging)
 
         progress?(0.58, "正在校验私有副本")
         _ = try verifyImportedStagingPackage(
             staging,
-            priorMapID: priorMapID,
-            packageSHA: packageSHA,
-            floorCount: floors.count,
-            elementCount: elementCount,
-            canonicalSourceSHA: canonicalSourceSHA)
+            priorMapID: identity.priorMapID,
+            packageSHA: identity.packageSHA,
+            floorCount: identity.floorCount,
+            elementCount: identity.elementCount,
+            canonicalSourceSHA: identity.canonicalSourceSHA)
 
         let target = try packageDirectory(
-            priorMapID: priorMapID, packageSHA: packageSHA)
+            priorMapID: identity.priorMapID,
+            packageSHA: identity.packageSHA)
         if fileManager.fileExists(atPath: target.path) {
             _ = try verifyPackage(
                 at: target,
-                priorMapID: priorMapID,
-                packageSHA256: packageSHA,
-                expectedName: name,
-                expectedFloorCount: floors.count,
-                expectedElementCount: elementCount,
-                expectedCanonicalSourceSHA256: canonicalSourceSHA)
+                priorMapID: identity.priorMapID,
+                packageSHA256: identity.packageSHA,
+                expectedName: identity.name,
+                expectedFloorCount: identity.floorCount,
+                expectedElementCount: identity.elementCount,
+                expectedCanonicalSourceSHA256: identity.canonicalSourceSHA)
         } else {
             try fileManager.createDirectory(
                 at: target.deletingLastPathComponent(),
@@ -471,14 +491,14 @@ enum MobileMapLibrary {
 
         progress?(0.86, "正在注册到统一门店地图库")
         let entry = try register(
-            priorMapID: priorMapID,
-            name: name,
-            packageSHA256: packageSHA,
+            priorMapID: identity.priorMapID,
+            name: identity.name,
+            packageSHA256: identity.packageSHA,
             packageURL: target,
-            floorCount: floors.count,
-            elementCount: elementCount,
+            floorCount: identity.floorCount,
+            elementCount: identity.elementCount,
             compilerVersion: "imported-pc-v2",
-            canonicalSourceSHA256: canonicalSourceSHA)
+            canonicalSourceSHA256: identity.canonicalSourceSHA)
         progress?(1, "已有地图包已验证并加入门店地图库")
         return entry
     }
