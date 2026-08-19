@@ -2942,6 +2942,20 @@ final class SupermarketScanSession {
         boundNodeID: Int64,
         captureID: UUID?
     ) -> TagObservationAppendResult? {
+        // This is a frame-local measurement rejection, not a writer failure.
+        // In particular, never pass NaN/Infinity to JSONEncoder and then make
+        // the whole continuous session permanently processing-ineligible.
+        guard observation.hasFinitePersistenceNumbers else {
+            appendScanEvent(
+                level: "warning",
+                event: "tag_observation_numeric_evidence_rejected",
+                message: "A non-finite price-tag measurement frame was skipped before persistence",
+                fields: [
+                    "observation_id": observation.observationId,
+                    "payload": String(observation.payload.prefix(128)),
+                ])
+            return nil
+        }
         guard localizationAdmissionGate.beginTransaction() == nil else {
             return nil
         }

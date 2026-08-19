@@ -1366,6 +1366,10 @@ class IOSCoreContractTests(unittest.TestCase):
         capture_core = (app / "PriceTagCaptureCore.swift").read_text(
             encoding="utf-8"
         )
+        localization_core = (
+            app / "PriceTagLocalizationCore.swift"
+        ).read_text(encoding="utf-8")
+        app_delegate = (app / "AppDelegate.swift").read_text(encoding="utf-8")
         scan_session = (app / "SupermarketScanSession.swift").read_text(
             encoding="utf-8"
         )
@@ -1375,7 +1379,7 @@ class IOSCoreContractTests(unittest.TestCase):
             "@objc private func confirmPriorMapPosition()", flow_start
         )
         barcode_flow = view_controller[flow_start:flow_end]
-        capture_sources = "\n".join((scanner, ui, barcode_flow))
+        capture_sources = "\n".join((scanner, ui, barcode_flow, app_delegate))
 
         self.assertIn("cvPixelBuffer: frame.capturedImage", scanner)
         self.assertIn("request.regionOfInterest = regionOfInterest", scanner)
@@ -1404,6 +1408,27 @@ class IOSCoreContractTests(unittest.TestCase):
         self.assertIn("presentPriceTagCaptureStartFailure", barcode_flow)
         self.assertIn("required_localization_evidence_failed", barcode_flow)
         self.assertIn("deferEvidenceUntilNodeBinding", barcode_flow)
+        self.assertIn("deferEvidenceUntilUsableMeasurement", barcode_flow)
+        self.assertIn("hasFinitePersistenceNumbers", barcode_flow)
+        self.assertIn("planeResidualM: finiteResidual", localization_core)
+        self.assertIn("PriceTagBarcodeBusinessPolicy.classify", ui)
+        self.assertIn("Possible product barcode", ui)
+        self.assertIn("It is printed on the ESL, save selected shelf", ui)
+        self.assertIn("StartESLBarcodeCaptureIntent", app_delegate)
+        self.assertIn("MarketScannerAppShortcuts", app_delegate)
+        self.assertIn("openAppWhenRun = true", app_delegate)
+        self.assertIn("PriceTagCaptureExternalTrigger.shared", app_delegate)
+        self.assertIn("handleExternalPriceTagCaptureRequest", view_controller)
+        self.assertIn("startPriceTagCapture()", view_controller)
+        view_did_appear = re.search(
+            r"override func viewDidAppear[\s\S]*?\n    \}", view_controller
+        )
+        self.assertIsNotNone(view_did_appear)
+        self.assertIn(
+            "handleExternalPriceTagCaptureRequest()",
+            view_did_appear.group(0),
+            "cold-launch App Intents must consume the pending trigger after presentation",
+        )
         self.assertIn("low_confidence_retained", barcode_flow)
         self.assertIn("retainedForReview: true", barcode_flow)
         self.assertIn("recomputableFrameCount >= 3", barcode_flow)
@@ -1432,6 +1457,8 @@ class IOSCoreContractTests(unittest.TestCase):
         )
         for prohibited in (
             "AVCaptureSession(",
+            "MPVolumeView",
+            "outputVolume",
             "session.pause(",
             "rtabmap?.stopCamera(",
             "stopMapping(",

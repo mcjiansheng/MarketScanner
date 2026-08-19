@@ -176,25 +176,45 @@ struct PriceTagDepthEvidence: Codable, Equatable {
             rejectionReason: reason)
     }
 
-    func withPlane(residualM: Double, normalCamera: SIMD3<Double>?) -> PriceTagDepthEvidence {
+    func withPlane(
+        residualM: Double?,
+        normalCamera: SIMD3<Double>?
+    ) -> PriceTagDepthEvidence {
         let validNormal = normalCamera.flatMap { normal -> [Double]? in
             let length = simd_length(normal)
-            guard length > 1.0e-9 else { return nil }
+            guard length.isFinite, length > 1.0e-9,
+                  normal.x.isFinite,
+                  normal.y.isFinite,
+                  normal.z.isFinite else {
+                return nil
+            }
             let unit = normal / length
             return [unit.x, unit.y, unit.z]
         }
+        // A nearly degenerate depth patch has no stable plane normal. The
+        // previous implementation used +infinity as the residual in that
+        // case and then copied it into the Codable observation. JSONEncoder
+        // rejects non-finite floating-point values, which made one ordinary
+        // bad depth frame poison the required sidecar health for the whole
+        // continuous scan. Absence is the truthful representation here: the
+        // frame remains measurement-unavailable/low-confidence, while the
+        // next ARFrame may still supply valid evidence.
+        let finiteResidual = residualM.flatMap {
+            $0.isFinite && $0 >= 0 ? $0 : nil
+        }
         let planeAccepted = accepted
-            && residualM.isFinite
-            && residualM <= 0.06
+            && finiteResidual.map { $0 <= 0.06 } == true
             && validNormal != nil
-        let planeQuality = min(1, max(0, 1 - residualM / 0.06))
+        let planeQuality = finiteResidual.map {
+            min(1, max(0, 1 - $0 / 0.06))
+        } ?? 0
         return PriceTagDepthEvidence(
             sampleCount: sampleCount,
             inlierCount: inlierCount,
             inlierRatio: inlierRatio,
             medianM: medianM,
             madM: madM,
-            planeResidualM: residualM,
+            planeResidualM: finiteResidual,
             surfaceNormalCamera: validNormal,
             confidence: planeAccepted
                 ? min(0.92, confidence * (0.82 + 0.18 * planeQuality))
@@ -513,6 +533,52 @@ struct PriorMapTagObservationRecord: Codable {
         case measurementHeightM = "measurement_height_m"
         case epoch
         case component
+    }
+
+    /// Preflight for the strict JSONL writer. A frame-local numeric failure
+    /// must be skipped before persistence, never be misreported as a disk or
+    /// framing failure that invalidates an otherwise healthy scan session.
+    var hasFinitePersistenceNumbers: Bool {
+        func validPoint(_ point: PriorMapTagPoint3D?) -> Bool {
+            guard let point else { return true }
+            return point.xM.isFinite
+                && point.yM.isFinite
+                && (point.heightM?.isFinite ?? true)
+        }
+        func validNodePoint(_ point: PriorMapTagNodeLocalPoint3D?) -> Bool {
+            guard let point else { return true }
+            return point.xM.isFinite && point.yM.isFinite && point.zM.isFinite
+        }
+        return timestamp.isFinite
+            && normalizedBounds.count == 4
+            && normalizedBounds.allSatisfy { $0.isFinite }
+            && frameTimestamp.isFinite
+            && nodeTimebaseFrameTimestamp.isFinite
+            && nodeTimebaseOffsetSeconds.isFinite
+            && poseTimestampDeltaMs.isFinite
+            && poseTimestampDeltaMs >= 0
+            && alignmentSnapshotTimestamp.isFinite
+            && alignmentAgeMs.isFinite
+            && alignmentAgeMs >= 0
+            && measurementConfidence.isFinite
+            && measurementConfidence >= 0
+            && measurementConfidence <= 1
+            && depthInlierRatio.isFinite
+            && depthInlierRatio >= 0
+            && depthInlierRatio <= 1
+            && (depthMedianM?.isFinite ?? true)
+            && (depthMadM?.isFinite ?? true)
+            && (planeResidualM?.isFinite ?? true)
+            && (surfaceNormalCamera.map {
+                $0.count == 3 && $0.allSatisfy { $0.isFinite }
+            } ?? true)
+            && localizationConfidence.isFinite
+            && localizationConfidence >= 0
+            && localizationConfidence <= 1
+            && validPoint(rawMapPosition)
+            && (boundNodeStamp?.isFinite ?? true)
+            && validNodePoint(pointInBoundNodeFrame)
+            && (measurementHeightM?.isFinite ?? true)
     }
 
     /// V1R5: returns a copy bound to the durable burst/frame identity

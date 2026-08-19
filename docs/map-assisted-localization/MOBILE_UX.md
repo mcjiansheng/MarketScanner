@@ -46,9 +46,15 @@
 
 “扫描价签条码”进入专用 camera-only Capture Mode，持续消费当前 `ARFrame.capturedImage`，不启动第二路相机，也不暂停 ARSession、RTAB-Map、数据库、Clock、Pose、node creation 或 prior-map localization；ARKit continuous autofocus 显式保持启用。固定 scan box 会映射成 Vision 的真实 ROI；状态文字固定在该框上边缘外 18 pt，条码文字固定在下边缘外 18 pt，边框、文字布局和 Vision ROI 共用同一个 `normalizedScanRect`，不再用 `centerY` 偏移。Vision 最多 10 Hz、one-in-flight；主 ROI 无结果时在同一 worker/ARFrame 上只追加一次有界扩展 ROI，支持 QR、EAN‑8/13、Code128、Code39/93、I2of5、ITF14、UPC‑E、PDF417、DataMatrix、Aztec（iOS 15+ 另含 Codabar）。每个 request 有 1 秒 ARFrame deadline，预览最多 24 Hz。Vision worker 固定为两条 lane：超时 lane 被 cancel/quarantine，备用 lane 可继续；两条都挂起时 Barcode UX fail closed，原扫描继续。候选连续 2 帧锁定，同一 capture 目标 4 个、最低 3 个独立 frame，最大窗口 4 秒。
 
+扫码初始提示建议与价签保持约 25–45 cm，让 ARKit continuous autofocus 有合理工作距离；模糊或退化深度只跳过当前 frame。iPhone 15 Pro 及更新机型可在“设置 → Action Button → Shortcut”绑定 MarketScanner 的 `Scan ESL` App Shortcut；它回到前台后走与屏幕按钮相同的完整准入。传统 Ring/Silent 拨片和音量键不可作为受支持的 App 原始按键，应用不监听系统音量变化、不嵌入隐藏音量控件，也不另外打开 `AVCaptureSession`。
+
+Vision 识别“条码”，不识别“这个条码印在商品包装还是 ESL 上”。因此商品正面的 EAN/UPC 和 URL QR 很快成功是正常检测结果。当前把典型零售码标为“疑似商品码”，操作员只有在确认该码确实印在 ESL 上时才能保存；Code128 继续允许，因为山姆现场 ESL 自身就是 Code128。若要求完全自动区分，必须另提供门店级 ESL payload/主数据合同。
+
 条码已锁定但 live node snapshot 暂时不可用时，只释放当前 evidence slot，并在同一严格 1 秒 node-timebase 合同内复用已冻结 exact-ID snapshot 或等待后续 frame；不得把它升级为 required-write failure，也不得启用 nearest-node/timestamp fallback。完整 durable burst 若仅因 recovering/weak、深度、node uncertainty、位置离散或货架歧义不足以自动确认，会直接保留为 `LOW_CONFIDENCE`，现场提示无需立即重扫；scene-depth observation v2 使用同一次 snapshot 保存 exact node-local point，PC 按 `P_final=T_final_node×P_node` 重投影并把结果写入 PriceTags 待复核。只有 burst/身份/图质量/exact node/node-local point/可解析位置等权威证据缺失，或输入仍是 legacy v1 coordinate frame 时才进入 `RESCAN_REQUIRED`。
 
 深度使用内缩 9×9 ROI，记录样本数、内点数/比例、中值、MAD、平面残差和法向；样本不足、前后景分层、反射/孔洞或平面不稳定时退化为货架射线或待复核，不能因为“有深度”就获得高置信。对齐快照超过 250 ms 降级，超过 600 ms 或版本落后强制 lost/review。只有至少 3 个逐帧可靠证据共同指向同一 `shelfSegmentId + side` 才允许确认；弱帧可以保留作 raw audit，但不能凑足确认 quorum。
+
+平面无法形成稳定法向量时 `plane_residual_m` 必须为缺失而不是 NaN/Infinity；observation 在 JSONL 写入前再次检查所有浮点证据。该类单帧数值退化只等待下一帧，不把整场扫描标成写入失败。应用没有“三个通道后新建扫描”的规则，整个楼层仍写同一个 `segment_0001` 连续数据库；只有真正的 required sidecar 写入/framing/身份/绑定失败才提示结束并创建新扫描。
 
 逐帧 observation 先落盘，complete burst 后才进入确认页。确认页显示 ESL、算法货架/侧面、迷你地图、高亮货架和替代候选，提供“正确”“错误/选择替代”“重扫”“仅保留观测”。替代选择按 segment + side 精确绑定。`USER_CONFIRMED` / `USER_OVERRIDDEN` 只新增用户证据，不覆盖算法关联，更不修改 SLAM、轨迹或 localization constraint。required evidence 写入失败、prior-map generation 失效或持久化失败时 fail closed，原始 RTAB-Map 数据库仍继续记录。
 

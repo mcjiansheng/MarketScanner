@@ -26,6 +26,11 @@
 | `weak_texture` | 制造 10–20 秒弱纹理 | weak/lost 有审计，不硬吸附 |
 | `dynamic_occlusion` | 行人或动态物体遮挡 | 状态可见，不错误自动确认 |
 | `tag_scan` | 至少 3 次 tag scan，一处靠近货架端点 | 不确定样本进入 review |
+| `tag_action_button_30x` | 把 Action Button 绑定 `Scan ESL`，前台/后台共触发 30 次 | 每次只进入同一个 ARFrame 扫码入口；不得暂停连续 DB/ARSession |
+| `tag_focus_distance` | 25/35/45/60 cm，强弱光、反光和倾斜分别扫 ESL | 记录自动对焦时间/成功率；模糊 frame 可恢复，不把单帧退化升级为 writer failure |
+| `tag_product_code_guard` | 分别扫描商品正面 EAN/UPC/URL QR 与真实 ESL Code128 | 商品码出现风险提示且需明确确认；ESL Code128 不被误拒 |
+| `multi_aisle_continuity` | 连续完成至少 5 个通道并穿插价签采集 | 始终为同一 tracking session/`segment_0001`；没有按通道数量要求新扫描 |
+| `tag_numeric_degradation` | 安全注入一个非有限/退化 measurement frame，随后恢复正常深度 | 坏 frame 被跳过并继续同一 capture；required writer failure count 不增加 |
 | `manual_correction` | 人工确认一次位置 | correction 绑定 node/time 并可审计 |
 | `manual_reselection_20x` | 手机保持静止与正常步行各连续执行缩放、平移、选点、X/Y/yaw/离散旋转后确认，共 20 次；记录请求/新 node/恢复事件 | 无需晃动手机即可绑定严格 post-request node；node-time≤1 秒；UI/event/alignment/PC 值一致；扫描 profile 恢复；失败保持弹窗和输入 |
 | `manual_persistence_failure` | 对 manual JSONL 做安全故障注入 | durable append 失败时 live alignment 不改变，raw DB 继续增长 |

@@ -449,6 +449,96 @@ func runESLBarcodeCaptureFocusedTests() {
         return false
     }
 
+    require(
+        PriceTagBarcodeBusinessPolicy.classify(
+            payload: "6901234567890",
+            symbology: "VNBarcodeSymbologyEAN13") == .likelyRetailProduct,
+        "retail EAN-13 must require explicit ESL identity confirmation")
+    require(
+        PriceTagBarcodeBusinessPolicy.classify(
+            payload: "https://m-sams.walmartmobile.cn/common/scan-app?id=1",
+            symbology: "VNBarcodeSymbologyQR") == .likelyRetailProduct,
+        "retail URL QR must require explicit ESL identity confirmation")
+    require(
+        PriceTagBarcodeBusinessPolicy.classify(
+            payload: "981115951",
+            symbology: "VNBarcodeSymbologyCode128") == .eslCompatible,
+        "Sam-style Code128 ESL payloads must remain capturable")
+
+    let coherentPlaneFixture = PriceTagDepthEvidence.evaluate(
+        (0..<64).map { 1.20 + Float($0 % 5 - 2) * 0.002 })
+    let degeneratePlaneFixture = coherentPlaneFixture.withPlane(
+        residualM: Double.infinity,
+        normalCamera: nil)
+    require(
+        !degeneratePlaneFixture.accepted
+            && degeneratePlaneFixture.planeResidualM == nil
+            && degeneratePlaneFixture.surfaceNormalCamera == nil,
+        "a degenerate depth plane must use absent evidence, never Infinity")
+    require(
+        (try? JSONEncoder().encode(degeneratePlaneFixture)) != nil,
+        "a degenerate depth plane must remain JSON encodable")
+
+    func persistenceObservation(
+        planeResidualM: Double? = 0.01
+    ) -> PriorMapTagObservationRecord {
+        return PriorMapTagObservationRecord(
+            format: "MarketScannerPriceTagObservation",
+            version: 2,
+            observationId: "numeric-preflight",
+            timestamp: 1_700_000_000,
+            payload: "981115951",
+            symbology: "VNBarcodeSymbologyCode128",
+            normalizedBounds: [0.4, 0.4, 0.2, 0.1],
+            frameTimestamp: 10,
+            nodeTimebaseFrameTimestamp: 10,
+            nodeTimebaseOffsetSeconds: 0,
+            poseTimestampDeltaMs: 0,
+            alignmentVersion: 1,
+            alignmentSnapshotTimestamp: 10,
+            alignmentAgeMs: 0,
+            alignmentVersionLag: 0,
+            alignmentFreshness: "fresh",
+            rawMapPosition: PriorMapTagPoint3D(
+                xM: 1, yM: 2, heightM: 1.2),
+            measurementMethod: "scene_depth",
+            measurementConfidence: 0.9,
+            depthSampleCount: 64,
+            depthInlierCount: 60,
+            depthInlierRatio: 0.9375,
+            depthMedianM: 1.2,
+            depthMadM: 0.002,
+            planeResidualM: planeResidualM,
+            surfaceNormalCamera: [0, 0, -1],
+            localizationState: "stable",
+            localizationConfidence: 0.9,
+            priorMapId: "map-esl",
+            priorMapSha256: String(repeating: "a", count: 64),
+            floorId: "F1",
+            trackingSessionId: "SESSION-ESL",
+            needsReview: false,
+            burstId: nil,
+            frameId: nil,
+            boundNodeId: 7,
+            boundNodeStamp: 10,
+            boundNodeMapId: 0,
+            coordinateFrame: "RTABMAP_BOUND_NODE_LOCAL",
+            pointInBoundNodeFrame: PriorMapTagNodeLocalPoint3D(
+                xM: 0.1, yM: 0.2, zM: -1.2),
+            measurementHeightM: 1.2)
+    }
+    let finiteObservation = persistenceObservation()
+    require(
+        finiteObservation.hasFinitePersistenceNumbers,
+        "finite ESL observation numbers must pass writer preflight")
+    let nonFiniteObservation = persistenceObservation(planeResidualM: .infinity)
+    require(
+        !nonFiniteObservation.hasFinitePersistenceNumbers,
+        "non-finite ESL observation numbers must fail before JSONL persistence")
+    require(
+        (try? JSONEncoder().encode(nonFiniteObservation)) == nil,
+        "the regression fixture must reproduce JSONEncoder's Infinity rejection")
+
     // BC-00: Vision revision 1 already reports full-image coordinates;
     // revision 2+ reports request-ROI-local coordinates and must be converted
     // with the exact request that produced the observation.
@@ -955,8 +1045,10 @@ func runESLBarcodeCaptureFocusedTests() {
         let second = submit(
             coordinator, generation: generation,
             timestamp: 0.2, candidates: [activeA])
-        if case .candidateSeen(_, let lockFrames, _) = first {
-            require(lockFrames == 1, "BC-04 first A must start lock at one")
+        if case .candidateSeen(_, let symbology, let lockFrames, _) = first {
+            require(
+                symbology == "EAN13" && lockFrames == 1,
+                "BC-04 first A must preserve symbology and start lock at one")
         } else {
             require(false, "BC-04 first A must enter candidate state")
         }
@@ -1015,6 +1107,36 @@ func runESLBarcodeCaptureFocusedTests() {
         else {
             require(false, "deferred evidence must return to collection")
         }
+        let nextMeasurement = submit(
+            coordinator, generation: generation,
+            timestamp: 0.6, candidates: [activeA])
+        if case .collect(let resumedID, _) = nextMeasurement {
+            require(
+                resumedID == captureID,
+                "the next numeric-measurement slot must belong to the same capture")
+        }
+        else {
+            require(false, "numeric-measurement fixture must admit the next frame")
+        }
+        let numericDeferred = coordinator.deferEvidenceUntilUsableMeasurement(
+            generation: generation,
+            captureID: captureID,
+            frameTimestamp: 0.6)
+        require(
+            numericDeferred == .waitingForUsableMeasurement(
+                acceptedFrames: 1, requiredFrames: 3),
+            "one non-finite frame must not cancel or poison the active capture")
+        let resumedAfterNumericFailure = submit(
+            coordinator, generation: generation,
+            timestamp: 0.8, candidates: [activeA])
+        if case .collect(let resumedID, _) = resumedAfterNumericFailure {
+            require(
+                resumedID == captureID,
+                "a later finite frame must resume the same capture")
+        }
+        else {
+            require(false, "capture must continue after frame-local numeric rejection")
+        }
         _ = coordinator.cancel(reason: "transient_binding_test_complete")
     }
     do {
@@ -1025,7 +1147,7 @@ func runESLBarcodeCaptureFocusedTests() {
         let changed = submit(
             coordinator, generation: generation,
             timestamp: 0.2, candidates: [activeB])
-        if case .candidateSeen(let payload, let lockFrames, _) = changed {
+        if case .candidateSeen(let payload, _, let lockFrames, _) = changed {
             require(
                 payload == activeB.payload && lockFrames == 1,
                 "BC-04 A,B must reset the lock to B/1")
@@ -1049,7 +1171,7 @@ func runESLBarcodeCaptureFocusedTests() {
         let nextA = submit(
             coordinator, generation: generation,
             timestamp: 0.4, candidates: [activeA])
-        if case .candidateSeen(let payload, let lockFrames, _) = nextA {
+        if case .candidateSeen(let payload, _, let lockFrames, _) = nextA {
             require(
                 payload == activeA.payload && lockFrames == 1,
                 "BC-04 A,none,A must restart candidate lock at A/1")

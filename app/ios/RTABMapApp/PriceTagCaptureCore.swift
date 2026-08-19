@@ -261,6 +261,43 @@ enum PriceTagBarcodeSelection: Equatable {
     case ambiguous([PriceTagSelectedBarcode])
 }
 
+enum PriceTagBarcodeBusinessClassification: Equatable {
+    case eslCompatible
+    case likelyRetailProduct
+}
+
+/// Vision recognizes symbols, not business meaning. EAN/UPC/ITF retail
+/// symbols and URL-shaped 2D payloads are therefore surfaced as likely
+/// product codes. They are not silently discarded because some stores use
+/// those same symbologies on ESL hardware; the confirmation UI must make the
+/// operator explicitly attest that the code is printed on the ESL.
+enum PriceTagBarcodeBusinessPolicy {
+    static func classify(
+        payload: String,
+        symbology: String
+    ) -> PriceTagBarcodeBusinessClassification {
+        let normalizedSymbology = symbology
+            .uppercased()
+            .filter { $0.isLetter || $0.isNumber }
+        let retailSymbologies = [
+            "EAN8", "EAN13", "UPCA", "UPCE", "I2OF5", "ITF14",
+        ]
+        if retailSymbologies.contains(where: {
+            normalizedSymbology.hasSuffix($0)
+        }) {
+            return .likelyRetailProduct
+        }
+        let normalizedPayload = payload.trimmingCharacters(
+            in: .whitespacesAndNewlines).lowercased()
+        if normalizedPayload.hasPrefix("http://")
+            || normalizedPayload.hasPrefix("https://")
+            || normalizedPayload.hasPrefix("sams://") {
+            return .likelyRetailProduct
+        }
+        return .eslCompatible
+    }
+}
+
 enum PriceTagBarcodeSelector {
     /// Vision can occasionally return duplicate observations for the same
     /// physical symbol. Only nearly coincident boxes are detector duplicates;
@@ -612,12 +649,19 @@ final class PriceTagVisionWorkerExecutor {
 enum PriceTagCaptureVisionAction: Equatable {
     case ignored
     case keepAiming(code: String)
-    case candidateSeen(payload: String, lockFrames: Int, requiredFrames: Int)
+    case candidateSeen(
+        payload: String,
+        symbology: String,
+        lockFrames: Int,
+        requiredFrames: Int)
     case candidateLocked(captureID: UUID, barcode: PriceTagSelectedBarcode)
     case collect(captureID: UUID, barcode: PriceTagSelectedBarcode)
     case duplicateCompleted(payload: String)
     case multipleBarcodes
-    case targetChanged(previousCaptureID: UUID, payload: String)
+    case targetChanged(
+        previousCaptureID: UUID,
+        payload: String,
+        symbology: String)
     case requestTimedOut(frameTimestamp: TimeInterval)
     case resolve(captureID: UUID, observationIDs: [String])
     /// `revokeVisionRequest` is true only for the synchronous ARFrame-deadline
@@ -632,6 +676,7 @@ enum PriceTagCaptureEvidenceAction: Equatable {
     case ignored
     case continueCollecting(acceptedFrames: Int, requiredFrames: Int)
     case waitingForNodeBinding(acceptedFrames: Int, requiredFrames: Int)
+    case waitingForUsableMeasurement(acceptedFrames: Int, requiredFrames: Int)
     case resolve(captureID: UUID, observationIDs: [String])
     case timedOut(captureID: UUID)
     case requiredEvidenceFailed(captureID: UUID)
@@ -1364,6 +1409,7 @@ final class PriceTagCaptureCoordinator {
                     lockFrames: 1)
                 return .candidateSeen(
                     payload: payload,
+                    symbology: symbology,
                     lockFrames: 1,
                     requiredFrames: policy.minimumCandidateLockFrames)
             case .candidate(
@@ -1383,6 +1429,7 @@ final class PriceTagCaptureCoordinator {
                         lockFrames: 1)
                     return .candidateSeen(
                         payload: payload,
+                        symbology: symbology,
                         lockFrames: 1,
                         requiredFrames: policy.minimumCandidateLockFrames)
                 }
@@ -1396,6 +1443,7 @@ final class PriceTagCaptureCoordinator {
                         lockFrames: updatedFrames)
                     return .candidateSeen(
                         payload: payload,
+                        symbology: symbology,
                         lockFrames: updatedFrames,
                         requiredFrames: policy.minimumCandidateLockFrames)
                 }
@@ -1434,7 +1482,8 @@ final class PriceTagCaptureCoordinator {
                     candidateLastFrameTimestamp = frameTimestamp
                     return .targetChanged(
                         previousCaptureID: captureID,
-                        payload: payload)
+                        payload: payload,
+                        symbology: symbology)
                 }
                 guard !acceptedFrameTimestamps.contains(frameTimestamp),
                       pendingEvidenceFrameTimestamp != frameTimestamp else {
@@ -1593,6 +1642,34 @@ final class PriceTagCaptureCoordinator {
         evidenceInFlight = false
         pendingEvidenceFrameTimestamp = nil
         return .waitingForNodeBinding(
+            acceptedFrames: acceptedFrames,
+            requiredFrames: requiredFrames)
+    }
+
+    /// A single ARFrame can contain degenerate depth/pose numbers while the
+    /// continuous scan and sidecar writer remain healthy. Release only that
+    /// frame's slot and keep collecting. This is deliberately separate from
+    /// `finishEvidence(... succeeded: false)`, which is reserved for a real
+    /// required evidence persistence failure.
+    func deferEvidenceUntilUsableMeasurement(
+        generation: UUID,
+        captureID: UUID,
+        frameTimestamp: TimeInterval
+    ) -> PriceTagCaptureEvidenceAction {
+        lock.lock()
+        defer { lock.unlock() }
+        guard case .collecting(
+                let currentGeneration, let currentCaptureID,
+                _, _, let acceptedFrames, let requiredFrames) = stateValue,
+              currentGeneration == generation,
+              currentCaptureID == captureID,
+              evidenceInFlight,
+              pendingEvidenceFrameTimestamp == frameTimestamp else {
+            return .ignored
+        }
+        evidenceInFlight = false
+        pendingEvidenceFrameTimestamp = nil
+        return .waitingForUsableMeasurement(
             acceptedFrames: acceptedFrames,
             requiredFrames: requiredFrames)
     }

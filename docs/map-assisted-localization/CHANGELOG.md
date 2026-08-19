@@ -2,6 +2,14 @@
 
 > 文档状态：**当前有效**。最后核对日期：2026-08-19。
 
+## 2026-08-19 — ESL 现场触发、商品码提示与连续扫描修复
+
+- 新增 `Scan ESL` App Intent/App Shortcut。iPhone 15 Pro 及更新机型可把 Action Button 配置为该 Shortcut；它打开 App 后只转发到现有 `startPriceTagCapture()`，不创建第二路相机，也不绕过扫描/定位/sidecar 门。传统静音拨片和音量键没有受支持的 raw-key API，明确不采用系统音量劫持。
+- 保持 ARKit continuous autofocus，扫码框提示约 25–45 cm 工作距离。软件不能控制 ARKit 相机同时又另行锁定 `AVCaptureDevice`，也不能突破镜头最短对焦距离。
+- Vision 能高效识别商品正面的 EAN/UPC/QR 属正常现象。EAN/UPC/ITF 与 URL 型 QR 现在显示“疑似商品码”，确认页要求操作员明确证明该码印在 ESL 上；Code128 不按长度/前缀静默拒绝，因为山姆现场 9 位 ESL 也使用 Code128。完全自动区分仍需要门店级 payload 合同、ESL 主数据或服务端校验。
+- 关闭连续扫描现场故障：退化 depth plane 过去把 `+Infinity` 作为 residual 传入 observation，导致 `JSONEncoder` 写 `tag_observations.jsonl` 失败并把当前会话标成 required-evidence failure。现在非有限 residual/normal 变为缺失、持久化前执行有限数预检，单帧退化只释放 evidence slot 并等待后续 frame；真正的磁盘/framing/身份/burst 故障仍 fail closed。源码没有“三个通道”切库限制，生产仍是 `continuous_streaming` 单库。
+- 已加入 Swift host/source 回归和中文本地化；当前 PriorMap **370/370 PASS（373.417 s）**，并通过 Swift parse、localization plist 校验、patch check 和 unsigned generic iphoneos QualifiedDevice Debug 全量编译/链接，AppIntents metadata 与中英文 Shortcut 训练成功。Action Button、25–45 cm 对焦矩阵与连续三个以上通道仍需签名 LiDAR 真机验证，整体保持 **NO-GO / NOT PRODUCTION READY**。
+
 ## 2026-08-19 — 人工位置更新的请求后节点保留
 
 - 修复“位置更新等待 stable RTAB-Map node 超时”：RTAB-Map 的 0.05 m/0.05 rad 小位移门和 rehearsal 会在操作者按提示保持静止时淘汰 detector frame，旧 UI 因而可能在 6 秒内永远等不到 fresh retained node。

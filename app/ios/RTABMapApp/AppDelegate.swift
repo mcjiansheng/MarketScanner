@@ -6,6 +6,7 @@
 //
 
 import UIKit
+import AppIntents
 import ARKit
 import MetricKit
 
@@ -312,4 +313,69 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         // If any sessions were discarded while the application was not running, this will be called shortly after application:didFinishLaunchingWithOptions.
         // Use this method to release any resources that were specific to the discarded scenes, as they will not return.
     }
+}
+
+extension Notification.Name {
+    static let marketScannerPriceTagCaptureRequested = Notification.Name(
+        "MarketScannerPriceTagCaptureRequested")
+}
+
+final class PriceTagCaptureExternalTrigger: @unchecked Sendable {
+    static let shared = PriceTagCaptureExternalTrigger()
+
+    private let lock = NSLock()
+    private var requestPending = false
+
+    private init() {}
+
+    func requestCapture() {
+        lock.lock()
+        requestPending = true
+        lock.unlock()
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(
+                name: .marketScannerPriceTagCaptureRequested,
+                object: nil)
+        }
+    }
+
+    func consumePendingRequest() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard requestPending else { return false }
+        requestPending = false
+        return true
+    }
+}
+
+/// iPhone 15 Pro and newer can bind this App Shortcut to the Action Button.
+/// Classic mute switches and hardware volume keys are not app-programmable
+/// controls in the public iOS SDK, so no volume interception is attempted.
+@available(iOS 16.0, *)
+struct StartESLBarcodeCaptureIntent: AppIntent {
+    static var title: LocalizedStringResource = "Scan ESL Barcode"
+    static var description = IntentDescription(
+        "Open the active MarketScanner session and start ESL barcode capture.")
+    static var openAppWhenRun = true
+
+    func perform() async throws -> some IntentResult & ProvidesDialog {
+        PriceTagCaptureExternalTrigger.shared.requestCapture()
+        return .result(dialog: "Opening MarketScanner to request ESL barcode capture.")
+    }
+}
+
+@available(iOS 16.0, *)
+struct MarketScannerAppShortcuts: AppShortcutsProvider {
+    static var appShortcuts: [AppShortcut] {
+        AppShortcut(
+            intent: StartESLBarcodeCaptureIntent(),
+            phrases: [
+                "Scan ESL with \(.applicationName)",
+                "Scan a price tag with \(.applicationName)",
+            ],
+            shortTitle: "Scan ESL",
+            systemImageName: "barcode.viewfinder")
+    }
+
+    static var shortcutTileColor: ShortcutTileColor { .blue }
 }

@@ -153,6 +153,8 @@ final class PriceTagCaptureOverlayView: UIView {
     private let progressView = UIProgressView(progressViewStyle: .default)
     private let scanTopGuide = UILayoutGuide()
     private let scanBottomGuide = UILayoutGuide()
+    private var barcodeBusinessClassification:
+        PriceTagBarcodeBusinessClassification = .eslCompatible
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -277,20 +279,37 @@ final class PriceTagCaptureOverlayView: UIView {
         let color: UIColor
         switch status {
         case .aiming:
-            statusLabel.text = NSLocalizedString("Place the ESL barcode inside the frame", comment: "")
+            barcodeBusinessClassification = .eslCompatible
+            statusLabel.text = NSLocalizedString(
+                "Place the ESL barcode inside the frame. Stay about 25–45 cm away for autofocus.",
+                comment: "")
             payloadLabel.text = nil
             progressView.progress = 0
             color = .white
         case .candidate(let payload, let lockFrames, let requiredFrames):
-            statusLabel.text = NSLocalizedString("Barcode detected. Hold steady", comment: "")
+            statusLabel.text = barcodeBusinessClassification
+                == .likelyRetailProduct
+                ? NSLocalizedString(
+                    "Possible product barcode. Use only the code printed on the ESL.",
+                    comment: "")
+                : NSLocalizedString("Barcode detected. Hold steady", comment: "")
             payloadLabel.text = payload
             progressView.progress = Float(lockFrames) / Float(max(1, requiredFrames)) * 0.25
             color = .systemYellow
         case .collecting(let payload, let acceptedFrames, let requiredFrames):
-            statusLabel.text = String(
-                format: NSLocalizedString("Collecting evidence %d/%d", comment: ""),
-                acceptedFrames,
-                requiredFrames)
+            statusLabel.text = barcodeBusinessClassification
+                == .likelyRetailProduct
+                ? String(
+                    format: NSLocalizedString(
+                        "Possible product barcode · ESL evidence %d/%d",
+                        comment: ""),
+                    acceptedFrames,
+                    requiredFrames)
+                : String(
+                    format: NSLocalizedString(
+                        "Collecting evidence %d/%d", comment: ""),
+                    acceptedFrames,
+                    requiredFrames)
             payloadLabel.text = payload
             progressView.progress = 0.25
                 + 0.75 * Float(acceptedFrames) / Float(max(1, requiredFrames))
@@ -326,6 +345,13 @@ final class PriceTagCaptureOverlayView: UIView {
             .compactMap { $0 }
             .joined(separator: ". ")
         UIAccessibility.post(notification: .announcement, argument: statusLabel.text)
+    }
+
+    func setBarcodeIdentity(payload: String, symbology: String) {
+        barcodeBusinessClassification =
+            PriceTagBarcodeBusinessPolicy.classify(
+                payload: payload,
+                symbology: symbology)
     }
 
     @objc private func cancelTapped() {
@@ -451,9 +477,16 @@ final class PriceTagShelfConfirmationViewController: UIViewController {
         titleLabel.font = .preferredFont(forTextStyle: .title2)
         titleLabel.adjustsFontForContentSizeCategory = true
         titleLabel.numberOfLines = 0
-        titleLabel.text = NSLocalizedString(
-            "Does this ESL belong to the highlighted shelf?",
-            comment: "")
+        let businessClassification = PriceTagBarcodeBusinessPolicy.classify(
+            payload: model.tag.payload,
+            symbology: model.tag.symbology)
+        titleLabel.text = businessClassification == .likelyRetailProduct
+            ? NSLocalizedString(
+                "This looks like a retail product barcode. Confirm only if this exact code is printed on the ESL.",
+                comment: "")
+            : NSLocalizedString(
+                "Does this ESL belong to the highlighted shelf?",
+                comment: "")
 
         let barcodeLabel = UILabel()
         barcodeLabel.font = .monospacedSystemFont(ofSize: 17, weight: .semibold)
@@ -501,7 +534,9 @@ final class PriceTagShelfConfirmationViewController: UIViewController {
         miniMap.selectedSegmentID = algorithm?.shelfSegmentId
 
         let correctButton = actionButton(
-            title: NSLocalizedString("Correct, save", comment: ""),
+            title: businessClassification == .likelyRetailProduct
+                ? NSLocalizedString("It is printed on the ESL, save", comment: "")
+                : NSLocalizedString("Correct, save", comment: ""),
             color: .systemGreen,
             selector: #selector(confirmAlgorithm))
         correctButton.isEnabled = model.algorithmCandidateReliable
@@ -545,7 +580,11 @@ final class PriceTagShelfConfirmationViewController: UIViewController {
             alternativesStack.addArrangedSubview(button)
         }
         saveSelectedButton.setTitle(
-            NSLocalizedString("Save selected shelf", comment: ""),
+            businessClassification == .likelyRetailProduct
+                ? NSLocalizedString(
+                    "It is printed on the ESL, save selected shelf",
+                    comment: "")
+                : NSLocalizedString("Save selected shelf", comment: ""),
             for: .normal)
         saveSelectedButton.titleLabel?.font = .preferredFont(forTextStyle: .headline)
         saveSelectedButton.backgroundColor = .systemBlue

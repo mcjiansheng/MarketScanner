@@ -546,6 +546,11 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         // notification shade or Siri) which never enter the background.
         notificationCenter.addObserver(self, selector: #selector(appMovedToForeground), name: UIApplication.didBecomeActiveNotification, object: nil)
         notificationCenter.addObserver(self, selector: #selector(defaultsChanged), name: UserDefaults.didChangeNotification, object: nil)
+        notificationCenter.addObserver(
+            self,
+            selector: #selector(handleExternalPriceTagCaptureRequest),
+            name: .marketScannerPriceTagCaptureRequested,
+            object: nil)
         
         registerSettingsBundle()
         
@@ -1526,6 +1531,7 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         if !resumeCaptureAfterSystemInterruption() {
             updateState(state: mState)
         }
+        handleExternalPriceTagCaptureRequest()
     }
     
     func setMeshRendering(viewMode: Int)
@@ -3215,6 +3221,10 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         finishStartup()
+        // A cold-launch App Intent can run before viewDidLoad installs its
+        // notification observer. The locked pending flag is authoritative,
+        // so consume it once the presenting view is actually on screen.
+        handleExternalPriceTagCaptureRequest()
     }
     
     var statusBarOrientation: UIInterfaceOrientation? {
@@ -4533,6 +4543,18 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         startPriceTagCapture()
     }
 
+    /// Public App Shortcut / iPhone Action Button entry. The shortcut never
+    /// owns a camera and cannot bypass the ordinary scan/localization gates;
+    /// it merely invokes the same ARFrame-only UX as the on-screen button.
+    @objc private func handleExternalPriceTagCaptureRequest() {
+        guard UIApplication.shared.applicationState == .active,
+              PriceTagCaptureExternalTrigger.shared.consumePendingRequest()
+        else {
+            return
+        }
+        startPriceTagCapture()
+    }
+
     private func recordPriceTagCaptureAudit(
         _ code: PriceTagCaptureAuditCode,
         generation: UUID? = nil,
@@ -5157,10 +5179,15 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     self.priceTagCaptureOverlay?.update(.aiming)
                 }
             }
-        case .candidateSeen(let payload, let lockFrames, let requiredFrames):
+        case .candidateSeen(
+                let payload, let symbology,
+                let lockFrames, let requiredFrames):
             DispatchQueue.main.async {
                 guard self.priceTagCaptureCoordinator.isCurrent(
                     result.generation) else { return }
+                self.priceTagCaptureOverlay?.setBarcodeIdentity(
+                    payload: payload,
+                    symbology: symbology)
                 self.priceTagCaptureOverlay?.update(.candidate(
                     payload: payload,
                     lockFrames: lockFrames,
@@ -5182,6 +5209,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     accepted = 0
                     required = 4
                 }
+                self.priceTagCaptureOverlay?.setBarcodeIdentity(
+                    payload: barcode.candidate.payload,
+                    symbology: barcode.candidate.symbology)
                 self.priceTagCaptureOverlay?.update(.collecting(
                     payload: barcode.candidate.payload,
                     acceptedFrames: accepted,
@@ -5220,7 +5250,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     result.generation) else { return }
                 self.priceTagCaptureOverlay?.update(.multiple)
             }
-        case .targetChanged(let previousCaptureID, let payload):
+        case .targetChanged(
+                let previousCaptureID, let payload, let symbology):
             _ = supermarketSession?.finalizeTagObservationCapture(
                 captureID: previousCaptureID,
                 minimumFrameCount: 3)
@@ -5228,6 +5259,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             DispatchQueue.main.async {
                 guard self.priceTagCaptureCoordinator.isCurrent(
                     result.generation) else { return }
+                self.priceTagCaptureOverlay?.setBarcodeIdentity(
+                    payload: payload,
+                    symbology: symbology)
                 self.priceTagCaptureOverlay?.update(.candidate(
                     payload: payload,
                     lockFrames: 1,
@@ -5338,6 +5372,29 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     capturePoseEpoch: capturePoseEpoch,
                     openGLWorldFromNode: binding.openGLWorldFromNode)
             }
+            guard localized.observation.hasFinitePersistenceNumbers else {
+                self.recordPriceTagCaptureAudit(
+                    .measurementUnavailable,
+                    generation: result.generation,
+                    captureID: captureID,
+                    phase: "numeric_preflight",
+                    payload: detection.payload,
+                    symbology: detection.symbology,
+                    sourceReason: "non_finite_measurement_frame_skipped",
+                    terminal: false,
+                    minimumInterval: 0.5)
+                let action = self.priceTagCaptureCoordinator
+                    .deferEvidenceUntilUsableMeasurement(
+                        generation: result.generation,
+                        captureID: captureID,
+                        frameTimestamp: result.frame.timestamp)
+                self.handlePriceTagEvidenceAction(
+                    action,
+                    generation: result.generation,
+                    captureID: captureID,
+                    payload: detection.payload)
+                return
+            }
             if localized.observation.pointInBoundNodeFrame == nil
                 || localized.observation.measurementMethod == "unavailable" {
                 self.recordPriceTagCaptureAudit(
@@ -5440,6 +5497,19 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 self.priceTagCaptureOverlay?.update(.error(
                     message: String(
                         format: self.localized("Barcode recognized. Waiting for an exact scan-node pose before saving low-confidence evidence (%d/%d)."),
+                        acceptedFrames,
+                        requiredFrames)))
+            }
+        case .waitingForUsableMeasurement(
+                let acceptedFrames, let requiredFrames):
+            DispatchQueue.main.async {
+                guard self.priceTagCaptureCoordinator.isCurrent(generation) else {
+                    return
+                }
+                self.priceTagCaptureOverlay?.update(.error(
+                    message: String(
+                        format: self.localized(
+                            "Barcode recognized. Waiting for a usable focused depth frame (%d/%d). Move slightly back if the label is blurry."),
                         acceptedFrames,
                         requiredFrames)))
             }

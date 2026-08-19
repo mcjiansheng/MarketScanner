@@ -495,7 +495,7 @@ struct PriceTagFrameMeasurement {
                 abs(simd_dot($0 - centroid, surfaceNormal))
             }.sorted()
             return values[values.count / 2]
-        } ?? .infinity
+        }
         let planeEvidence = evaluation.withPlane(
             residualM: residual,
             normalCamera: normal)

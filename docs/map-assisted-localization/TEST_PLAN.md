@@ -2,6 +2,12 @@
 
 > 文档状态：**当前有效**。最后核对日期：2026-08-19。
 
+## 2026-08-19 ESL 现场效率与连续性回归
+
+自动化必须证明：非有限 depth-plane residual/normal 被转换为缺失且 JSON 可编码；任何 observation 的 NaN/Infinity 在 writer 前被拒绝；`deferEvidenceUntilUsableMeasurement` 只释放当前 frame slot、保留同一 capture ID 和已接受帧，后续有限 frame 可继续。磁盘写失败、JSONL framing、会话/地图身份和 observation→burst orphan 仍必须进入原有粘性 fail-closed。EAN-13、URL QR 应分类为疑似商品码；山姆 9 位 Code128 `981115951` 仍兼容。源码合同必须证明 App Intent/Shortcut 只调用现有入口，不包含 `MPVolumeView`、`outputVolume` 或第二路 `AVCaptureSession`。
+
+签名真机必须覆盖：Action Button 从前台/后台连续触发 30 次；25/35/45/60 cm、强弱光、反光、倾斜、模糊恢复；商品正面 EAN/QR 与实际 ESL Code128 的提示/确认；连续扫描至少 5 个通道且数据库仍为单一 `segment_0001`；安全注入非有限 measurement frame 后下一帧继续，同时 `tag_observation_numeric_evidence_rejected` 不增加 required writer failure；再注入真实 writer/framing 错误确认仍关闭发布门。传统静音拨片/音量键记录为平台不支持，不使用私有 API。真机矩阵完成前不得登记 Production GO。
+
 ## 2026-08-19 人工位置更新 fresh-node 超时回归
 
 自动化必须证明人工位置提交经过完整 Swift/native bridge，并用单个 `ParamEvent` 同时请求 `RGBD/LinearUpdate=0`、`RGBD/AngularUpdate=0`、`Mem/RehearsalSimilarity=1.0`；配置恢复必须来自当前 authoritative mapping profile，不能硬编码旧值。pure admission 正反例覆盖：请求后新 node 且 delta≤1 秒通过；相同/更早 frame、请求时刻前的 node stamp、相同基线 node、未递增 stamp、delta>1 秒、node 0 和非有限值拒绝；无基线时也必须以 request node-time 为下界。成功、超时、取消、系统中断、prior-map unload、finalization 和重新开库必须清除请求作用域，durable append 仍先于 alignment CAS。

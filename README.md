@@ -96,7 +96,13 @@ session input manifest v4 将 `clock_correlations.jsonl` 与源数据库和其�
 
 已有地图模式提供用户触发的 ESL Barcode Capture Mode，直接复用持续到达的 `ARFrame.capturedImage`，不启动第二路相机。进入该模式不会暂停 `ARSession`、RTAB-Map、连续 SQLite 数据库、节点创建、时钟/位姿记录或先验地图定位；相机画面只由 camera-only `MTKView` 预览覆盖，原扫描链继续在后台运行。ARKit 连续自动对焦被显式保持启用。Vision 使用屏幕固定 scan box 对应的真实 `regionOfInterest`，按最多 10 Hz 且 one-in-flight 执行；主 ROI 无结果时只在同一 worker lane/同一 ARFrame 上追加一次有界扩展 ROI 检测，以覆盖贴近镜头时条码略超框的情况，同时增加 Code39/93、I2of5、ITF14、DataMatrix、Aztec 等成熟码制。每个请求仍有独立的 1 秒 ARFrame deadline。底层使用固定两条 worker lane：超时请求会 best-effort cancel 并隔离旧 lane，fresh request 可在备用 lane 实际开始；两条 lane 都挂起时立即终止 ESL UX，不创建第三条 worker 或无界 backlog，原始扫描链继续。相机预览最多 24 Hz。候选需要连续 2 帧锁定，同一 burst 目标 4 个、最低 3 个独立帧；采集窗口为 4 秒，给近距离重新对焦和短暂 node publication gap 留出时间。
 
+现场触发新增公共 App Shortcut `Scan ESL`；iPhone 15 Pro 及更新机型可在系统“设置 → Action Button → Shortcut”把 Action Button 绑定到该入口。Shortcut 只调用屏幕按钮使用的同一个 `startPriceTagCapture()`，不能绕过扫描、定位、相机或 sidecar 健康门。传统 Ring/Silent 静音拨片和音量键没有稳定、受支持的 App raw-key API，因此项目不监听系统音量、不隐藏 `MPVolumeView`，也不争抢 ARKit 所持相机。扫码初始提示建议与价签保持约 25–45 cm；这能减少触屏抖动并给连续自动对焦留出工作距离，但软件不能突破镜头最短对焦距离。
+
 价签入口使用独立全屏扫码框、识别进度、成功/错误状态、触觉反馈和取消按钮；状态文字和已识别条码分别绑定扫码框的精确上、下边缘并保持 18 pt 间距，不再依赖屏幕中心魔数，因此不会压住扫码框边线。失败时按 ARFrame、定位对齐、扫描状态、地图身份和 required evidence 给出明确弹窗。native node timebase 在首个 RTAB-Map snapshot 前缺失属于暂时未就绪：该 frame 会等待而不写入非有限占位值，避免一次启动窗口同时毒化三份必要定位 sidecar。扫码过程中暂时拿不到 live node snapshot 时，会在同一 1 秒严格时间合同内复用已冻结 exact-ID snapshot 或等待下一帧，不再把它误报成 sidecar 写入失败；真实必需写入失败、身份错误和 burst 绑定失败仍保持粘性 fail-closed。
+
+Vision 识别的是条码码制，不知道条码是否物理印在电子价签上；商品正面的 EAN/UPC 或 URL 型 QR 被快速识别属于正常行为。没有门店级 ESL payload 合同或主数据时，不能仅凭码制自动拒绝，因为现场 ESL 本身可能使用 Code128、EAN 或 QR。当前对典型零售商品码显示风险提示，并在保存前要求操作员明确确认“该码确实印在 ESL 上”；山姆现场常见的 9 位 Code128 继续正常进入采集。
+
+连续扫描没有“三个通道后分段”或强制新建会话的阈值。现场一次失败的实际原因是深度平面退化时内部 residual 使用 `+Infinity`，`JSONEncoder` 无法写入 `tag_observations.jsonl`，随后严格证据健康门才提示结束并开启新扫描。现在不稳定平面将 residual 表示为缺失并降级当前 frame，持久化前再检查全部数值；该 frame 会被跳过并等待下一帧，不会毒化整场连续数据库。真实的磁盘写入、JSONL framing、身份或 observation/burst 绑定损坏仍保持粘性 fail-closed。
 
 价签 observation schema v2 由同一次 native 原子快照冻结 `bound_node_id`、`bound_node_stamp`、`bound_node_map_id` 和 `T_opengl_world_from_node`，把同帧 scene-depth 世界点转换为 `point_in_bound_node_frame`。手机与 PC 后处理只执行一次 `P_final = T_final_node × P_node`，不再把已经位于先验地图框的旧 `raw_map_position` 再与 raw-node inverse 组合，从而关闭非零地图平移/旋转下的重复变换。只有 scene depth 可形成正式 node-local 三维点；二维 `shelf_plane_ray` 不伪造该权威。历史 observation v1 仍保留条码和业务身份，但可发布坐标清空、质量降为低置信并生成 `legacy_tag_coordinate_frame_rescan_required`。完整 burst 若定位、深度或货架关联质量不足，业务记录继续保留；任何低置信、空坐标、未关联或 rescan 都会阻断 `COMPLETE/publish_permitted`。扫描结束会同步驱动 Mobile-Only workflow 的 `scanning → finalizingScan → idle`，可恢复保存失败则回到原扫描，避免下一次配置收到旧的 `scanning` 状态。
 
