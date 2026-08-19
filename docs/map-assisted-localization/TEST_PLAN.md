@@ -1,6 +1,12 @@
 # 地图辅助定位阶段一至阶段三测试计划
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-17。
+> 文档状态：**当前有效**。最后核对日期：2026-08-19。
+
+## 2026-08-19 人工位置更新 fresh-node 超时回归
+
+自动化必须证明人工位置提交经过完整 Swift/native bridge，并用单个 `ParamEvent` 同时请求 `RGBD/LinearUpdate=0`、`RGBD/AngularUpdate=0`、`Mem/RehearsalSimilarity=1.0`；配置恢复必须来自当前 authoritative mapping profile，不能硬编码旧值。pure admission 正反例覆盖：请求后新 node 且 delta≤1 秒通过；相同/更早 frame、请求时刻前的 node stamp、相同基线 node、未递增 stamp、delta>1 秒、node 0 和非有限值拒绝；无基线时也必须以 request node-time 为下界。成功、超时、取消、系统中断、prior-map unload、finalization 和重新开库必须清除请求作用域，durable append 仍先于 alignment CAS。
+
+签名真机必须在手机静止、正常步行、1 Hz 和自适应 1.5–2 Hz、弱跟踪恢复、前后台/来电中断各场景执行；连续 20 次“确认当前位置/重新选择位置”不应要求晃动手机，核对每次请求到新 node 的延迟、DB node 增量、参数恢复事件、manual v3 node/stamp/timebase/generation、UI 值、alignment 和 PC parser。故障注入要保留 6 秒确实无 detector node 的可恢复超时、审计写失败和 CAS 冲突。主机测试或 unsigned Xcode build 不能把本项登记为真机 PASS。
 
 ## 2026-08-15 通道/货架约束增量
 

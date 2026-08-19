@@ -37,7 +37,8 @@ private struct PendingManualPriorMapPoseRequest {
     let mapPose: PriorMapPose2D
     let reason: String
     let requestedAtWallClock: Date
-    let requestedAtFrameTimestamp: TimeInterval?
+    let requestedAtFrameTimestamp: TimeInterval
+    let requestedAtNodeTimebaseTimestamp: TimeInterval
     let baselineNodeID: Int?
     let baselineNodeStamp: TimeInterval?
     let priorMapGeneration: UUID
@@ -1421,6 +1422,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         cancelPriceTagCapture(
             reason: "system_interruption",
             userMessage: localized("ESL capture was cancelled by a system interruption."))
+        cancelPendingManualPriorMapPoseRequest(
+            reason: "system_interruption")
         guard !mSystemInterruptionInProgress,
               mState == .STATE_MAPPING || mState == .STATE_CAMERA else {
             return
@@ -6308,18 +6311,30 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             return
         }
 
-        let currentFrame = session.currentFrame
-        let baselineBinding = currentFrame.flatMap {
-            rtabmap?.latestNodeBinding(frameTimestamp: $0.timestamp)
+        guard let currentFrame = session.currentFrame,
+              currentFrame.timestamp.isFinite,
+              let requestNodeTimebase = rtabmap?.nodeTimebase(
+                frameTimestamp: currentFrame.timestamp),
+              requestNodeTimebase.timestamp.isFinite else {
+            completion(.rejected(message: localized(
+                "The scan clock is not ready for an exact position update. Keep scanning with the scene visible and try again; the selected coordinates were not changed.")))
+            return
         }
+        let liveBaselineBinding = rtabmap?.latestNodeBinding(
+            frameTimestamp: currentFrame.timestamp)
+        let baselineNodeID = liveBaselineBinding?.nodeId
+            ?? priorMapLastNodeBinding?.nodeId
+        let baselineNodeStamp = liveBaselineBinding?.nodeStamp
+            ?? priorMapLastNodeBinding?.nodeStamp
         let request = PendingManualPriorMapPoseRequest(
             id: UUID(),
             mapPose: mapPose,
             reason: reason,
             requestedAtWallClock: Date(),
-            requestedAtFrameTimestamp: currentFrame?.timestamp,
-            baselineNodeID: baselineBinding?.nodeId,
-            baselineNodeStamp: baselineBinding?.nodeStamp,
+            requestedAtFrameTimestamp: currentFrame.timestamp,
+            requestedAtNodeTimebaseTimestamp: requestNodeTimebase.timestamp,
+            baselineNodeID: baselineNodeID,
+            baselineNodeStamp: baselineNodeStamp,
             priorMapGeneration: priorMapGeneration,
             trackingSessionID: scanSession.trackingSessionId,
             completion: completion)
@@ -6329,6 +6344,17 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             mManualPriorMapPoseRequestLock.unlock()
             completion(.rejected(message: localized(
                 "Another position correction is already waiting for a stable node.")))
+            return
+        }
+        guard rtabmap?.setManualAnchorNodeCreationEnabled(true) == true else {
+            mManualPriorMapPoseRequestLock.unlock()
+            scanSession.appendScanEvent(
+                level: "warning",
+                event: "manual_localization_event_rejected",
+                message: "Native mapping could not enable one-shot node retention for a manual correction",
+                fields: ["reason": "manual_anchor_node_request_unavailable"])
+            completion(.rejected(message: localized(
+                "A scan node could not be requested for this position update. Keep the scan active and try again; the selected coordinates were not changed.")))
             return
         }
         mPendingManualPriorMapPoseRequest = request
@@ -6342,8 +6368,9 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                 "xM": "\(mapPose.xM)",
                 "yM": "\(mapPose.yM)",
                 "yawRad": "\(mapPose.yawRad)",
-                "baselineNodeId": baselineBinding.map { "\($0.nodeId)" }
+                "baselineNodeId": baselineNodeID.map(String.init)
                     ?? "unavailable",
+                "nodeCreationMode": "one_shot_post_request_node",
                 "poseEpoch": "\(mCapturePoseEpoch)",
             ])
 
@@ -6360,24 +6387,37 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             mManualPriorMapPoseRequestLock.unlock()
             return
         }
+        // Restore while the same lock still excludes a new request. Clearing
+        // first would let a second tap enable its window just before this old
+        // timeout disables it.
+        let restoreRequested = rtabmap?.setManualAnchorNodeCreationEnabled(false)
+            ?? false
         mPendingManualPriorMapPoseRequest = nil
         mManualPriorMapPoseRequestLock.unlock()
 
         supermarketSession?.appendScanEvent(
             level: "warning",
             event: "manual_localization_event_rejected",
-            message: "Manual localization timed out while waiting for a fresh accepted RTAB-Map node",
-            fields: ["reason": "fresh_node_timeout"])
+            message: "Manual localization timed out after requesting one post-submit RTAB-Map node",
+            fields: [
+                "reason": "fresh_node_timeout",
+                "mappingParameterRestoreRequested":
+                    restoreRequested ? "true" : "false",
+            ])
         request.completion(.rejected(message: localized(
-            "No new stable RTAB-Map node was created in time. Keep the phone steady with the scene visible, then confirm again; your selected coordinates are still shown.")))
+            "The position update could not bind a new scan node in time. Scanning is still active and your selected coordinates are unchanged; keep the scene visible and try again.")))
     }
 
     private func cancelPendingManualPriorMapPoseRequest(reason: String) {
         mManualPriorMapPoseRequestLock.lock()
-        let request = mPendingManualPriorMapPoseRequest
+        guard let request = mPendingManualPriorMapPoseRequest else {
+            mManualPriorMapPoseRequestLock.unlock()
+            return
+        }
+        let restoreRequested = rtabmap?
+            .setManualAnchorNodeCreationEnabled(false) ?? false
         mPendingManualPriorMapPoseRequest = nil
         mManualPriorMapPoseRequestLock.unlock()
-        guard let request else { return }
         DispatchQueue.main.async {
             request.completion(.rejected(message: self.localized(
                 "The scan state changed before the position could be committed. The position was not changed.")))
@@ -6386,7 +6426,11 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             level: "warning",
             event: "manual_localization_event_rejected",
             message: "Pending manual localization was cancelled before commit",
-            fields: ["reason": reason])
+            fields: [
+                "reason": reason,
+                "mappingParameterRestoreRequested":
+                    restoreRequested ? "true" : "false",
+            ])
     }
 
     private func resolvePendingManualPriorMapPoseIfReady(
@@ -6399,29 +6443,21 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
             mManualPriorMapPoseRequestLock.unlock()
             return
         }
-        let frameIsNew = request.requestedAtFrameTimestamp.map {
-            frameTimestamp > $0
-        } ?? true
-        let bindingIsFresh: Bool
-        if let baselineNodeID = request.baselineNodeID,
-           let baselineNodeStamp = request.baselineNodeStamp {
-            let publishedAfterRequest = nodeBinding.nodeId != baselineNodeID
-                || nodeBinding.nodeStamp > baselineNodeStamp + 0.000_001
-            // A node published immediately before the tap is still an exact
-            // authority when the accepted frame is within 250 ms of its stamp.
-            // This avoids forcing a stationary operator to move merely to
-            // manufacture another node, while never reusing the old 1 s cache.
-            let sameNodeStillFresh = nodeBinding.nodeId == baselineNodeID
-                && nodeBinding.deltaSeconds <= 0.25
-            bindingIsFresh = publishedAfterRequest || sameNodeStillFresh
-        }
-        else {
-            bindingIsFresh = nodeBinding.deltaSeconds <= 0.25
-        }
-        guard frameIsNew, bindingIsFresh else {
+        guard PriorMapManualNodeBindingPolicy.accepts(
+                requestedAtFrameTimestamp: request.requestedAtFrameTimestamp,
+                requestedAtNodeTimebaseTimestamp:
+                    request.requestedAtNodeTimebaseTimestamp,
+                baselineNodeID: request.baselineNodeID,
+                baselineNodeStamp: request.baselineNodeStamp,
+                candidateFrameTimestamp: frameTimestamp,
+                candidateNodeID: nodeBinding.nodeId,
+                candidateNodeStamp: nodeBinding.nodeStamp,
+                candidateNodeTimeDeltaSeconds: nodeBinding.deltaSeconds) else {
             mManualPriorMapPoseRequestLock.unlock()
             return
         }
+        let mappingParameterRestoreRequested = rtabmap?
+            .setManualAnchorNodeCreationEnabled(false) ?? false
         mPendingManualPriorMapPoseRequest = nil
         mManualPriorMapPoseRequestLock.unlock()
 
@@ -6521,6 +6557,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     "nodeId": "\(nodeBinding.nodeId)",
                     "requestLatencySeconds": String(
                         format: "%.3f", requestLatency),
+                    "mappingParameterRestoreRequested":
+                        mappingParameterRestoreRequested ? "true" : "false",
                     "poseEpoch": "\(poseEpoch)",
                 ])
             DispatchQueue.main.async {
@@ -8480,6 +8518,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
         cancelPriceTagCapture(
             reason: "mapping_stop_requested",
             userMessage: nil)
+        cancelPendingManualPriorMapPoseRequest(
+            reason: "mapping_stop_requested")
         // Any call reaching this method is an intentional terminal/safety path;
         // it must not be undone later by didBecomeActive.
         cancelAutomaticCaptureResume()

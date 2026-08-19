@@ -1162,6 +1162,22 @@ class IOSCoreContractTests(unittest.TestCase):
         view_controller = (app / "ViewController.swift").read_text(
             encoding="utf-8"
         )
+        localization_core = (app / "PriorMapLocalizationCore.swift").read_text(
+            encoding="utf-8"
+        )
+        rtabmap_swift = (app / "RTABMap.swift").read_text(encoding="utf-8")
+        native_wrapper_hpp = (app / "NativeWrapper.hpp").read_text(
+            encoding="utf-8"
+        )
+        native_wrapper_cpp = (app / "NativeWrapper.cpp").read_text(
+            encoding="utf-8"
+        )
+        native_app_hpp = (
+            repository / "app/android/jni/RTABMapApp.h"
+        ).read_text(encoding="utf-8")
+        native_app_cpp = (
+            repository / "app/android/jni/RTABMapApp.cpp"
+        ).read_text(encoding="utf-8")
 
         picker_start = localization.index("final class PriorMapPosePickerView")
         picker_end = localization.index(
@@ -1198,14 +1214,94 @@ class IOSCoreContractTests(unittest.TestCase):
         )
         apply_flow = view_controller[apply_start:apply_end]
         self.assertIn("baselineNodeID", apply_flow)
-        self.assertIn("bindingIsFresh", apply_flow)
-        self.assertIn("nodeBinding.deltaSeconds <= 0.25", apply_flow)
+        self.assertIn("requestedAtNodeTimebaseTimestamp", apply_flow)
+        self.assertIn("PriorMapManualNodeBindingPolicy.accepts", apply_flow)
+        self.assertIn("setManualAnchorNodeCreationEnabled(true)", apply_flow)
+        self.assertGreaterEqual(
+            apply_flow.count("setManualAnchorNodeCreationEnabled(false)"), 3
+        )
+        self.assertIn("one_shot_post_request_node", apply_flow)
+        self.assertNotIn("sameNodeStillFresh", apply_flow)
         self.assertIn("fresh_node_timeout", apply_flow)
         append_index = apply_flow.index("appendManualLocalizationEvent(")
         commit_index = apply_flow.index("commitManualPosition(candidate)")
         self.assertLess(append_index, commit_index)
         self.assertIn("prepareManualPosition", apply_flow)
         self.assertNotIn("confirmCurrentPosition(", apply_flow)
+
+        policy_start = localization_core.index(
+            "enum PriorMapManualNodeBindingPolicy"
+        )
+        policy_end = localization_core.index(
+            "final class PriorMapLocalizationAnchor", policy_start
+        )
+        policy = localization_core[policy_start:policy_end]
+        self.assertIn("maximumNodeTimeDeltaSeconds: TimeInterval = 1.0", policy)
+        self.assertIn("candidateFrameTimestamp > requestedAtFrameTimestamp", policy)
+        self.assertIn(
+            "candidateNodeStamp\n                > requestedAtNodeTimebaseTimestamp",
+            policy,
+        )
+        self.assertIn("candidateNodeID != baselineNodeID", policy)
+
+        native_method_start = native_app_cpp.index(
+            "bool RTABMapApp::setManualAnchorNodeCreationEnabled(bool enabled)"
+        )
+        native_method_end = native_app_cpp.index(
+            "bool RTABMapApp::getLoopClosureLinkSnapshot", native_method_start
+        )
+        native_method = native_app_cpp[native_method_start:native_method_end]
+        self.assertIn('kRGBDLinearUpdate(), "0"', native_method)
+        self.assertIn('kRGBDAngularUpdate(), "0"', native_method)
+        self.assertIn('kMemRehearsalSimilarity(), "1.0"', native_method)
+        self.assertIn("const rtabmap::ParametersMap configured", native_method)
+        self.assertIn("const std::string keys[]", native_method)
+        self.assertEqual(native_method.count("new rtabmap::ParamEvent(parameters)"), 1)
+        self.assertIn("manualAnchorNodeCreationEnabled_", native_app_hpp)
+        self.assertIn(
+            "std::recursive_mutex mappingParametersMutex_", native_app_hpp
+        )
+        parameter_method_start = native_app_cpp.index(
+            "rtabmap::ParametersMap RTABMapApp::getRtabmapParameters()"
+        )
+        parameter_method_end = native_app_cpp.index(
+            "RTABMapApp::RTABMapApp(", parameter_method_start
+        )
+        parameter_method = native_app_cpp[
+            parameter_method_start:parameter_method_end
+        ]
+        self.assertIn(
+            "if(manualAnchorNodeCreationEnabled_)", parameter_method
+        )
+        self.assertIn("kRGBDLinearUpdate(), \"0\"", parameter_method)
+        self.assertIn("kRGBDAngularUpdate(), \"0\"", parameter_method)
+        self.assertIn("kMemRehearsalSimilarity(), \"1.0\"", parameter_method)
+        self.assertIn(
+            "std::lock_guard<std::recursive_mutex> lock(mappingParametersMutex_)",
+            native_method,
+        )
+        set_parameter_start = native_app_cpp.index(
+            "int RTABMapApp::setMappingParameter("
+        )
+        set_parameter_end = native_app_cpp.index(
+            "void RTABMapApp::setGPS", set_parameter_start
+        )
+        self.assertIn(
+            "std::lock_guard<std::recursive_mutex> lock(mappingParametersMutex_)",
+            native_app_cpp[set_parameter_start:set_parameter_end],
+        )
+        self.assertIn("setManualAnchorNodeCreationEnabled(bool enabled)", native_app_hpp)
+        self.assertIn(
+            "setManualAnchorNodeCreationEnabledNative", native_wrapper_hpp
+        )
+        self.assertIn(
+            "native(object)->setManualAnchorNodeCreationEnabled(enabled)",
+            native_wrapper_cpp,
+        )
+        self.assertIn(
+            "setManualAnchorNodeCreationEnabledNative(native_rtabmap, enabled)",
+            rtabmap_swift,
+        )
 
     def test_mapping_location_consumers_share_stabilized_pose_authority(self) -> None:
         repository = Path(__file__).resolve().parents[3]

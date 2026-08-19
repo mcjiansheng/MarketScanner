@@ -341,6 +341,52 @@ enum PriorMapStageOneMath {
     }
 }
 
+/// Exact-node admission for a user-submitted map position.
+///
+/// RTAB-Map normally drops stationary frames below RGBD/LinearUpdate and
+/// RGBD/AngularUpdate. The UI therefore opens a request-scoped native retention
+/// window for a post-request node instead of reusing an arbitrarily old node or
+/// asking the operator to move the phone. This pure policy is shared with the
+/// host tests and still requires the retained node to satisfy the formal
+/// one-second node-time contract.
+enum PriorMapManualNodeBindingPolicy {
+    static let maximumNodeTimeDeltaSeconds: TimeInterval = 1.0
+    private static let stampEpsilonSeconds: TimeInterval = 0.000_001
+
+    static func accepts(
+        requestedAtFrameTimestamp: TimeInterval,
+        requestedAtNodeTimebaseTimestamp: TimeInterval,
+        baselineNodeID: Int?,
+        baselineNodeStamp: TimeInterval?,
+        candidateFrameTimestamp: TimeInterval,
+        candidateNodeID: Int,
+        candidateNodeStamp: TimeInterval,
+        candidateNodeTimeDeltaSeconds: TimeInterval
+    ) -> Bool {
+        guard requestedAtFrameTimestamp.isFinite,
+              requestedAtNodeTimebaseTimestamp.isFinite,
+              candidateFrameTimestamp.isFinite,
+              candidateNodeID > 0,
+              candidateNodeStamp.isFinite,
+              candidateNodeTimeDeltaSeconds.isFinite,
+              candidateNodeTimeDeltaSeconds >= 0,
+              candidateNodeTimeDeltaSeconds
+                <= maximumNodeTimeDeltaSeconds,
+              candidateFrameTimestamp > requestedAtFrameTimestamp,
+              candidateNodeStamp
+                > requestedAtNodeTimebaseTimestamp + stampEpsilonSeconds else {
+            return false
+        }
+        guard let baselineNodeID, let baselineNodeStamp else {
+            return true
+        }
+        return baselineNodeStamp.isFinite
+            && candidateNodeID != baselineNodeID
+            && candidateNodeStamp
+                > baselineNodeStamp + stampEpsilonSeconds
+    }
+}
+
 /// Owns the only mutable map/ARKit alignment anchor used by Stage One.
 /// Recovery hypothesis tracks may be cleared at any episode boundary without
 /// moving this anchor or reverting to a historical hypothesis.

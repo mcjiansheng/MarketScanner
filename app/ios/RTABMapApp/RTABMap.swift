@@ -209,6 +209,14 @@ class RTABMap {
         return (frameTimestamp + offset, offset)
     }
 
+    /// Open a request-scoped retention window for a post-request mapping node.
+    /// The caller must disable this on success, timeout and every cancellation
+    /// path so normal small-motion/rehearsal filtering resumes.
+    @discardableResult
+    func setManualAnchorNodeCreationEnabled(_ enabled: Bool) -> Bool {
+        setManualAnchorNodeCreationEnabledNative(native_rtabmap, enabled)
+    }
+
     /// Returns only the native graph edge frozen for the exact loop callback
     /// IDs. A later event, a missing edge or an unsupported link type cannot
     /// be substituted by mapCorrection or a visual inlier summary.

@@ -4541,6 +4541,85 @@ let rightTurn = PriorMapStageOneMath.arkitHorizontalPose(
     forwardZ: 0)
 require(close(rightTurn.yawRad, 0), "ARKit +x forward must be canonical map east")
 
+let manualBindingAccepted = PriorMapManualNodeBindingPolicy.accepts(
+    requestedAtFrameTimestamp: 100.0,
+    requestedAtNodeTimebaseTimestamp: 1_000.0,
+    baselineNodeID: 41,
+    baselineNodeStamp: 999.0,
+    candidateFrameTimestamp: 100.9,
+    candidateNodeID: 42,
+    candidateNodeStamp: 1_000.9,
+    candidateNodeTimeDeltaSeconds: 0.0)
+require(
+    manualBindingAccepted,
+    "a new exact node created after a manual request must be accepted")
+require(
+    !PriorMapManualNodeBindingPolicy.accepts(
+        requestedAtFrameTimestamp: 100.0,
+        requestedAtNodeTimebaseTimestamp: 1_000.0,
+        baselineNodeID: 41,
+        baselineNodeStamp: 999.0,
+        candidateFrameTimestamp: 100.0,
+        candidateNodeID: 42,
+        candidateNodeStamp: 1_000.9,
+        candidateNodeTimeDeltaSeconds: 0.9),
+    "a candidate frame at the request boundary must be rejected")
+require(
+    !PriorMapManualNodeBindingPolicy.accepts(
+        requestedAtFrameTimestamp: 100.0,
+        requestedAtNodeTimebaseTimestamp: 1_000.0,
+        baselineNodeID: 41,
+        baselineNodeStamp: 999.0,
+        candidateFrameTimestamp: 100.9,
+        candidateNodeID: 41,
+        candidateNodeStamp: 1_000.9,
+        candidateNodeTimeDeltaSeconds: 0.0),
+    "the baseline node must never be reused for a manual request")
+require(
+    !PriorMapManualNodeBindingPolicy.accepts(
+        requestedAtFrameTimestamp: 100.0,
+        requestedAtNodeTimebaseTimestamp: 1_000.0,
+        baselineNodeID: 41,
+        baselineNodeStamp: 999.0,
+        candidateFrameTimestamp: 100.9,
+        candidateNodeID: 42,
+        candidateNodeStamp: 999.0,
+        candidateNodeTimeDeltaSeconds: 0.0),
+    "a node stamp that does not advance beyond the request must be rejected")
+require(
+    !PriorMapManualNodeBindingPolicy.accepts(
+        requestedAtFrameTimestamp: 100.0,
+        requestedAtNodeTimebaseTimestamp: 1_000.0,
+        baselineNodeID: 41,
+        baselineNodeStamp: 999.0,
+        candidateFrameTimestamp: 101.1,
+        candidateNodeID: 42,
+        candidateNodeStamp: 1_000.0,
+        candidateNodeTimeDeltaSeconds: 1.1),
+    "a node outside the formal one-second binding window must be rejected")
+require(
+    !PriorMapManualNodeBindingPolicy.accepts(
+        requestedAtFrameTimestamp: 100.0,
+        requestedAtNodeTimebaseTimestamp: 1_000.0,
+        baselineNodeID: nil,
+        baselineNodeStamp: nil,
+        candidateFrameTimestamp: .nan,
+        candidateNodeID: 0,
+        candidateNodeStamp: .nan,
+        candidateNodeTimeDeltaSeconds: .nan),
+    "non-finite or zero-node manual evidence must be rejected")
+require(
+    PriorMapManualNodeBindingPolicy.accepts(
+        requestedAtFrameTimestamp: 100.0,
+        requestedAtNodeTimebaseTimestamp: 1_000.0,
+        baselineNodeID: nil,
+        baselineNodeStamp: nil,
+        candidateFrameTimestamp: 100.8,
+        candidateNodeID: 1,
+        candidateNodeStamp: 1_000.8,
+        candidateNodeTimeDeltaSeconds: 0.0),
+    "the first post-request node is valid when no baseline node exists")
+
 // The first ARKit frame is the alignment origin. Walking straight ahead
 // after choosing a cardinal start heading must advance in that exact map
 // direction, not in a frame shifted by 90 degrees.

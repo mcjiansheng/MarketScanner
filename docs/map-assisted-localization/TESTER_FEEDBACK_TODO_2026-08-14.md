@@ -1,6 +1,6 @@
 # 现场测试反馈整改与待办
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-17。
+> 文档状态：**当前有效**。最后核对日期：2026-08-19。
 
 本文记录 `fix/manual-anchor-continuous-recovery@bb09e1346a13945b1d4d8fa7eaf174959b528ab9` 的现场反馈，以及后续 `fix/tag-node-local-publication-gate` 设计审查整改。它不把“移除了已知 trap”写成“4 次现场 crash 已根治”，也不把未经同一真实 Sam 数据 A/B 的参数建议直接固化为生产默认值。
 
@@ -14,7 +14,7 @@
 
 - 人工“重新选择位置”改用真正的 `UIScrollView` 1×–8× 缩放、放大后单指平移、双击缩放/复位、箭头定位、点击选点和箭头拖动。旧实现直接修改 `imageView.transform`，但坐标换算继续使用未变换 bounds，且 `layoutSubviews()` 会重设 frame，确实会造成缩放/平移无效或选点偏差。
 - 保留 canonical X/Y/yaw 数值、0.1/0.5/1.0 m 四向微调、东/北/西/南和 ±1/±5/±15° 旋转。确认前显式结束编辑并重新解析三个字段；非法输入保留在弹窗内，不再静默提交旧 pose。
-- 人工定位改为 fresh-node 握手：确认后保持弹窗，在请求后的 accepted frame 上重新取得与 node stamp 相差不超过 250 ms 的 exact snapshot（优先新 node；刚发布的同一 node 仍可用，避免强迫静止用户移动）；超时只提示重试，用户已选坐标不丢失。移除“弹窗先关闭，再依赖最多 1 秒旧缓存”的低成功率路径。
+- 人工定位使用严格 post-request fresh-node 握手：确认后保持弹窗，并为本次请求临时关闭 native 小位移丢帧/rehearsal 合并，使静止手机的下一 detector tick 也可成为普通 retained node；成功、超时、取消、中断和 teardown 请求恢复扫描 profile。candidate frame/node stamp 必须严格晚于请求，存在基线时拒绝同一 node ID，node-time 差≤1 秒；不再接受请求前刚发布的同一节点，也不要求操作者晃动手机。超时只提示重试，用户已选坐标不丢失。
 - 人工 alignment 改为 `prepare -> durable manual event -> compare-and-swap commit`。审计 JSONL 写失败时 live alignment 保持不变；不再出现“内存位置已改变，但事件未落盘”的不可审计状态。
 - RTAB-Map、prior-map depth/localizer、ESL depth/ray 和 location-bearing sensor boundary 统一使用同一帧经连续性门接受的 software-stabilized transform。被拒 raw frame 只进入 tracking health 统计，不进入位置 sidecar。
 - tracking 恢复后的 raw ARKit epoch 若发生明显坐标变化，先重基准并拒绝边界帧；普通 callback gap 的位移/转角门不再随 2 秒放宽到 6 m/360°，而使用 0.25 秒封顶的连续性窗口，并记录 `poseEpoch`、距离、角度和实际门限。
@@ -70,6 +70,6 @@
 ## 关闭条件
 
 - 自动化：PriorMap、Map Studio、Qualification、native、Swift parse、Python/JavaScript syntax、macOS `rtabmap-reprocess` 和 unsigned exact-HEAD iPhoneOS Debug/Release 全部通过。
-- 真机：fresh-node 人工重定位连续 20 次成功，含 X/Y/yaw 文本最后一键确认、缩放/平移、弱 tracking 恢复和审计写失败注入；成功记录必须证明 UI 值、manual event、live alignment 和 PC 解析一致。
+- 真机：手机静止与步行状态共执行 fresh-node 人工重定位连续 20 次，含 X/Y/yaw 文本最后一键确认、缩放/平移、弱 tracking 恢复、系统中断、扫描 profile 恢复和审计写失败注入；成功记录必须证明请求后新 node、≤1 秒 time binding、UI 值、manual event、live alignment 和 PC 解析一致。
 - 现场：Sam 大货架完整绕行、顾客碰撞、长距离漂移、人工校准、可靠/错误回环隔离均保留完整 DB/节点/价签和最终低置信度结果；没有完全性损坏时不得只返回“处理失败”。
 - 发布：exact SHA、签名设备、原始证据包和独立审查齐全前，状态保持 **NO-GO / NOT PRODUCTION READY**。

@@ -134,6 +134,11 @@ bool getNodeTimeOffsetNative(const void *object, double * offset)
     return native(object)->getNodeTimeOffset(*offset);
 }
 
+bool setManualAnchorNodeCreationEnabledNative(const void *object, bool enabled)
+{
+    return object && native(object)->setManualAnchorNodeCreationEnabled(enabled);
+}
+
 bool getLoopClosureLinkSnapshotNative(
         const void *object,
         int32_t expectedFromNodeId,

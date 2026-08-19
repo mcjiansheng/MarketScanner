@@ -33,6 +33,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #endif
 #include <cstdint>
 #include <memory>
+#include <mutex>
 
 #include <tango-gl/util.h>
 
@@ -144,6 +145,7 @@ class RTABMapApp : public UEventsHandler {
   void setStreamingMapMode(bool enabled, int maxRenderedNodes);
   bool getNodeTimeSnapshot(NodeTimeSnapshot & snapshot);
   bool getNodeTimeOffset(double & offset);
+  bool setManualAnchorNodeCreationEnabled(bool enabled);
   bool getLoopClosureLinkSnapshot(int expectedFromNodeId,
                                   int expectedToNodeId,
                                   LoopClosureLinkSnapshot & snapshot);
@@ -308,12 +310,14 @@ class RTABMapApp : public UEventsHandler {
   std::string exportPointCloudFormat_;
 
   rtabmap::ParametersMap mappingParameters_;
+  std::recursive_mutex mappingParametersMutex_;
 
   bool dataRecorderMode_;
   bool preserveCameraOrigin_;
   rtabmap::Transform preservedCameraOriginOffset_;
   bool streamingMapMode_;
   int streamingMaxRenderedNodes_;
+  bool manualAnchorNodeCreationEnabled_;
   bool clearSceneOnNextRender_;
   bool openingDatabase_;
   bool exporting_;

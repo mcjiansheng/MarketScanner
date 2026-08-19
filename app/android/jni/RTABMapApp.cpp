@@ -139,6 +139,74 @@ bool RTABMapApp::getNodeTimeOffset(double & offset)
 	return false;
 }
 
+bool RTABMapApp::setManualAnchorNodeCreationEnabled(bool enabled)
+{
+	// A manual map-position correction must be bound to a node created after
+	// the operator submits it. RTAB-Map intentionally removes stationary
+	// frames through RGBD/LinearUpdate, RGBD/AngularUpdate and rehearsal, so a
+	// stationary operator could otherwise wait forever. Temporarily disabling
+	// only those retention filters makes the next eligible detector tick a
+	// normal graph node. Swift restores the configured values after observing
+	// that post-request node (or on every cancellation/timeout path).
+	// Serialize the override state and ParamEvent ordering with every ordinary
+	// setMappingParameter() publication. Otherwise an adaptive-rate update that
+	// began just before this call could post an older full profile afterwards.
+	std::lock_guard<std::recursive_mutex> lock(mappingParametersMutex_);
+	const bool wasEnabled = manualAnchorNodeCreationEnabled_;
+	if(enabled == wasEnabled)
+	{
+		return true;
+	}
+	if(!rtabmap_ || !rtabmapThread_ || !rtabmapThread_->isRunning() ||
+		openingDatabase_ || dataRecorderMode_ || localizationMode_)
+	{
+		// A stopped producer cannot create another node. Every resume/open path
+		// reparses getRtabmapParameters(), so clearing the local request state is
+		// sufficient when teardown overtakes a pending Swift cancellation.
+		if(!enabled)
+		{
+			manualAnchorNodeCreationEnabled_ = false;
+			return true;
+		}
+		UWARN("Cannot enable one-shot manual-anchor node retention while mapping is inactive.");
+		return false;
+	}
+
+	rtabmap::ParametersMap parameters;
+	manualAnchorNodeCreationEnabled_ = enabled;
+	if(enabled)
+	{
+		parameters.insert(rtabmap::ParametersPair(
+			rtabmap::Parameters::kRGBDLinearUpdate(), "0"));
+		parameters.insert(rtabmap::ParametersPair(
+			rtabmap::Parameters::kRGBDAngularUpdate(), "0"));
+		parameters.insert(rtabmap::ParametersPair(
+			rtabmap::Parameters::kMemRehearsalSimilarity(), "1.0"));
+	}
+	else
+	{
+		const rtabmap::ParametersMap configured = getRtabmapParameters();
+		const std::string keys[] = {
+			rtabmap::Parameters::kRGBDLinearUpdate(),
+			rtabmap::Parameters::kRGBDAngularUpdate(),
+			rtabmap::Parameters::kMemRehearsalSimilarity()};
+		for(const std::string & key : keys)
+		{
+			rtabmap::ParametersMap::const_iterator iter = configured.find(key);
+			if(iter == configured.end())
+			{
+				manualAnchorNodeCreationEnabled_ = wasEnabled;
+				UERROR("Cannot restore missing manual-anchor mapping parameter %s.",
+					key.c_str());
+				return false;
+			}
+			parameters.insert(*iter);
+		}
+	}
+	UEventsManager::post(new rtabmap::ParamEvent(parameters));
+	return true;
+}
+
 bool RTABMapApp::getLoopClosureLinkSnapshot(
 		int expectedFromNodeId,
 		int expectedToNodeId,
@@ -219,6 +287,7 @@ int start_logger()
 
 rtabmap::ParametersMap RTABMapApp::getRtabmapParameters()
 {
+	std::lock_guard<std::recursive_mutex> lock(mappingParametersMutex_);
 	rtabmap::ParametersMap parameters;
 
 	parameters.insert(mappingParameters_.begin(), mappingParameters_.end());
@@ -299,6 +368,18 @@ rtabmap::ParametersMap RTABMapApp::getRtabmapParameters()
         uInsert(parameters, rtabmap::ParametersPair(rtabmap::Parameters::kRGBDAngularUpdate(), "0"));
         uInsert(parameters, rtabmap::ParametersPair(rtabmap::Parameters::kMemNotLinkedNodesKept(), std::string("true")));
 	}
+	if(manualAnchorNodeCreationEnabled_)
+	{
+		// setMappingParameter() republishes the complete configured profile.
+		// Reapply this request-scoped override here so an adaptive detection-rate
+		// or resource-policy update cannot silently cancel the fresh-node request.
+		uInsert(parameters, rtabmap::ParametersPair(
+			rtabmap::Parameters::kRGBDLinearUpdate(), "0"));
+		uInsert(parameters, rtabmap::ParametersPair(
+			rtabmap::Parameters::kRGBDAngularUpdate(), "0"));
+		uInsert(parameters, rtabmap::ParametersPair(
+			rtabmap::Parameters::kMemRehearsalSimilarity(), "1.0"));
+	}
 
 	return parameters;
 }
@@ -348,6 +429,7 @@ RTABMapApp::RTABMapApp() :
 		preserveCameraOrigin_(false),
 		streamingMapMode_(false),
 		streamingMaxRenderedNodes_(0),
+		manualAnchorNodeCreationEnabled_(false),
 		clearSceneOnNextRender_(false),
 		openingDatabase_(false),
 		exporting_(false),
@@ -507,6 +589,12 @@ int RTABMapApp::openDatabase(const std::string & databasePath, bool databaseInMe
 	}
 	rtabmapEvents_.clear();
 	openingDatabase_ = true;
+	// A newly opened database always starts from the configured mapping
+	// profile, never from a request-scoped manual-anchor override.
+	{
+		std::lock_guard<std::recursive_mutex> lock(mappingParametersMutex_);
+		manualAnchorNodeCreationEnabled_ = false;
+	}
 	bool restartThread = false;
 	if(rtabmapThread_)
 	{
@@ -3378,6 +3466,7 @@ void RTABMapApp::setExportPointCloudFormat(const std::string & format)
 
 int RTABMapApp::setMappingParameter(const std::string & key, const std::string & value)
 {
+	std::lock_guard<std::recursive_mutex> lock(mappingParametersMutex_);
 	std::string compatibleKey = key;
 
 	// Backward compatibility

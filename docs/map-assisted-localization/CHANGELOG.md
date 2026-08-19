@@ -1,6 +1,13 @@
 # 地图辅助定位变更记录
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-15。
+> 文档状态：**当前有效**。最后核对日期：2026-08-19。
+
+## 2026-08-19 — 人工位置更新的请求后节点保留
+
+- 修复“位置更新等待 stable RTAB-Map node 超时”：RTAB-Map 的 0.05 m/0.05 rad 小位移门和 rehearsal 会在操作者按提示保持静止时淘汰 detector frame，旧 UI 因而可能在 6 秒内永远等不到 fresh retained node。
+- 新增 Swift/C/native 请求作用域桥。提交人工位置时暂设 `RGBD/LinearUpdate=0`、`RGBD/AngularUpdate=0`、`Mem/RehearsalSimilarity=1.0`，让下一 detector tick 保留为普通图节点；成功、超时、取消、系统中断和扫描 teardown 请求恢复 authoritative mapping profile，重新开库也清除残留请求状态。
+- exact-node 安全合同没有放宽：候选 frame/node stamp 必须严格晚于请求，存在基线时 node ID 必须变化且 stamp 必须递增，node-time delta 仍≤1 秒；manual JSONL durable append 仍先于 alignment CAS。实现不复用旧节点、不注入外部 pose prior，也不要求操作者移动手机。
+- 新增 pure policy 与源码桥合同正反例；签名 LiDAR 真机连续 20 次重定位仍待执行，因此整体状态不从 **NO-GO / NOT PRODUCTION READY** 提升。
 
 ## 2026-08-15 — 扫描前显示名称合并
 

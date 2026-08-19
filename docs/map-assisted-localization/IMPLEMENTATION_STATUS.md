@@ -1,6 +1,8 @@
 # 地图辅助定位实现状态
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-17。
+> 文档状态：**当前有效**。最后核对日期：2026-08-19。
+
+2026-08-19 测试反馈修复：人工位置确认不再同时要求“手机稳定”和“自然产生一个通过 0.05 m/0.05 rad 门的新节点”。每次提交会通过 Swift→C bridge→native 发出请求作用域的参数事件，暂时将 `RGBD/LinearUpdate=0`、`RGBD/AngularUpdate=0`、`Mem/RehearsalSimilarity=1.0`，让下一 detector tick 可作为普通 retained graph node；成功、6 秒超时、取消、系统中断、prior-map 卸载和 finalization 均恢复配置值。admission 仍要求 frame 与 node stamp 严格晚于请求、存在基线时 node ID/stamp 都前进、node-time delta ≤1 秒，并保持 manual JSONL durable-first 与 alignment CAS。该改动不注入外部 prior、不接受历史节点，也不把主机构建等同于真机结论；签名 LiDAR 真机连续 20 次人工重定位仍须执行，整体继续 **NO-GO / NOT PRODUCTION READY**。
 
 2026-08-17 复核结论：P1-B～P2 **不是全部关闭**，当前只能标记为“代码子集已实现、生产发布与现场资格未完成”。shelf sidecar v2 已持久化通道候选距离/结构盆地/拓扑/组合分、`BOOTSTRAP/TRACKING/LOW_CONFIDENCE`、当前通道/货架/侧和低置信原因；货架窗口只使用过滤深度点到权威货架物理长边的实际 sample/inlier/median/max 几何统计，普通 RTAB-Map 视觉指标只作诊断。资源策略执行候选 24→12 和 1/2、1/4 cadence，跳过节拍不会复用旧几何自证。pose-transition v3 从 native Statistics 事件冻结 exact global/local-space `Link`，绑定 node/component/epoch，并要求至少两组 node-disjoint、transform 一致的 witness；单链路、反向重复、共享端点、错误 component、冲突 transform、缺任一相邻 bridge 和旧 aggregate counter 均拒绝。C-1/C-2/C-3 仍为 `CALIBRATION_PENDING`，但 publication invariant v3 已把“完整测试成果”和“生产资格”分离：Debug 在其余图、坐标、价签、穿架、framing、身份和原子提交门全部通过时可生成 `COMPLETE`、`result_scope=TEST`、`publish_permitted=true` 的手机/PC 全量结果，同时固定 `production_publish_permitted=false`；clean Release 仍必须达到 `CALIBRATED/NOT_APPLICABLE` 才可能生产发布。构建身份 version 5 绑定实际 source ref 和 tracked patch SHA-256。自动化证明了合同正反例和 Swift/Python 同构，但尚未证明真机能稳定产生两组跨 epoch native edge，因此不构成签名真机、LiDAR、Sam 现场或生产发布证明。
 

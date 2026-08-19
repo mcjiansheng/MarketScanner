@@ -80,6 +80,7 @@ bool getNodeTimeSnapshotNative(const void *object, int32_t * nodeId,
                                float * nodeQx, float * nodeQy, float * nodeQz,
                                float * nodeQw);
 bool getNodeTimeOffsetNative(const void *object, double * offset);
+bool setManualAnchorNodeCreationEnabledNative(const void *object, bool enabled);
 bool getLoopClosureLinkSnapshotNative(
                                const void *object,
                                int32_t expectedFromNodeId,
