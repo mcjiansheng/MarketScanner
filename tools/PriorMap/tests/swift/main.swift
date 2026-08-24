@@ -3289,6 +3289,169 @@ if CommandLine.arguments.count == 4,
         expectedPath: CommandLine.arguments[3])
     exit(0)
 }
+if CommandLine.arguments.count == 3,
+   CommandLine.arguments[1] == "--prior-map-bundle-focused" {
+    runPriorMapBundleFocusedTests(workbookPath: CommandLine.arguments[2])
+    exit(0)
+}
+
+/// V1R6: finalized prior-map sessions must bundle the exact installed
+/// package (`prior_map/` + `prior_map_receipt.json`) so PC post-processing
+/// can always run structure-corrected localized optimization. Bundling is
+/// fail-closed on identity/verification and idempotent for the same identity.
+func runPriorMapBundleFocusedTests(workbookPath: String) {
+    let previousMapRoot = MobileMapLibrary.rootOverride
+    let temporary = FileManager.default.temporaryDirectory
+        .appendingPathComponent(
+            "prior-map-bundle-\(UUID().uuidString)", isDirectory: true)
+    MobileMapLibrary.rootOverride = temporary.appendingPathComponent(
+        "Maps", isDirectory: true)
+    defer {
+        restoreMutablePermissions(temporary)
+        try? FileManager.default.removeItem(at: temporary)
+        MobileMapLibrary.rootOverride = previousMapRoot
+    }
+    do {
+        let workbook = URL(fileURLWithPath: workbookPath)
+        let report = try MapSourceImportCoordinator.importMap(
+            stagedURL: workbook,
+            originalFilename: workbook.lastPathComponent,
+            contract: .topLeft,
+            strict: true)
+        let staging = try MobileMapLibrary.stagingDirectory(
+            for: "bundle-focused")
+        let compiled = try MobilePriorMapCompiler.compile(
+            canonicalSource: report.canonicalSource,
+            outputDirectory: staging)
+        let installTarget = try MobileMapLibrary.packageDirectory(
+            priorMapID: compiled.priorMapID,
+            packageSHA: compiled.packageSHA256)
+        try FileManager.default.createDirectory(
+            at: installTarget.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        try FileManager.default.moveItem(at: staging, to: installTarget)
+        _ = try MobileMapLibrary.register(
+            priorMapID: compiled.priorMapID,
+            name: report.mapName,
+            packageSHA256: compiled.packageSHA256,
+            packageURL: installTarget,
+            floorCount: compiled.floorCount,
+            elementCount: compiled.elementCount,
+            compilerVersion: "swift-v1",
+            canonicalSourceSHA256: report.canonicalSourceSha256)
+
+        let session = temporary.appendingPathComponent(
+            "SupermarketSession-bundle", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: session, withIntermediateDirectories: true)
+        let receipt = try PriorMapSessionBundler.bundleInstalledPackage(
+            into: session,
+            priorMapID: compiled.priorMapID,
+            packageSHA256: compiled.packageSHA256,
+            canonicalSourceSHA256: report.canonicalSourceSha256)
+        require(
+            receipt.bundled
+                && receipt.priorMapId == compiled.priorMapID
+                && receipt.packageSha256 == compiled.packageSHA256
+                && receipt.canonicalSourceSha256
+                    == report.canonicalSourceSha256,
+            "bundle receipt must echo the exact installed identity")
+        let fileManager = FileManager.default
+        require(
+            fileManager.fileExists(atPath: session
+                .appendingPathComponent("prior_map/manifest.json").path)
+                && fileManager.fileExists(atPath: session
+                    .appendingPathComponent(
+                        "prior_map/package_manifest.json").path),
+            "bundled package must carry manifest and package_manifest")
+        let verified = try PriorMapSessionBundler.verifyBundledPackage(
+            in: session)
+        require(
+            verified == receipt,
+            "bundled package must re-verify to the same receipt")
+        let again = try PriorMapSessionBundler.bundleInstalledPackage(
+            into: session,
+            priorMapID: compiled.priorMapID,
+            packageSHA256: compiled.packageSHA256,
+            canonicalSourceSHA256: report.canonicalSourceSha256)
+        require(again == receipt, "bundling must be idempotent")
+
+        // V1R6 restore: unregistering the map must not strand finalized
+        // sessions; the bundle re-installs the exact bound identity.
+        let restoreSession = temporary.appendingPathComponent(
+            "SupermarketSession-restore", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: restoreSession, withIntermediateDirectories: true)
+        _ = try PriorMapSessionBundler.bundleInstalledPackage(
+            into: restoreSession,
+            priorMapID: compiled.priorMapID,
+            packageSHA256: compiled.packageSHA256,
+            canonicalSourceSHA256: report.canonicalSourceSha256)
+        try MobileMapLibrary.unregister(
+            priorMapID: compiled.priorMapID,
+            packageSHA256: compiled.packageSHA256)
+        do {
+            _ = try MobileMapLibrary.map(
+                priorMapID: compiled.priorMapID,
+                packageSHA256: compiled.packageSHA256)
+            require(false, "unregistered map must not resolve")
+        } catch {}
+        let restored = try PriorMapSessionBundler.restoreInstalledPackage(
+            from: restoreSession)
+        require(
+            restored.priorMapID == compiled.priorMapID
+                && restored.packageSHA256 == compiled.packageSHA256,
+            "restore must re-register the exact bundled identity")
+        let reloaded = try MobileMapLibrary.map(
+            priorMapID: compiled.priorMapID,
+            packageSHA256: compiled.packageSHA256)
+        require(
+            reloaded.packageSHA256 == compiled.packageSHA256,
+            "restored package must load by exact ID/SHA")
+
+        // Tampering with a bundled artifact must fail verification.
+        restoreMutablePermissions(session)
+        let tamperURL = session.appendingPathComponent(
+            "prior_map/manifest.json")
+        var payload = try Data(contentsOf: tamperURL)
+        payload.append(Data(" ".utf8))
+        try payload.write(to: tamperURL)
+        do {
+            _ = try PriorMapSessionBundler.verifyBundledPackage(in: session)
+            require(false, "tampered bundle must fail verification")
+        } catch {}
+
+        // Canonical-source mismatch must refuse bundling fail-closed.
+        let otherSession = temporary.appendingPathComponent(
+            "SupermarketSession-mismatch", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: otherSession, withIntermediateDirectories: true)
+        do {
+            _ = try PriorMapSessionBundler.bundleInstalledPackage(
+                into: otherSession,
+                priorMapID: compiled.priorMapID,
+                packageSHA256: compiled.packageSHA256,
+                canonicalSourceSHA256: String(repeating: "0", count: 64))
+            require(false, "canonical mismatch must refuse bundling")
+        } catch {}
+
+        // Unknown package SHA must refuse bundling fail-closed.
+        do {
+            _ = try PriorMapSessionBundler.bundleInstalledPackage(
+                into: otherSession,
+                priorMapID: compiled.priorMapID,
+                packageSHA256: String(repeating: "1", count: 64),
+                canonicalSourceSHA256: nil)
+            require(false, "uninstalled package SHA must refuse bundling")
+        } catch {}
+
+        print("Prior-map bundle focused tests passed")
+    } catch {
+        FileHandle.standardError.write(
+            Data("Prior-map bundle suite failed: \(error)\n".utf8))
+        exit(13)
+    }
+}
 if CommandLine.arguments.count <= 1 {
     runESLBarcodeCaptureFocusedTests()
 }

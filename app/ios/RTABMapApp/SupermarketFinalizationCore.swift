@@ -31,6 +31,11 @@ struct ExternalCopyVerificationReceipt: Codable {
     let packageContentSha256: String
     let localCopyRetained: Bool
     let durabilityBoundary: String
+    /// V1R6 prior-map bundle evidence: nil for exports created before the
+    /// bundled-prior-map contract.
+    var priorMapBundled: Bool? = nil
+    var priorMapId: String? = nil
+    var priorMapPackageSha256: String? = nil
 }
 
 struct ExternalCopyPackageManifest: Codable {

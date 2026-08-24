@@ -7854,6 +7854,39 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                     }
                     // Clock evidence applies to every mode; prior-map
                     // evidence only to prior-map scans.
+                    var priorMapBundleReceipt: PriorMapSessionBundler.Receipt?
+                    if isPriorMapScan {
+                        // V1R6: bundle the exact installed prior-map package
+                        // into the session directory so PC post-processing
+                        // can always run structure-corrected localized
+                        // optimization. Fail-closed like the required
+                        // localization sidecars.
+                        let boundMapID = scanSession
+                            .scanConfiguration.priorMapId
+                        let boundMapSHA = scanSession
+                            .scanConfiguration.priorMapSha256
+                        if let boundMapID = boundMapID,
+                           let boundMapSHA = boundMapSHA,
+                           !boundMapID.isEmpty, !boundMapSHA.isEmpty {
+                            do {
+                                priorMapBundleReceipt = try PriorMapSessionBundler
+                                    .bundleInstalledPackage(
+                                        into: segmentDirectory
+                                            .deletingLastPathComponent(),
+                                        priorMapID: boundMapID,
+                                        packageSHA256: boundMapSHA,
+                                        canonicalSourceSHA256: scanSession
+                                            .scanConfiguration
+                                            .priorMapCanonicalSourceSha256)
+                            } catch {
+                                processingBlockers.append(
+                                    "prior_map_bundle_failed")
+                            }
+                        } else {
+                            processingBlockers.append(
+                                "prior_map_binding_missing")
+                        }
+                    }
                     let metadataFinalized = processingBlockers.isEmpty
                     let processingEligibility: ScanProcessingEligibility?
                     if processingBlockers.isEmpty {
@@ -8002,7 +8035,8 @@ class ViewController: GLKViewController, ARSessionDelegate, RTABMapObserver, UIP
                         performanceEvidenceComplete:
                             performanceWatermark.complete,
                         performanceWriteFailureCount:
-                            performanceWatermark.writeFailureCount)
+                            performanceWatermark.writeFailureCount,
+                        priorMapBundled: priorMapBundleReceipt?.bundled)
                     let finalSnapshot = scanSession.makeSidecarSnapshot(metadata: metadata)
                     snapshot = finalSnapshot
                     sidecarCommitResult = try scanSession.writeSidecarFiles(

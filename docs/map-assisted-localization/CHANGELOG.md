@@ -1,6 +1,29 @@
 # 地图辅助定位变更记录
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-19。
+> 文档状态：**当前有效**。最后核对日期：2026-08-24。
+
+## 2026-08-24 — 先验地图会话捆绑（V1R6）
+
+- 新增 `PriorMapSessionBundler`：扫描 finalize 时把地图库中与扫描绑定精确一致的
+  已安装包写入 `<session>/prior_map/` 并写 `<session>/prior_map_receipt.json`
+  （MarketScannerPriorMapBundleReceipt v1）；捆绑失败按 required 证据
+  fail-closed（`prior_map_bundle_failed` / `prior_map_binding_missing` 进入
+  processingBlockers）。动机：0823 批次因 PC 侧缺少与手机会话匹配的包版本
+  （手机 `02402-6bfaef41d384` vs 本地 `02402-d4eb3e633cc2`）无法执行结构校正。
+- 导出 `exportFinalizedCapture` 自动携带捆绑包并逐文件复核；历史会话导出时尽力
+  从地图库补捆；`copy_verification.json` 新增 `priorMapBundled / priorMapId /
+  priorMapPackageSha256`；metadata 新增可选 `priorMapBundled`。
+- PC Map Studio：inspect 上报 `bundled_prior_map`（与 metadata 精确比对身份）；
+  localized 任务未指定地图时自动选用身份匹配的捆绑包；web 自动填充路径。
+- 手机本地后处理：地图库缺失时经 `restoreInstalledPackage` 从捆绑包恢复注册
+  （复用 unregister 保留的只读字节、重新校验后 re-register），避免与 PC 相同
+  的“缺少地图包”阻断。
+- 详细设计见 `PRIOR_MAP_SESSION_BUNDLE_V1R6_2026-08-24.md`。验证：Swift host
+  `--prior-map-bundle-focused`（捆绑/幂等/注销恢复/篡改拒绝/canonical 失配拒绝/
+  未知 SHA 拒绝）PASS；PriorMap 370/370、Map Studio 148/148、Qualification
+  32/32、unsigned generic iPhoneOS Debug BUILD SUCCEEDED。签名 LiDAR 真机
+  finalize/导出与 PC localized 端到端仍未执行，整体保持 **NO-GO / NOT
+  PRODUCTION READY**。
 
 ## 2026-08-19 — PC 地图包文件夹导入防崩溃
 

@@ -5102,5 +5102,87 @@ class PersistentJobRuntimeTests(unittest.TestCase):
             self.assertEqual(state.list(), [])
 
 
+class BundledPriorMapResolutionTests(unittest.TestCase):
+    """V1R6: sessions may carry the exact prior-map package the phone used;
+    localized processing auto-selects it only on exact identity match."""
+
+    PRIOR_MAP_ID = "02402-6bfaef41d384"
+    PACKAGE_SHA = "f" * 64
+    CANONICAL_SHA = "6" * 64
+
+    def _write_session(self, root: Path, canonical: str | None = CANONICAL_SHA,
+                       receipt_canonical: str | None = CANONICAL_SHA) -> Path:
+        session = root / "SupermarketSession-test"
+        segment = session / "segment_0001"
+        segment.mkdir(parents=True)
+        metadata = {
+            "finalized": True,
+            "scanMode": "continuous_streaming",
+            "priorMapId": self.PRIOR_MAP_ID,
+            "priorMapSha256": self.PACKAGE_SHA,
+        }
+        if canonical is not None:
+            metadata["priorMapCanonicalSourceSha256"] = canonical
+        (segment / "metadata.json").write_text(
+            json.dumps(metadata), encoding="utf-8")
+        package = session / "prior_map"
+        package.mkdir()
+        (package / "manifest.json").write_text(
+            json.dumps({"prior_map_id": self.PRIOR_MAP_ID}), encoding="utf-8")
+        (package / "package_manifest.json").write_text(
+            json.dumps({"package_sha256": self.PACKAGE_SHA}), encoding="utf-8")
+        receipt = {
+            "format": "MarketScannerPriorMapBundleReceipt",
+            "version": 1,
+            "bundled": True,
+            "prior_map_id": self.PRIOR_MAP_ID,
+            "package_sha256": self.PACKAGE_SHA,
+            "canonical_source_sha256": receipt_canonical,
+        }
+        (session / "prior_map_receipt.json").write_text(
+            json.dumps(receipt), encoding="utf-8")
+        return session
+
+    def test_bundled_package_with_exact_identity_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = self._write_session(Path(temporary))
+            summary = server.bundled_prior_map_summary(session)
+            self.assertTrue(summary["present"])
+            self.assertTrue(summary["identity_matches_session"])
+            self.assertEqual(summary["package_path"], str(session / "prior_map"))
+
+    def test_canonical_mismatch_never_auto_selects(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = self._write_session(
+                Path(temporary), canonical="9" * 64)
+            summary = server.bundled_prior_map_summary(session)
+            self.assertTrue(summary["present"])
+            self.assertFalse(summary["identity_matches_session"])
+            with self.assertRaises(server.RequestError):
+                server.resolve_localized_prior_map({}, session)
+
+    def test_missing_bundle_requires_explicit_prior_map(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = Path(temporary) / "SupermarketSession-plain"
+            (session / "segment_0001").mkdir(parents=True)
+            with self.assertRaises(server.RequestError):
+                server.resolve_localized_prior_map({}, session)
+
+    def test_empty_request_falls_back_to_bundled_package(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = self._write_session(Path(temporary))
+            resolved = server.resolve_localized_prior_map({}, session)
+            self.assertEqual(resolved, session / "prior_map")
+
+    def test_explicit_prior_map_wins_over_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = self._write_session(Path(temporary))
+            explicit = Path(temporary) / "other-package"
+            explicit.mkdir()
+            resolved = server.resolve_localized_prior_map(
+                {"prior_map": str(explicit)}, session)
+            self.assertEqual(resolved, explicit.resolve())
+
+
 if __name__ == "__main__":
     unittest.main()

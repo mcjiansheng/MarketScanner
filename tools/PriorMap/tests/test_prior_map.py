@@ -1672,6 +1672,8 @@ class IOSCoreContractTests(unittest.TestCase):
             / "app/ios/RTABMapApp/MobileOnlyWorkflow/ProcessingResourceGovernor.swift",
             repository
             / "app/ios/RTABMapApp/MobileOnlyWorkflow/MobileProcessingPipeline.swift",
+            repository
+            / "app/ios/RTABMapApp/MobileOnlyWorkflow/PriorMapSessionBundler.swift",
         ]
         swift_test = Path(__file__).with_name("swift") / "main.swift"
         with tempfile.TemporaryDirectory() as temporary:
@@ -1738,6 +1740,27 @@ class IOSCoreContractTests(unittest.TestCase):
             self.assertIn(
                 "Snapshot stable committed-file focused tests passed",
                 snapshot_stable_read_result.stdout,
+            )
+            bundle_workbook = Path(temporary) / "bundle-fixture.xlsx"
+            write_workbook(bundle_workbook, fixture_rows())
+            bundle_result = subprocess.run(
+                [
+                    str(executable),
+                    "--prior-map-bundle-focused",
+                    str(bundle_workbook),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                bundle_result.returncode,
+                0,
+                bundle_result.stderr,
+            )
+            self.assertIn(
+                "Prior-map bundle focused tests passed",
+                bundle_result.stdout,
             )
             absolute_prior_contract_result = subprocess.run(
                 [str(executable), "--absolute-prior-contract", "run"],

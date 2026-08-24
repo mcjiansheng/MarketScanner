@@ -658,6 +658,15 @@ function applyInspectionCapabilities(data) {
   $("#run-single").textContent = currentSingleScanMode === "continuous_streaming"
     ? "PC 优化并生成地图"
     : "生成单设备地图";
+  // V1R6: auto-select the prior-map package bundled inside the session so
+  // localized processing always resolves the exact map the phone used.
+  const bundled = data?.bundled_prior_map;
+  const localizedPrior = $("localized-prior-map");
+  if (bundled && bundled.present && bundled.identity_matches_session
+      && localizedPrior && !localizedPrior.value.trim()) {
+    localizedPrior.value = bundled.package_path;
+    localizedPrior.dataset.bundledAuto = "true";
+  }
 }
 
 async function inspectSession(inputId) {

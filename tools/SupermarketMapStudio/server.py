@@ -1204,6 +1204,86 @@ def structure_coverage_summary(session: Path) -> Dict[str, Any]:
     }
 
 
+def bundled_prior_map_summary(session: Path) -> Dict[str, Any]:
+    """Report a V1R6 prior-map package bundled inside the session directory.
+
+    The phone bundles the exact installed package it scanned with into
+    `<session>/prior_map/` plus `<session>/prior_map_receipt.json`. PC
+    localized processing may auto-select it only when the receipt identity
+    exactly matches the session metadata binding; deep package validation
+    still runs in the localized pipeline afterwards.
+    """
+    summary: Dict[str, Any] = {
+        "present": False,
+        "package_path": None,
+        "receipt_path": None,
+        "prior_map_id": None,
+        "package_sha256": None,
+        "canonical_source_sha256": None,
+        "identity_matches_session": False,
+    }
+    package_dir = session / "prior_map"
+    receipt_path = session / "prior_map_receipt.json"
+    if not package_dir.is_dir() or not receipt_path.is_file():
+        return summary
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return summary
+    if not isinstance(receipt, dict) or receipt.get("bundled") is not True:
+        return summary
+    if not (package_dir / "manifest.json").is_file() or not (
+        package_dir / "package_manifest.json"
+    ).is_file():
+        return summary
+    summary["present"] = True
+    summary["package_path"] = str(package_dir)
+    summary["receipt_path"] = str(receipt_path)
+    receipt_id = receipt.get("prior_map_id")
+    receipt_sha = receipt.get("package_sha256")
+    receipt_canonical = receipt.get("canonical_source_sha256")
+    summary["prior_map_id"] = receipt_id
+    summary["package_sha256"] = receipt_sha
+    summary["canonical_source_sha256"] = receipt_canonical
+    metadata: Dict[str, Any] = {}
+    for candidate in sorted(session.glob("segment_*/metadata.json")):
+        try:
+            metadata = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            metadata = {}
+        break
+    session_id = metadata.get("priorMapId")
+    session_sha = metadata.get("priorMapSha256")
+    session_canonical = metadata.get("priorMapCanonicalSourceSha256")
+    identity_ok = (
+        isinstance(receipt_id, str)
+        and receipt_id == session_id
+        and isinstance(receipt_sha, str)
+        and receipt_sha == session_sha
+    )
+    if identity_ok and session_canonical is not None:
+        identity_ok = receipt_canonical == session_canonical
+    summary["identity_matches_session"] = bool(identity_ok)
+    return summary
+
+
+def resolve_localized_prior_map(
+    data: Dict[str, Any], session: Path
+) -> Path:
+    """Resolve the localized prior-map path, falling back to the bundled
+    package shipped inside the session when the request does not name one."""
+    raw = data.get("prior_map")
+    if isinstance(raw, str) and raw.strip():
+        return resolve_path(raw, "Prior-map package")
+    bundled = bundled_prior_map_summary(session)
+    if bundled["present"] and bundled["identity_matches_session"]:
+        return Path(str(bundled["package_path"]))
+    raise RequestError(
+        "Prior-map package is required. The session does not carry a "
+        "matching bundled prior map; import the exact package first."
+    )
+
+
 def prior_map_localization_summary(session: Path) -> Dict[str, Any]:
     """Inspect bounded Stage-2 audit sidecars without touching the scan DB."""
     names = {
@@ -1322,6 +1402,7 @@ def inspect_session(session: Path) -> Dict[str, Any]:
         },
         "structure_coverage": structure_coverage_summary(session),
         "prior_map_localization": prior_map_localization_summary(session),
+        "bundled_prior_map": bundled_prior_map_summary(session),
         "scan_logs": scan_event_logs(session),
         "crash_diagnostics": metrickit_diagnostic_logs(session),
         "phone_performance": phone_performance.analyze_session(session),
@@ -3547,9 +3628,13 @@ def start_job(data: Dict[str, Any]) -> Job:
         if kind in {"map", "stage"}:
             input_keys = (str(require_session(data.get("session"))),)
         elif kind == "localized":
+            localized_session = require_session(data.get("session"))
+            localized_prior_map = resolve_localized_prior_map(
+                data, localized_session)
+            data["prior_map"] = str(localized_prior_map)
             input_keys = (
-                str(require_session(data.get("session"))),
-                str(resolve_path(data.get("prior_map"), "Prior-map package")),
+                str(localized_session),
+                str(localized_prior_map),
             )
         else:
             raw_devices = data.get("devices")

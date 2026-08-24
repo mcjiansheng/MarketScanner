@@ -149,6 +149,12 @@ struct ScanSegmentMetadata: Codable {
     let performanceLastTimestampUnix: TimeInterval?
     let performanceEvidenceComplete: Bool?
     let performanceWriteFailureCount: Int?
+    /// V1R6: true when the exact installed prior-map package used by this
+    /// scan was bundled into the session directory (`prior_map/` plus
+    /// `prior_map_receipt.json`) so PC structure-corrected localized
+    /// processing can always resolve the bound map. Older metadata decodes
+    /// nil and keeps the historical PC map-selection flow.
+    var priorMapBundled: Bool? = nil
 }
 
 struct ScanPerformanceSampleInput {
@@ -1369,6 +1375,45 @@ final class SupermarketScanSession {
                 at: localCaptureDirectory,
                 to: exportCapture)
 
+            // V1R6: carry the bundled prior-map package (or attach the still
+            // installed package for historical sessions) so the exported
+            // package always supports PC structure-corrected localized
+            // processing. Verification below is fail-closed.
+            let localPriorMap = sessionDirectory.appendingPathComponent(
+                PriorMapSessionBundler.bundleDirectoryName, isDirectory: true)
+            if fileManager.fileExists(atPath: localPriorMap.path) {
+                try fileManager.copyItem(
+                    at: localPriorMap,
+                    to: exportRoot.appendingPathComponent(
+                        PriorMapSessionBundler.bundleDirectoryName,
+                        isDirectory: true))
+                let localReceiptURL = sessionDirectory.appendingPathComponent(
+                    PriorMapSessionBundler.receiptFileName)
+                if fileManager.fileExists(atPath: localReceiptURL.path) {
+                    try fileManager.copyItem(
+                        at: localReceiptURL,
+                        to: exportRoot.appendingPathComponent(
+                            PriorMapSessionBundler.receiptFileName))
+                }
+            } else if let boundID = metadata["priorMapId"] as? String,
+                      let boundSHA = metadata["priorMapSha256"] as? String,
+                      !boundID.isEmpty, !boundSHA.isEmpty {
+                _ = try? PriorMapSessionBundler.bundleInstalledPackage(
+                    into: exportRoot,
+                    priorMapID: boundID,
+                    packageSHA256: boundSHA,
+                    canonicalSourceSHA256: metadata[
+                        "priorMapCanonicalSourceSha256"] as? String)
+            }
+            var exportedPriorMapReceipt: PriorMapSessionBundler.Receipt?
+            if fileManager.fileExists(atPath: exportRoot
+                .appendingPathComponent(
+                    PriorMapSessionBundler.bundleDirectoryName,
+                    isDirectory: true).path) {
+                exportedPriorMapReceipt = try PriorMapSessionBundler
+                    .verifyBundledPackage(in: exportRoot)
+            }
+
             progress?(0.74, "正在复核导出文件 SHA-256…")
             let exportManifest = try CaptureDirectoryIntegrity.manifest(
                 for: exportCapture,
@@ -1405,7 +1450,10 @@ final class SupermarketScanSession {
                 packageContentSha256: packageContentSha256,
                 localCopyRetained: true,
                 durabilityBoundary:
-                    "provider_copy_closed_and_reread_no_power_loss_guarantee")
+                    "provider_copy_closed_and_reread_no_power_loss_guarantee",
+                priorMapBundled: exportedPriorMapReceipt?.bundled,
+                priorMapId: exportedPriorMapReceipt?.priorMapId,
+                priorMapPackageSha256: exportedPriorMapReceipt?.packageSha256)
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             try sidecarWriter.writeAtomic(

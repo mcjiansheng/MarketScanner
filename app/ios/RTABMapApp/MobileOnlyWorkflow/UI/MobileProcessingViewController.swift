@@ -300,7 +300,9 @@ final class MobileProcessingViewController: UIViewController,
         let candidate = candidates[indexPath.row]
 
         // The map bound to the session metadata selects the library entry
-        // (§4.2): never pick the first map blindly.
+        // (§4.2): never pick the first map blindly. V1R6: when the
+        // library no longer holds the bound identity, restore it from the
+        // verified package bundled inside the session instead of failing.
         let map: MobileMapLibrary.MapEntry
         do {
             guard let priorMapID = candidate.boundPriorMapID,
@@ -308,10 +310,17 @@ final class MobileProcessingViewController: UIViewController,
                 throw MobileOnlyWorkflowError.mapNotBound(
                     "会话元数据未记录地图身份（旧会话？）")
             }
-            map = try MobileMapLibrary.map(priorMapID: priorMapID, packageSHA256: priorMapSHA)
+            do {
+                map = try MobileMapLibrary.map(
+                    priorMapID: priorMapID, packageSHA256: priorMapSHA)
+            } catch {
+                map = try PriorMapSessionBundler.restoreInstalledPackage(
+                    from: candidate.sessionDirectory)
+            }
         } catch {
             presentNotice(
-                "该会话绑定的地图不在地图库中：\(error.localizedDescription)\n"
+                "该会话绑定的地图不在地图库中，且会话内捆绑包不可用："
+                + "\(error.localizedDescription)\n"
                 + "请先导入并编译对应门店地图。")
             return
         }
