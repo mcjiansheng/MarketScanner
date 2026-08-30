@@ -19,9 +19,24 @@
   实测 753.76 ms/帧；预筛后 34.67 ms/帧（**21.7×**），命中点逐一相等。
 - **证据栅格上界每次生效**（首轮遗漏）：原每 100 帧才检查，低帧率可突破 50,000。
 
+**实时定位 usable 占比低的根因诊断**（37 会话 / 43,995 条 `localization_trace.jsonl`）：
+- `trackingState` 100% 为 normal、`structureSource` 89.6% 为 `scene_depth`
+  → **问题不在 ARKit，也不在缺深度**（推翻此前假设）。
+- 拒绝原因集中在 `insufficient_structure_points`（44.0%）与 `ambiguous_structure_match`（26.8%），
+  成功 `trusted_structure_correction` 仅 0.2%。
+- `matchUniqueness` 中位为 **0**（21/27 会话），门限 0.10 拒绝 **91.3%** 帧；
+  在线安全门 0.35 m 拒绝 **96.2%** 帧（实际所需修正量中位 2.209 m）。
+- **关键反证**：唯一性 = 0 的帧残差中位 0.0014 **低于** 唯一性 > 0 的 0.0043
+  → 低残差不代表匹配正确，**放宽残差门或安全门是错误方向**。
+- 结论：根因为**周期性平行货架几何多解**，属场景几何本质；破解需引入非周期信息
+  （`MapPillar`/`MapCross`/墙角/货架端头的角点显著性图，及已绑定货架的 ESL 价签作绝对锚点）。
+  本轮未实施该算法改动（需真机验证收益与风险）。
+
 新增 `tools/PriorMap/tag_capture_backtest.py`（回测，支持 `--json` 归档）、
 `tools/PriorMap/dynamic_filter_benchmark.py`（基准）、
-`tools/PriorMap/tests/test_tag_capture_backtest.py`（15 例）。
+`tools/PriorMap/localization_trace_diagnostic.py`（定位诊断，含门限拟合表）、
+`tools/PriorMap/tests/test_tag_capture_backtest.py`（15 例）、
+`tools/PriorMap/tests/test_localization_trace_diagnostic.py`（9 例）。
 
 回测：成功率 **0.0% → 64.9%**，均值耗时 **4.00 s → 1.14 s（−71.5%）**，
 失败空等 **267.8 s → 59.0 s（−78.0%）**。

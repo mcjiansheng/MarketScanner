@@ -12,6 +12,16 @@
 
 新增工具：`tools/PriorMap/tag_capture_backtest.py`（回测，支持 `--json` 归档供 CI）、`tools/PriorMap/dynamic_filter_benchmark.py`（基准）；新增回归测试 `tools/PriorMap/tests/test_tag_capture_backtest.py`（15 例）。`IOSCoreContractTests` 6/6 通过（含 Swift host 全量编译），CI 同款 87 文件 `swiftc -parse` 通过，tag evidence 峰值 RSS 由 687 MB 降至 549 MB。
 
+**实时定位 `usable` 占比低的根因已定位**（37 会话 / 43,995 条 `localization_trace.jsonl`）：
+
+- `trackingState` **100% normal**、`structureSource` 89.6% `scene_depth` → **不是 ARKit 问题，也不是缺深度**（推翻此前假设）。
+- 拒绝集中于 `insufficient_structure_points`（44.0%）与 `ambiguous_structure_match`（26.8%），成功仅 **0.2%**。
+- `matchUniqueness` 中位 **0**（21/27 会话），门限 0.10 拒 **91.3%**；在线安全门 0.35 m 拒 **96.2%**（实际所需修正中位 2.209 m）。
+- **反证**：唯一性 = 0 的帧残差中位 0.0014 **低于** 唯一性 > 0 的 0.0043 —— **低残差不代表匹配正确，放宽残差门或安全门是错误方向**。
+- 结论：根因为**周期性平行货架几何多解**，属场景几何本质，非调参可解；需引入非周期信息（`MapPillar`/`MapCross`/墙角/货架端头角点显著性图，及已绑定货架的 ESL 价签作绝对锚点）。该算法改动本轮**未实施**（需真机验证收益与风险）。
+
+新增 `tools/PriorMap/localization_trace_diagnostic.py`（含门限拟合表）与 9 个回归用例。首轮建议的"加匹配拒绝原因遥测"因此关闭——既有 `constraintReason` 字段已提供门级归因，无需新增埋点。
+
 **上述 64.9% 为回测结果，非真机结果。** 签名 LiDAR 真机端到端、Xcode 全量 Release Archive、现场控制点验收、C-1/C-2/C-3 标定仍未执行；手机 `calibrationStatus` 仍硬编码 `CALIBRATION_PENDING`，PC `production_publish_permitted` 因此仍恒为 false。整体继续 **NO-GO / NOT PRODUCTION READY**。
 
 2026-08-19 ESL 现场反馈修复：新增可绑定 iPhone Action Button 的 `Scan ESL` App Shortcut，共享屏幕按钮的同一准入链；不支持且不劫持音量键/传统静音拨片。ARKit 连续自动对焦保持启用，UI 提示约 25–45 cm。EAN/UPC/ITF 与 URL 型 QR 作为疑似商品码警告并要求人工确认，不对山姆 9 位 Code128 ESL 做猜测式拦截。现场“约三个通道后要求新扫描”不是通道计数策略，而是退化深度平面把 `+Infinity` 编入 observation，触发 `JSONEncoder`/required-sidecar 粘性失败；现在非有限 residual 归一为 nil，observation 写前做有限数预检，单帧退化等待下一帧，真实 writer/framing/身份故障仍 fail closed。当前 PriorMap 370/370、Swift parse、本地化格式、patch check 和 unsigned generic iphoneos QualifiedDevice Debug 全量编译/链接 PASS，AppIntents metadata 生成成功；签名真机 Action Button、对焦/反光矩阵和连续多通道尚未执行，整体继续 **NO-GO / NOT PRODUCTION READY**。

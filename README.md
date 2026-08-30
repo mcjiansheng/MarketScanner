@@ -120,7 +120,28 @@ python3 tools/PriorMap/tag_capture_backtest.py \
 # 动态结构过滤热循环基准（真实地图包）
 python3 tools/PriorMap/dynamic_filter_benchmark.py \
   --package /path/to/mapcase03_sam --points 600 --frames 30
+
+# 实时定位诊断：为什么 usable 占比低（门限拟合 + 拒绝原因分布）
+python3 tools/PriorMap/localization_trace_diagnostic.py \
+  --root 扫描结果 --root "PC处理结果/0823-tianhong"
 ```
+
+### 实时定位 usable 占比低的根因（2026-08-30 诊断结论）
+
+对 37 个会话、43,995 条 `localization_trace.jsonl` 逐帧记录做统计：
+
+- 手机 `trackingState` **100% 为 normal**、`structureSource` 89.6% 为 `scene_depth`——**问题不在 ARKit，也不在缺深度**。
+- 拒绝原因集中在 `insufficient_structure_points`（44.0%）与 `ambiguous_structure_match`（26.8%），
+  成功 `trusted_structure_correction` 仅 **0.2%**。
+- `matchUniqueness` 中位为 **0**（21/27 个会话如此），门限 0.10 拒绝了 **91.3%** 的帧；
+  在线修正安全门 0.35 m 拒绝了 **96.2%** 的帧（实际需要的修正量中位为 2.209 m）。
+- **关键反证**：唯一性 = 0 的帧，其 `matchResidualCost` 中位为 0.0014，**低于**唯一性 > 0 的 0.0043。
+  即多解帧的残差并不更差——**低残差不代表匹配正确，因此放宽残差门或安全门会引入错误匹配，不是有效修复**。
+
+结论：根因是**周期性平行货架造成的几何多解**，属场景几何本质，不是阈值调参问题。
+破解方向是引入**非周期信息**（`MapPillar` 柱子、`MapCross` 交叉口、墙角、货架端头的角点/端点显著性图，
+以及已绑定货架的 ESL 价签作为绝对锚点）。详见
+[`MARKETSCANNER_ROUND2_REMEDIATION_2026-08-30.md`](MARKETSCANNER_ROUND2_REMEDIATION_2026-08-30.md) 第四节。
 
 修复内容：
 

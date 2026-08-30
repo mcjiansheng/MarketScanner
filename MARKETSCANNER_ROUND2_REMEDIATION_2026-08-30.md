@@ -8,10 +8,18 @@
 
 ## 〇、一句话结论
 
-首轮审查发现"端到端不闭环"，本轮把它定位到了**具体代码行**：价签链路在现场的成功率是 **0%（0/74 burst）**，根因是三道门叠加失效；其中两道已修复并有测量支撑，另一道（定位质量）属于首轮已识别的 P0，本轮未动算法。此外发现并修复了首轮遗漏的一个**严重性能缺陷**（每帧 753 ms 的距离计算，21.7 倍加速）。
+首轮审查发现"端到端不闭环"，本轮把它定位到了**具体代码行**，并用现场数据量化了两个 0%：
 
-**修复后回测：成功率 0% → 64.9%，单次采集均值耗时 4.00 s → 1.14 s（-71.5%），无效等待 -78.0%。**
-**注意：这是回测结果，不是真机结果。** 真机验证仍是未完成项（见第七节）。
+1. **价签链路成功率 0%（0/74 burst）** —— 三道门叠加失效，已修复并有测量支撑。
+   **修复后回测 64.9%，单次采集均值耗时 4.00 s → 1.14 s（-71.5%），无效等待 -78.0%。**
+2. **实时定位 `usable` 占比 0.2%（94/43,995 帧）** —— 用既有 `localization_trace.jsonl` 诊断出根因是
+   **周期性平行货架造成的几何多解**（`matchUniqueness` 中位为 0，21/27 个会话如此），并给出反证：
+   **多解帧的残差比唯一解更低**（0.0014 vs 0.0043），因此**放宽残差门或安全门是错误方向**。
+
+此外修复了首轮遗漏的一个**严重性能缺陷**：动态过滤热循环每帧 753.76 ms（与现场 921 ms 尖峰吻合），
+加包围盒预筛后 34.67 ms，**21.7 倍**，结果逐一相等。
+
+**注意：以上均为回测/诊断结果，不是真机结果。** 真机验证仍是未完成项（见第八节）。
 
 ---
 
@@ -191,7 +199,81 @@ frame 级剩余拒绝: measurement_unavailable 38 / node_binding_missing 19
 
 ---
 
-## 四、性能优化对比（动态结构过滤）
+## 四、实时定位 `usable` 占比 0% 的根因诊断
+
+首轮审查留下的问题是"只知道 `usable` 占 0–1%，不知道是哪道门在拒绝"。本轮用手机写入的
+`localization_trace.jsonl`（37 个会话、**43,995 条**逐帧记录）直接回答了这个问题——不需要新增遥测，
+答案已经在既有数据里。
+
+诊断工具：`tools/PriorMap/localization_trace_diagnostic.py`（新建，可复现，支持 `--json`）。
+
+```bash
+python3 tools/PriorMap/localization_trace_diagnostic.py \
+  --root 扫描结果 --root "PC处理结果/0823-tianhong"
+```
+
+### 4.1 拒绝原因分布
+
+| 原因 | 计数 | 占比 |
+| --- | ---: | ---: |
+| `insufficient_structure_points` | 19,350 | **44.0%** |
+| `ambiguous_structure_match` | 11,770 | **26.8%** |
+| `correction_exceeds_safety_gate` | 5,232 | 11.9% |
+| `no_hypothesis` | 3,334 | 7.6% |
+| `geometry_candidate` | 1,495 | 3.4% |
+| `road_prior_display_only` | 1,048 | 2.4% |
+| **`trusted_structure_correction`（成功）** | **91** | **0.2%** |
+
+同时：`trackingState` **100% 为 normal**（ARKit 本身健康）、`structureSource` 89.6% 为 `scene_depth`（深度是有的）。
+**这推翻了"定位失败是因为深度不足/ARKit 不稳"的假设。**
+
+### 4.2 门限拟合——门限落在观测分布的哪个位置
+
+| 字段 | 门限 | 样本 | 拒绝率 | 中位 / p90 |
+| --- | ---: | ---: | ---: | --- |
+| `structurePointCount` | ≥45 | 43,995 | **72.5%** | 26.0 / 77.0 |
+| `structureCoverageAngleRad` | ≥0.35 | 43,995 | 22.5% | 0.777 / 1.398 |
+| `matchUniqueness` | ≥0.10 | 43,995 | **91.3%** | **0.0 / 0.088** |
+| `matchResidualCost` | ≤0.10 | 19,842 | 1.6% | 0.003 / 0.020 |
+| `correctionTranslationM`（非零） | ≤0.35 m | 13,798 | **96.2%** | **2.209 / 5.826** |
+
+两个极端失配：唯一性门限卡在 **p91**（数据 p90 才 0.088），在线安全门卡在 **p96**（实际需要的修正量中位是 2.2 m）。
+
+### 4.3 关键反证：低残差不等于匹配正确
+
+| 分组 | cost 中位 |
+| --- | ---: |
+| 唯一性 > 0（有明确胜出解） | 0.0043 |
+| **唯一性 = 0（完全无法区分）** | **0.0014** |
+
+多解记录的残差**比唯一解还低**。这说明：周期性的平行货架会产生多个残差同样极低、但位置完全不同的候选解。
+
+> **因此，放宽 `matchResidualCost` 或放宽在线安全门都不是有效修复**——它们会让"残差很低但位置错误"的解通过，把轨迹拉到错误的通道。这一点必须明确，否则很容易把 0.2% 的成功率误判为"门限调一下就好"。
+
+### 4.4 会话级证据：这是系统性的，不是偶发
+
+27 个有效会话中，**21 个会话的 `matchUniqueness` 中位数为 0**；`usable` 计数普遍为 0，最高的会话也只有 1.79%。
+道路候选同样无法消歧（61.8% 的帧有 3 个道路候选）。
+
+### 4.5 结论
+
+定位失败的根因是**周期性平行货架结构造成的几何多解**，属于场景的几何本质，不是阈值调参问题。
+要提升 `usable` 占比，必须引入**非周期信息**打破对称性。按可行性排序：
+
+1. **非周期结构锚点**（推荐先做）：地图中已有 `MapPillar`（柱子）、`MapCross`（通道交叉口）、墙角、货架端头。
+   这些在几何上是唯一的。建议为距离场额外生成一层"角点/端点显著性图"，与现有边缘距离场并行匹配。
+   这是**纯软件、可在本机验证**的改动。
+2. **ESL 价签作为地标锚点**：已扫到的价签一旦绑定货架，就是强绝对约束。与第 2 节的价签修复直接协同
+   ——价签成功率上去后，可为定位提供周期性结构无法提供的绝对锚点。
+3. **多趟扫描 / 历史轨迹复用**：同一门店第二次扫描时用首趟结果做先验。
+4. 人工锚点（已有，但依赖操作员，不能作为主要手段）。
+
+**本轮未实施上述算法改动**，理由是它需要真机验证才能确认收益与风险，而本轮不具备该条件。
+这里给出的是经过数据验证的**根因定位与方案排序**，而不是猜测。
+
+---
+
+## 五、性能优化对比（动态结构过滤）
 
 工具：`tools/PriorMap/dynamic_filter_benchmark.py`，输入真实山姆地图包。
 
@@ -212,7 +294,7 @@ python3 tools/PriorMap/dynamic_filter_benchmark.py \
 
 ---
 
-## 五、测试与流水线结果
+## 六、测试与流水线结果
 
 ### 5.1 新增测试
 
@@ -223,11 +305,18 @@ python3 tools/PriorMap/dynamic_filter_benchmark.py \
 - 策略对比：深度匮乏场景 optimized 严格占优；深度充足场景两者都成功且 optimized 不慢
 - 发现与聚合：空目录容错、`segment_0001` 发现、合成树上完整报告
 
+`tools/PriorMap/tests/test_localization_trace_diagnostic.py`（9 个用例，全部通过）：
+
+- trace 发现：空文件必须跳过、畸形 JSON 行容错
+- 门限拟合：拒绝率统计正确、**零修正值不计入安全门样本**（零表示未尝试而非通过）、缺字段安全
+- 聚合：原因直方图、状态直方图、门限表字段齐全、空树安全
+- **歧义 vs 残差反证**：构造"多解帧残差低于唯一解"的 fixture，断言该关系被正确检出（这条断言把第 4.3 节的反证固化成回归保护）
+
 ### 5.2 既有测试（全部实测，顺序执行）
 
 | 套件 | 用例数 | 结果 | 耗时 |
 | --- | --- | --- | --- |
-| PriorMap（`discover -s tools/PriorMap/tests -t .`） | 385 | **OK / 385 passed** | 819.6 s |
+| PriorMap（`discover -s tools/PriorMap/tests -t .`） | 394 | **OK / 394 passed** | 801.7 s |
 | Map Studio（`tests` 目录下三模块） | 148 | **OK / 148 passed** | 10.7 s |
 | Qualification（`discover -s tools/Qualification/tests -t .`） | 32 | **31 passed / 1 error** | 30.4 s |
 | `IOSCoreContractTests`（含 Swift host 全量编译 + 契约断言） | 6 | **OK / 6 passed** | 462 s |
@@ -265,20 +354,22 @@ Swift host 规模指标（同一轮跑出，均在门限内且持续改善）：
 
 ---
 
-## 六、新增/修改文件
+## 七、新增/修改文件
 
 | 文件 | 类型 | 说明 |
 | --- | --- | --- |
 | `tools/PriorMap/tag_capture_backtest.py` | 新增 | 现场数据回测工具，门级失败归因 + 策略对比 + `--json` 归档 |
 | `tools/PriorMap/dynamic_filter_benchmark.py` | 新增 | 动态过滤热循环基准，真实地图包 |
+| `tools/PriorMap/localization_trace_diagnostic.py` | 新增 | 定位 trace 诊断：拒绝原因分布 + **门限拟合表** + 歧义/残差反证 |
 | `tools/PriorMap/tests/test_tag_capture_backtest.py` | 新增 | 15 个回归用例 |
+| `tools/PriorMap/tests/test_localization_trace_diagnostic.py` | 新增 | 9 个回归用例 |
 | `app/ios/RTABMapApp/PriceTagCaptureCore.swift` | 修改 | 分层 ROI、2/2/3 契约、分级 quorum、早退 |
 | `app/ios/RTABMapApp/MobilePostProcessing/ShelfLocalizationEvidence.swift` | 修改 | 包围盒预筛、栅格上界 |
 | `tools/PriorMap/tests/swift/main.swift` | 修改 | 契约更新 + 三道防回退断言 |
 
 ---
 
-## 七、未完成项与风险（诚实披露）
+## 八、未完成项与风险（诚实披露）
 
 用户要求的验收底线是"端到端稳定成功运行、各环节无异常中断"。**本轮未达成这一底线的全部验证**，原因如下：
 
@@ -288,17 +379,22 @@ Swift host 规模指标（同一轮跑出，均在门限内且持续改善）：
 | **Xcode 完整 Archive 构建** | 本机执行了 CI 同款 `swiftc -parse`（87 文件）与 Swift host 编译链接（385 测试内含），未执行 Xcode 工程全量 Archive | 建议在 CI 或本机跑一次 `RTABMapApp-QualifiedDevice` Release |
 | **Qualification 1 个用例** | 执行环境沙箱拦截 `os.link()`，非代码缺陷 | 在无沙箱环境或 CI 上复核 |
 | **发布门仍然恒假** | 手机 `ShelfLocalizationPolicy.calibrationStatus` 硬编码 `CALIBRATION_PENDING`，PC `production_publish_permitted` 因此恒为 false | 需现场标定 C-1/C-2/C-3（首轮 P0-3，本轮未动） |
-| **定位 usable 比例 0%** | 属算法层问题（距离场匹配在平行货架/动态场景下召回率低），本轮未改匹配算法 | 需现场真值标定（首轮 P0-2/P0-5） |
-| **GitHub 远端同步** | 当前分支 `fix/esl-field-capture-efficiency` 与 `origin` 同步（0/0），本轮改动尚未提交 | 待你确认后提交并推送 |
+| **定位 usable 比例 0.2%** | 根因已定位为平行货架几何多解（第四节），但破解需要引入非周期锚点，属算法改动，需真机验证收益与风险 | 见第九节建议 1 |
 
 **关键限定**：64.9% 是**回测**成功率，表示"按修复后策略，现场这批 burst 中有 48 个能走完采集→形成结果"。它不等于真机成功率，也不等于可发布率——这 48 个结果仍会因 `needs_review`/`LOW_CONFIDENCE` 而被拒绝自动发布，需人工确认。这是设计意图，不是残留缺陷。
 
 ---
 
-## 八、建议的下一步（按优先级）
+## 九、建议的下一步（按优先级）
 
-1. **跑一次真机回归**：同一门店、同一路线，扫 3 次，用 `tag_capture_backtest.py --json` 归档前后对比。这是验证 64.9% 的唯一方式。
-2. **现场标定 C-1/C-2/C-3**（解锁发布门）：需要 ≥20 个控制点的真值数据集。
-3. **加匹配拒绝原因遥测**：当前仍只能看到 `usable=0%`，无法定位是哪个门在拒绝，后续调参仍是盲调。
+1. **引入非周期结构锚点**（破解定位多解，本轮已定位根因，方案明确）：为距离场额外生成一层
+   角点/端点显著性图（`MapPillar` 柱子、`MapCross` 交叉口、墙角、货架端头），与现有边缘距离场并行匹配。
+   这是**纯软件、可在本机用现有 trace 数据验证**的改动，建议作为下一个迭代的主体。
+2. **跑一次真机回归**：同一门店、同一路线，扫 3 次，用 `tag_capture_backtest.py --json` 与
+   `localization_trace_diagnostic.py --json` 归档前后对比。这是验证 64.9% 与定位改善的唯一方式。
+3. **现场标定 C-1/C-2/C-3**（解锁发布门）：需要 ≥20 个控制点的真值数据集。
 4. **真值验收**：按首轮建议的门槛（点位中位误差 ≤0.5 m、P95 ≤1.0 m、价签可发布 ≥90%）。
 5. **确认契约变更**：产品侧是否接受 2 帧 quorum。
+
+> 首轮建议的"加匹配拒绝原因遥测"现已关闭：既有 `localization_trace.jsonl` 的 `constraintReason`
+> 字段已经提供了门级归因，`localization_trace_diagnostic.py` 可直接复用，不需要新增埋点。
