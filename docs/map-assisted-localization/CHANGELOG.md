@@ -58,8 +58,16 @@
 
 回测：成功率 **0.0% → 64.9%**，均值耗时 **4.00 s → 1.14 s（−71.5%）**，
 失败空等 **267.8 s → 59.0 s（−78.0%）**。
-验证：`IOSCoreContractTests` 6/6（含 Swift host 全量编译，462 s）、CI 同款 87 文件
-`swiftc -parse` PASS、tag evidence 峰值 RSS 687 MB → 549 MB。
+验证：`IOSCoreContractTests` 6/6（含 Swift host 全量编译）、CI 同款 87 文件 `swiftc -parse` PASS、
+tag evidence 峰值 RSS 687 MB → 549 MB。
+
+**Xcode Release 全量构建已通过**（CI `ios-source-contracts` 同款命令）：
+`BUILD SUCCEEDED`；`Package.resolved` 构建前后字节一致；构建产物内
+`MarketScannerBuildIdentity.json` 经 `market_scanner_build_identity.py verify` 校验为
+`build identity verified`，`app_git_sha` 精确绑定本轮 exact HEAD、
+`production_eligible=true`、`working_tree_state=clean`。
+（`iphonesimulator` 依赖缺失，模拟器构建未执行；宿主环境禁止 SwiftPM `sandbox-exec`，
+需加 `-skipPackageUpdates -scmProvider system`，属环境限制非代码问题。）
 **回测非真机**；真机端到端、Xcode Release Archive、现场标定仍未执行，整体继续
 **NO-GO / NOT PRODUCTION READY**。详见根目录
 `MARKETSCANNER_ROUND2_REMEDIATION_2026-08-30.md`。

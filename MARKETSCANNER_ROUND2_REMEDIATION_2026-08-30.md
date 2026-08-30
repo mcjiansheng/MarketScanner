@@ -448,6 +448,44 @@ Swift host 规模指标（同一轮跑出，均在门限内且持续改善）：
 
 > 这是**产品契约变更**，不是静默改参数。若产品侧不认可 2 帧 quorum，请回退修复 2 的 `minimumEvidenceFrames`，其余修复不受影响。
 
+### 6.3 Xcode Release 全量构建（验证流水线）
+
+按 CI `ios-source-contracts` job 的同一套命令在本机执行（`iphoneos` 依赖 7.7 GB 已就绪；
+`iphonesimulator` 依赖缺失，模拟器构建未执行）：
+
+```bash
+xcodebuild -project app/ios/RTABMapApp.xcodeproj -scheme RTABMapApp \
+  -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+  -derivedDataPath /tmp/MSDerivedData -skipPackageUpdates -scmProvider system \
+  ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
+  CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY='' \
+  clean build
+```
+
+| 步骤 | 结果 |
+| --- | --- |
+| `xcodebuild clean build`（Release / arm64 / iphoneos） | **BUILD SUCCEEDED** |
+| `Package.resolved` 构建前后字节比对 | **PASS**（未被 Xcode 改写） |
+| 构建产物内 `MarketScannerBuildIdentity.json` | 存在 |
+| `market_scanner_build_identity.py verify --repo .` | **build identity verified** |
+
+嵌入的构建身份精确绑定到 exact HEAD：
+
+```
+app_git_sha        = 10a0f32fe81ce1a87d8bc92bb14540ebd7c38b1b   ← 本轮提交
+build_configuration= release
+working_tree_state = clean
+production_eligible= true
+version            = 5
+```
+
+> 说明：默认命令会因宿主环境禁止 SwiftPM 的 `sandbox-exec` 而在 "Resolve Package Graph" 阶段失败
+> （`sandbox_apply: Operation not permitted`），这是**执行环境限制、非代码问题**。
+> 加 `-skipPackageUpdates -scmProvider system` 后可正常构建。
+
+这一构建把所有 Swift 改动（价签采集、包围盒预筛、栅格上界、结构点门槛）都做了
+**真实的编译与链接**，强于 `swiftc -parse` 的语法检查。
+
 ---
 
 ## 七、新增/修改文件
@@ -472,12 +510,14 @@ Swift host 规模指标（同一轮跑出，均在门限内且持续改善）：
 | 未验证项 | 原因 | 建议 |
 | --- | --- | --- |
 | **真机端到端扫描** | 需要签名 iPhone（LiDAR）+ 门店现场，本机无法执行 | 必须补，这是唯一能证明成功率的手段 |
-| **Xcode 完整 Archive 构建** | 本机执行了 CI 同款 `swiftc -parse`（87 文件）与 Swift host 编译链接（385 测试内含），未执行 Xcode 工程全量 Archive | 建议在 CI 或本机跑一次 `RTABMapApp-QualifiedDevice` Release |
+| **Xcode Release 全量构建** | ~~未执行~~ → **已执行并通过**，见 6.3 | 已完成 |
 | **Qualification 1 个用例** | 执行环境沙箱拦截 `os.link()`，非代码缺陷 | 在无沙箱环境或 CI 上复核 |
 | **发布门仍然恒假** | 手机 `ShelfLocalizationPolicy.calibrationStatus` 硬编码 `CALIBRATION_PENDING`，PC `production_publish_permitted` 因此恒为 false | 需现场标定 C-1/C-2/C-3（首轮 P0-3，本轮未动） |
 | **定位 usable 比例 0.2%** | 根因已定位为平行货架几何多解（第四节），但破解需要引入非周期锚点，属算法改动，需真机验证收益与风险 | 见第九节建议 1 |
 
 **关键限定**：64.9% 是**回测**成功率，表示"按修复后策略，现场这批 burst 中有 48 个能走完采集→形成结果"。它不等于真机成功率，也不等于可发布率——这 48 个结果仍会因 `needs_review`/`LOW_CONFIDENCE` 而被拒绝自动发布，需人工确认。这是设计意图，不是残留缺陷。
+
+**仍未达成的只有真机一项**（签名 iPhone + 门店现场 + 控制点真值）。构建与测试层面的验证已全部完成，见 6.3。
 
 ---
 

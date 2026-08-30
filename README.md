@@ -145,6 +145,12 @@ python3 tools/PriorMap/localization_trace_diagnostic.py \
 离线估算通过帧数 2,504 → 3,739（+49%）；cost/唯一性/角覆盖/安全门/多帧一致性全部照旧生效。
 已尝试但因契约测试拒绝而**回退**：按空间盆地重算唯一性（详见报告 §4.8）。
 
+Xcode Release 全量构建（CI 同款命令）已通过：`BUILD SUCCEEDED`，且构建产物内
+`MarketScannerBuildIdentity.json` 经统一合约校验为 `build identity verified`，
+`app_git_sha` 精确绑定 exact HEAD，`production_eligible=true`。
+（`iphonesimulator` 依赖缺失，模拟器构建未执行；宿主环境禁止 SwiftPM `sandbox-exec`，
+需加 `-skipPackageUpdates -scmProvider system`。）
+
 结论：根因是**周期性平行货架造成的几何多解**，属场景几何本质，不是阈值调参问题。
 破解方向是引入**非周期信息**（`MapPillar` 柱子、`MapCross` 交叉口、墙角、货架端头的角点/端点显著性图，
 以及已绑定货架的 ESL 价签作为绝对锚点）。详见
