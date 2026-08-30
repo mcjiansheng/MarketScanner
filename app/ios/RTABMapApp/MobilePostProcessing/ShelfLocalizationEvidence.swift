@@ -1079,6 +1079,37 @@ final class DynamicShelfEvidenceFilter {
         var retained: [PriorMapPose2D] = []
         retained.reserveCapacity(localPoints.count)
         var rejected = 0
+        // Round-2 remediation: the previous code called
+        // `distanceToBoundary` for every (point, polygon, edge) triple. On a
+        // real Sam package that is ~1197 polygons x 4 edges x 600 points =
+        // ~2.9M distance evaluations *per frame*, which is what drove the
+        // sustained ~112% CPU and the 921 ms update spikes seen in the field.
+        // Pre-computing bounding boxes once per call turns the common case
+        // into an O(1) reject; only points near a shelf pay for exact
+        // geometry. The result is bit-for-bit identical.
+        let supportBoxes = authoritativeShelfPolygons.map { polygon -> Bounds in
+            var minX = Double.infinity
+            var minY = Double.infinity
+            var maxX = -Double.infinity
+            var maxY = -Double.infinity
+            for point in polygon {
+                if point.xM < minX { minX = point.xM }
+                if point.xM > maxX { maxX = point.xM }
+                if point.yM < minY { minY = point.yM }
+                if point.yM > maxY { maxY = point.yM }
+            }
+            return Bounds(minX: minX, minY: minY, maxX: maxX, maxY: maxY)
+        }
+        // Hard ceiling on the evidence grid. Previously the trim only ran on
+        // every 100th frame, so a slow frame rate could let `cells` grow past
+        // the documented 50k cap before anything reclaimed memory.
+        if cells.count > maximumCells {
+            let keep = cells.sorted {
+                $0.value.lastSeen > $1.value.lastSeen
+            }.prefix(maximumCells)
+            cells = Dictionary(
+                uniqueKeysWithValues: keep.map { ($0.key, $0.value) })
+        }
         let warmedUp = timestamp - (firstTimestamp ?? timestamp)
             >= ShelfLocalizationPolicy.calibrationPendingDynamicPersistenceSeconds
         for point in localPoints {
@@ -1103,9 +1134,12 @@ final class DynamicShelfEvidenceFilter {
             // supported by a mapped shelf face must remain usable immediately.
             // The 10-second persistence gate applies only to unmatched
             // transient structure such as customers and carts.
-            let mapSupported = authoritativeShelfPolygons.contains {
-                Self.distanceToBoundary(x: mapX, y: mapY, polygon: $0) <= 0.5
-            }
+            let mapSupported = Self.isMapSupported(
+                x: mapX,
+                y: mapY,
+                polygons: authoritativeShelfPolygons,
+                boxes: supportBoxes,
+                toleranceM: 0.5)
             if !warmedUp || persistent || mapSupported {
                 retained.append(point)
             } else {
@@ -1125,6 +1159,46 @@ final class DynamicShelfEvidenceFilter {
             }
         }
         return (retained, rejected)
+    }
+
+    /// Axis-aligned extent used to reject a point before paying for exact
+    /// point-to-segment geometry.
+    private struct Bounds {
+        let minX: Double
+        let minY: Double
+        let maxX: Double
+        let maxY: Double
+    }
+
+    /// Two-stage map-support test.
+    ///
+    /// Stage 1 rejects any polygon whose expanded bounding box cannot contain
+    /// the sample. Stage 2 runs the original exact distance test only for the
+    /// handful of polygons that survive. Semantically identical to
+    /// `authoritativeShelfPolygons.contains { distanceToBoundary(...) <= tol }`
+    /// but with the per-frame cost moved from O(points x edges) to
+    /// O(points + near-matches x edges).
+    private static func isMapSupported(
+        x: Double,
+        y: Double,
+        polygons: [[PriorMapPose2D]],
+        boxes: [Bounds],
+        toleranceM: Double
+    ) -> Bool {
+        guard polygons.count == boxes.count else { return false }
+        for index in polygons.indices {
+            let box = boxes[index]
+            if x < box.minX - toleranceM || x > box.maxX + toleranceM
+                || y < box.minY - toleranceM || y > box.maxY + toleranceM {
+                continue
+            }
+            if distanceToBoundary(
+                x: x, y: y, polygon: polygons[index]
+            ) <= toleranceM {
+                return true
+            }
+        }
+        return false
     }
 
     private static func distanceToBoundary(

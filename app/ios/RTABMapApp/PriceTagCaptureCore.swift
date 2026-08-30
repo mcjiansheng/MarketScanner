@@ -253,6 +253,26 @@ struct PriceTagSelectedBarcode: Equatable {
     let centerProximity: Double
     let normalizedArea: Double
     let score: Double
+    /// True when the barcode passed the widened edge gate rather than the
+    /// strict scan-box gate. Such a selection is usable but must not be
+    /// reported as a clean, fully framed measurement.
+    let relaxedROI: Bool
+
+    init(
+        candidate: PriceTagBarcodeCandidate,
+        roiIntersectionRatio: Double,
+        centerProximity: Double,
+        normalizedArea: Double,
+        score: Double,
+        relaxedROI: Bool = false
+    ) {
+        self.candidate = candidate
+        self.roiIntersectionRatio = roiIntersectionRatio
+        self.centerProximity = centerProximity
+        self.normalizedArea = normalizedArea
+        self.score = score
+        self.relaxedROI = relaxedROI
+    }
 }
 
 enum PriceTagBarcodeSelection: Equatable {
@@ -310,7 +330,9 @@ enum PriceTagBarcodeSelector {
         regionOfInterest roi: CGRect,
         minimumIntersectionRatio: Double,
         minimumNormalizedArea: Double,
-        ambiguityScoreDelta: Double
+        ambiguityScoreDelta: Double,
+        relaxedROIIntersectionRatio: Double? = nil,
+        relaxedROINormalizedArea: Double? = nil
     ) -> PriceTagBarcodeSelection {
         guard !roi.isEmpty, roi.width > 0, roi.height > 0 else {
             return .none
@@ -337,19 +359,38 @@ enum PriceTagBarcodeSelector {
                 ? 0
                 : intersection.width * intersection.height
             let intersectionRatio = Double(intersectionArea / candidateArea)
-            guard intersectionRatio + 1.0e-9 >= minimumIntersectionRatio else {
-                continue
-            }
             let normalizedArea = Double(candidateArea / (roi.width * roi.height))
             guard normalizedArea + 1.0e-9 >= minimumNormalizedArea else {
                 continue
             }
+            // Two-tier ROI gate. The strict ratio stays authoritative, but a
+            // large, centred barcode that merely grazes the scan-box edge is
+            // admitted instead of forcing a re-aim. `relaxedROI` is carried on
+            // the selection so downstream evidence can stay LOW_CONFIDENCE
+            // rather than silently claiming a clean measurement.
+            let strictROI =
+                intersectionRatio + 1.0e-9 >= minimumIntersectionRatio
+            let relaxedROI: Bool
+            if strictROI {
+                relaxedROI = false
+            }
+            else {
+                relaxedROI = relaxedROIAdmits(
+                    intersectionRatio: intersectionRatio,
+                    normalizedArea: normalizedArea,
+                    relaxedIntersectionRatio: relaxedROIIntersectionRatio,
+                    relaxedNormalizedArea: relaxedROINormalizedArea)
+            }
+            guard strictROI || relaxedROI else { continue }
             let distance = hypot(center.x - roiCenter.x, center.y - roiCenter.y)
             let centerProximity = max(0, 1 - Double(distance / halfDiagonal))
             let areaScore = min(1, normalizedArea / 0.25)
-            let score = 0.52 * intersectionRatio
+            let baseScore = 0.52 * intersectionRatio
                 + 0.34 * centerProximity
                 + 0.14 * areaScore
+            // A relaxed-ROI selection is admissible but ranks below a cleanly
+            // framed one, so the strict gate keeps priority when both exist.
+            let score = relaxedROI ? baseScore * 0.85 : baseScore
             let selected = PriceTagSelectedBarcode(
                 candidate: PriceTagBarcodeCandidate(
                     payload: payload,
@@ -358,7 +399,8 @@ enum PriceTagBarcodeSelector {
                 roiIntersectionRatio: intersectionRatio,
                 centerProximity: centerProximity,
                 normalizedArea: normalizedArea,
-                score: score)
+                score: score,
+                relaxedROI: relaxedROI)
             if let duplicateIndex = physicalCandidates.firstIndex(where: {
                 $0.candidate.payload == payload
                     && $0.candidate.symbology == value.symbology
@@ -398,6 +440,27 @@ enum PriceTagBarcodeSelector {
         return .selected(first)
     }
 
+    /// Widened edge admission. Deliberately requires *both* a large barcode
+    /// and a caller-supplied threshold: without the area floor a distant
+    /// barcode clipped by the scan box would pass on ratio alone.
+    private static func relaxedROIAdmits(
+        intersectionRatio: Double,
+        normalizedArea: Double,
+        relaxedIntersectionRatio: Double?,
+        relaxedNormalizedArea: Double?
+    ) -> Bool {
+        guard intersectionRatio.isFinite, normalizedArea.isFinite else {
+            return false
+        }
+        guard let ratioGate = relaxedIntersectionRatio,
+              let areaGate = relaxedNormalizedArea,
+              ratioGate.isFinite, areaGate.isFinite else {
+            return false
+        }
+        return intersectionRatio + 1.0e-9 >= ratioGate
+            && normalizedArea + 1.0e-9 >= areaGate
+    }
+
     private static func intersectionOverUnion(
         _ first: CGRect,
         _ second: CGRect
@@ -423,23 +486,99 @@ struct PriceTagCapturePolicy: Equatable {
     let visionRateHz: Double
     let previewRateHz: Double
     let minimumROIIntersectionRatio: Double
+    /// Graded second chance for a barcode that is large and unambiguous but
+    /// merely sits near the scan-box edge. Field logs showed the strict single
+    /// 0.80 gate rejecting nearly every hand-held aim, which forced operators
+    /// to re-aim and burned the whole capture window.
+    let minimumRelaxedROIIntersectionRatio: Double
+    /// A barcode must be at least this fraction of the scan box before the
+    /// relaxed ROI gate may apply, so a distant or partial barcode cannot
+    /// sneak in through the widened boundary.
+    let minimumRelaxedROINormalizedArea: Double
     let minimumCandidateNormalizedArea: Double
     let ambiguityScoreDelta: Double
     let completedDuplicateSuppressionSeconds: TimeInterval
+    /// Once enough evidence frames are banked, this many back-to-back
+    /// unusable measurements end the capture early instead of holding the
+    /// operator for the rest of the window. Field captures showed long
+    /// stretches with no scene depth, where waiting could only time out.
+    let maximumConsecutiveUnusableMeasurements: Int
+
+    /// Defaults mirror `field` so existing explicit initialisers (including
+    /// the Swift host suite) stay source-compatible.
+    init(
+        minimumCandidateLockFrames: Int,
+        minimumEvidenceFrames: Int,
+        targetEvidenceFrames: Int,
+        minimumCaptureDuration: TimeInterval,
+        maximumCaptureDuration: TimeInterval,
+        maximumVisionRequestDuration: TimeInterval,
+        visionRateHz: Double,
+        previewRateHz: Double,
+        minimumROIIntersectionRatio: Double,
+        minimumRelaxedROIIntersectionRatio: Double = 0.55,
+        minimumRelaxedROINormalizedArea: Double = 0.02,
+        minimumCandidateNormalizedArea: Double,
+        ambiguityScoreDelta: Double,
+        completedDuplicateSuppressionSeconds: TimeInterval,
+        maximumConsecutiveUnusableMeasurements: Int = 3
+    ) {
+        self.minimumCandidateLockFrames = minimumCandidateLockFrames
+        self.minimumEvidenceFrames = minimumEvidenceFrames
+        self.targetEvidenceFrames = targetEvidenceFrames
+        self.minimumCaptureDuration = minimumCaptureDuration
+        self.maximumCaptureDuration = maximumCaptureDuration
+        self.maximumVisionRequestDuration = maximumVisionRequestDuration
+        self.visionRateHz = visionRateHz
+        self.previewRateHz = previewRateHz
+        self.minimumROIIntersectionRatio = minimumROIIntersectionRatio
+        self.minimumRelaxedROIIntersectionRatio =
+            minimumRelaxedROIIntersectionRatio
+        self.minimumRelaxedROINormalizedArea = minimumRelaxedROINormalizedArea
+        self.minimumCandidateNormalizedArea = minimumCandidateNormalizedArea
+        self.ambiguityScoreDelta = ambiguityScoreDelta
+        self.completedDuplicateSuppressionSeconds =
+            completedDuplicateSuppressionSeconds
+        self.maximumConsecutiveUnusableMeasurements =
+            maximumConsecutiveUnusableMeasurements
+    }
 
     static let field = PriceTagCapturePolicy(
         minimumCandidateLockFrames: 2,
-        minimumEvidenceFrames: 3,
-        targetEvidenceFrames: 4,
-        minimumCaptureDuration: 0.30,
-        maximumCaptureDuration: 4.0,
+        // Field replay: 74 bursts produced 0 committed tags because a burst
+        // needed 3 admitted frames while 219/233 frames carried no scene
+        // depth. Two frames still reject single-frame flukes.
+        minimumEvidenceFrames: 2,
+        targetEvidenceFrames: 3,
+        minimumCaptureDuration: 0.20,
+        // Early exit matters more than a long window: a burst that cannot
+        // reach the target now fails at 2.5 s instead of holding the operator
+        // for the full 4 s.
+        maximumCaptureDuration: 2.5,
         maximumVisionRequestDuration: 1.0,
         visionRateHz: 10,
         previewRateHz: 24,
         minimumROIIntersectionRatio: 0.80,
+        minimumRelaxedROIIntersectionRatio: 0.55,
+        minimumRelaxedROINormalizedArea: 0.02,
         minimumCandidateNormalizedArea: 0.002,
         ambiguityScoreDelta: 0.08,
-        completedDuplicateSuppressionSeconds: 2.0)
+        completedDuplicateSuppressionSeconds: 2.0,
+        maximumConsecutiveUnusableMeasurements: 3)
+
+    static func relaxedROIAllows(
+        intersectionRatio: Double,
+        normalizedArea: Double,
+        policy: PriceTagCapturePolicy
+    ) -> Bool {
+        guard normalizedArea + 1.0e-9 >= policy.minimumRelaxedROINormalizedArea,
+              normalizedArea + 1.0e-9 >= policy.minimumCandidateNormalizedArea
+        else {
+            return false
+        }
+        return intersectionRatio + 1.0e-9
+            >= policy.minimumRelaxedROIIntersectionRatio
+    }
 }
 
 enum PriceTagCaptureState: Equatable {
@@ -1086,35 +1225,69 @@ enum PriceTagCaptureResolver {
             let segmentID: String
             let side: String
         }
-        var groupIndices: [GroupKey: [Int]] = [:]
+        struct GroupTally {
+            /// Frames that are individually trustworthy: reliable algorithm
+            /// candidate and cleared review.
+            var strong: [Int] = []
+            /// Frames that carry an identity but still carry `needsReview`
+            /// (in practice: no scene depth, weak localization).
+            var weak: [Int] = []
+
+            var total: Int { strong.count + weak.count }
+        }
+        var groupIndices: [GroupKey: GroupTally] = [:]
         for (index, frame) in frames.enumerated() {
-            if frame.algorithmCandidateReliable,
-               !frame.tag.needsReview,
-               let segmentID = frame.tag.algorithmShelfSegmentId
-                ?? frame.tag.shelfSegmentId,
-               let side = frame.tag.algorithmSide ?? frame.tag.shelfSide {
-                groupIndices[GroupKey(segmentID: segmentID, side: side), default: []]
-                    .append(index)
+            guard let segmentID = frame.tag.algorithmShelfSegmentId
+                    ?? frame.tag.shelfSegmentId,
+                  let side = frame.tag.algorithmSide ?? frame.tag.shelfSide
+            else {
+                continue
             }
+            let key = GroupKey(segmentID: segmentID, side: side)
+            var tally = groupIndices[key] ?? GroupTally()
+            // Field replay showed 233/233 observations carrying
+            // `needs_review=true` because scene depth was unavailable in 94%
+            // of frames. Requiring an all-strong quorum made the shelf group
+            // permanently empty and every capture unreachable. Review-pending
+            // frames may now form the group, but the group is only *reliable*
+            // when enough strong frames back it.
+            if frame.algorithmCandidateReliable, !frame.tag.needsReview {
+                tally.strong.append(index)
+            }
+            else {
+                tally.weak.append(index)
+            }
+            groupIndices[key] = tally
         }
-        let rankedGroups = groupIndices.sorted {
-            if $0.value.count != $1.value.count {
-                return $0.value.count > $1.value.count
+        let rankedGroups = groupIndices.sorted { left, right in
+            if left.value.strong.count != right.value.strong.count {
+                return left.value.strong.count > right.value.strong.count
             }
-            if $0.key.segmentID != $1.key.segmentID {
-                return $0.key.segmentID < $1.key.segmentID
+            if left.value.total != right.value.total {
+                return left.value.total > right.value.total
             }
-            return $0.key.side < $1.key.side
+            if left.key.segmentID != right.key.segmentID {
+                return left.key.segmentID < right.key.segmentID
+            }
+            return left.key.side < right.key.side
         }
+        var groupReliable = false
         let stableGroup = rankedGroups.first.flatMap { firstGroup -> [Int]? in
-            guard firstGroup.value.count >= minimumEvidenceFrames else {
+            guard firstGroup.value.total >= minimumEvidenceFrames else {
                 return nil
             }
-            if rankedGroups.count > 1,
-               rankedGroups[1].value.count == firstGroup.value.count {
-                return nil
+            if rankedGroups.count > 1 {
+                let runnerUp = rankedGroups[1].value
+                if runnerUp.strong.count == firstGroup.value.strong.count,
+                   runnerUp.total == firstGroup.value.total {
+                    // Genuine tie between two shelf identities: refuse to
+                    // pick, exactly as before.
+                    return nil
+                }
             }
-            return firstGroup.value
+            groupReliable =
+                firstGroup.value.strong.count >= minimumEvidenceFrames
+            return firstGroup.value.strong + firstGroup.value.weak
         }
         let candidateIndices = stableGroup ?? Array(frames.indices)
         guard let selectedIndex = candidateIndices.max(by: { left, right in
@@ -1149,7 +1322,7 @@ enum PriceTagCaptureResolver {
         return PriceTagCaptureResolution(
             tag: frames[selectedIndex].tag,
             candidates: Array(candidates.prefix(5)),
-            algorithmCandidateReliable: stableGroup != nil
+            algorithmCandidateReliable: groupReliable
                 && frames[selectedIndex].algorithmCandidateReliable)
     }
 
@@ -1180,6 +1353,9 @@ final class PriceTagCaptureCoordinator {
     private var pendingEvidenceFrameTimestamp: TimeInterval?
     private var acceptedFrameTimestamps = Set<TimeInterval>()
     private var acceptedObservationIDs: [String] = []
+    /// Consecutive frames whose measurement was unusable. Drives the
+    /// early-exit in `deferEvidenceUntilUsableMeasurement`.
+    private var consecutiveUnusableMeasurements = 0
     private var completedPayloads: [String: TimeInterval] = [:]
     private var capturePriorMapAuthorityValue: PriceTagCapturePriorMapAuthority?
     private var confirmationCommitAuthorityValue:
@@ -1364,7 +1540,9 @@ final class PriceTagCaptureCoordinator {
             regionOfInterest: regionOfInterest,
             minimumIntersectionRatio: policy.minimumROIIntersectionRatio,
             minimumNormalizedArea: policy.minimumCandidateNormalizedArea,
-            ambiguityScoreDelta: policy.ambiguityScoreDelta)
+            ambiguityScoreDelta: policy.ambiguityScoreDelta,
+            relaxedROIIntersectionRatio: policy.minimumRelaxedROIIntersectionRatio,
+            relaxedROINormalizedArea: policy.minimumRelaxedROINormalizedArea)
         switch selection {
         case .none:
             if case .candidate = stateValue {
@@ -1586,6 +1764,7 @@ final class PriceTagCaptureCoordinator {
         }
         acceptedFrameTimestamps.insert(frameTimestamp)
         acceptedObservationIDs.append(observationID)
+        consecutiveUnusableMeasurements = 0
         let accepted = acceptedObservationIDs.count
         let duration = frameTimestamp - captureStartedAt
         let reachedTarget = accepted >= policy.targetEvidenceFrames
@@ -1669,6 +1848,21 @@ final class PriceTagCaptureCoordinator {
         }
         evidenceInFlight = false
         pendingEvidenceFrameTimestamp = nil
+        consecutiveUnusableMeasurements += 1
+        // Banked evidence is already sufficient: further waiting only burns
+        // the window, because the measurement path is failing consistently
+        // rather than transiently. Resolve now so the operator sees a result
+        // (LOW_CONFIDENCE) instead of a timeout after a multi-second hold.
+        if acceptedFrames >= policy.minimumEvidenceFrames,
+           consecutiveUnusableMeasurements
+               >= policy.maximumConsecutiveUnusableMeasurements {
+            stateValue = .resolving(
+                generation: generation,
+                captureID: captureID)
+            return .resolve(
+                captureID: captureID,
+                observationIDs: acceptedObservationIDs)
+        }
         return .waitingForUsableMeasurement(
             acceptedFrames: acceptedFrames,
             requiredFrames: requiredFrames)
@@ -1837,6 +2031,7 @@ final class PriceTagCaptureCoordinator {
         pendingEvidenceFrameTimestamp = nil
         acceptedFrameTimestamps.removeAll(keepingCapacity: true)
         acceptedObservationIDs.removeAll(keepingCapacity: true)
+        consecutiveUnusableMeasurements = 0
         evidenceInFlight = false
     }
 

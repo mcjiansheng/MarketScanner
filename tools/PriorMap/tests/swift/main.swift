@@ -789,14 +789,41 @@ func runESLBarcodeCaptureFocusedTests() {
         ])),
         "BC-03 the existing score-margin policy may select a clear physical winner")
 
+    // CONTRACT CHANGE 2026-08-30 (round-2 remediation).
+    // Field replay over 74 captured bursts showed the 2/3/4 contract produced
+    // 0 committed tags: 219/233 frames carried no scene depth, so a burst
+    // almost never banked 3 admitted frames and every capture burned the full
+    // window before timing out. The contract is now 2/2/3.
+    // The strict 0.80 ROI gate is UNCHANGED and stays authoritative; the
+    // relaxed gate is an additional, area-floored second chance that can only
+    // admit barcodes the strict gate would have sent back for a re-aim.
     require(
         PriceTagCapturePolicy.field.minimumCandidateLockFrames == 2
-            && PriceTagCapturePolicy.field.minimumEvidenceFrames == 3
-            && PriceTagCapturePolicy.field.targetEvidenceFrames == 4
+            && PriceTagCapturePolicy.field.minimumEvidenceFrames == 2
+            && PriceTagCapturePolicy.field.targetEvidenceFrames == 3
             && PriceTagCapturePolicy.field.visionRateHz >= 5
             && PriceTagCapturePolicy.field.visionRateHz <= 10
             && PriceTagCapturePolicy.field.minimumROIIntersectionRatio == 0.80,
-        "field policy must retain the 2/3/4 frame contract, bounded Vision and exact 80% ROI gate")
+        "field policy must retain the 2/2/3 frame contract, bounded Vision and exact 80% ROI gate")
+    // A single frame must still be rejected under any policy.
+    require(
+        PriceTagCapturePolicy.field.minimumEvidenceFrames >= 2,
+        "evidence quorum must reject single-frame flukes")
+    // The widened edge gate must never be looser than the strict gate, and
+    // must keep an area floor so distant clipped barcodes cannot pass.
+    require(
+        PriceTagCapturePolicy.field.minimumRelaxedROIIntersectionRatio
+            < PriceTagCapturePolicy.field.minimumROIIntersectionRatio
+            && PriceTagCapturePolicy.field.minimumRelaxedROIIntersectionRatio
+                >= 0.5
+            && PriceTagCapturePolicy.field.minimumRelaxedROINormalizedArea
+                > PriceTagCapturePolicy.field.minimumCandidateNormalizedArea,
+        "relaxed ROI gate must stay bounded and area-floored")
+    require(
+        PriceTagCapturePolicy.field.maximumCaptureDuration <= 2.5
+            && PriceTagCapturePolicy.field.maximumConsecutiveUnusableMeasurements
+                >= 2,
+        "capture window must cap dead waiting and end repeated measurement failure")
     let stableAuditCodes = Set(
         PriceTagCaptureAuditCode.allCases.map(\.rawValue))
     for requiredCode in [

@@ -106,6 +106,35 @@ Vision 识别的是条码码制，不知道条码是否物理印在电子价签�
 
 价签 observation schema v2 由同一次 native 原子快照冻结 `bound_node_id`、`bound_node_stamp`、`bound_node_map_id` 和 `T_opengl_world_from_node`，把同帧 scene-depth 世界点转换为 `point_in_bound_node_frame`。手机与 PC 后处理只执行一次 `P_final = T_final_node × P_node`，不再把已经位于先验地图框的旧 `raw_map_position` 再与 raw-node inverse 组合，从而关闭非零地图平移/旋转下的重复变换。只有 scene depth 可形成正式 node-local 三维点；二维 `shelf_plane_ray` 不伪造该权威。历史 observation v1 仍保留条码和业务身份，但可发布坐标清空、质量降为低置信并生成 `legacy_tag_coordinate_frame_rescan_required`。完整 burst 若定位、深度或货架关联质量不足，业务记录继续保留；任何低置信、空坐标、未关联或 rescan 都会阻断 `COMPLETE/publish_permitted`。扫描结束会同步驱动 Mobile-Only workflow 的 `scanning → finalizingScan → idle`，可恢复保存失败则回到原扫描，避免下一次配置收到旧的 `scanning` 状态。
 
+### 2026-08-30 第二轮审查与价签识别优化
+
+第二轮审查以仓库内真实现场数据（14 个含价签会话、74 个 burst、233 条观察）做回测，定位到价签链路成功率为 **0%** 的代码级根因并修复。
+
+新增回测与基准工具：
+
+```bash
+# 现场数据回测：门级失败归因 + 策略对比
+python3 tools/PriorMap/tag_capture_backtest.py \
+  --root 扫描结果 --root "PC处理结果/0823-tianhong" --compare
+
+# 动态结构过滤热循环基准（真实地图包）
+python3 tools/PriorMap/dynamic_filter_benchmark.py \
+  --package /path/to/mapcase03_sam --points 600 --frames 30
+```
+
+修复内容：
+
+- **价签采集契约由 2/3/4 帧改为 2/2/3 帧**，采集窗口由 4.0 s 收紧到 2.5 s，最短采集时长 0.30 s 改为 0.20 s。冻结契约测试已同步更新，并新增三道防回退断言（单帧必须拒绝、放宽门必须严于主门且有面积托底、窗口必须封顶）。
+- **ROI 门改为分层**：0.80 严格主门保持不变且仍是权威判据；新增"面积托底的第二道门"（归一化面积 ≥0.02 且交叠 ≥0.55）允许大而清晰的条码贴边通过，放宽进入的候选评分乘 0.85，并以 `relaxedROI` 标记供下游按低置信处理。
+- **货架 quorum 改为强弱分级**：原 `resolve()` 要求组内全部帧 `!needsReview`，而现场 233/233 观察因深度不可用恒为 `needsReview`，导致分组永远为空。现在弱证据帧可以形成分组，但只有强帧数量达标时才判定 `algorithmCandidateReliable = true`，弱结果仍需人工确认且不自动发布。
+- **测量连续失败提前退出**：已攒够最少证据帧且测量连续 3 次不可用时立即结束采集，不再空转到窗口超时。
+- **动态结构过滤热循环加包围盒预筛**：原实现对每个深度点遍历全部货架/固定结构多边形的每条边，真实山姆地图（1240 多边形 / 4874 边）实测 753.76 ms/帧，与现场记录的 921 ms 更新尖峰吻合。预筛后为 34.67 ms/帧，**加速 21.7 倍**，结果逐一相等。
+- **证据栅格上界改为每次生效**：原先只在每 100 帧触发裁剪，低帧率下可突破 50,000 上限。
+
+回测结果：成功率 **0.0% → 64.9%**（0/74 → 48/74），单次采集均值耗时 **4.00 s → 1.14 s（−71.5%）**，失败空等 **267.8 s → 59.0 s（−78.0%）**。
+
+该 64.9% 是**回测**成功率，表示这批 burst 按新策略能走完采集并形成结果；其中多数仍会因 `needs_review` 判为 `LOW_CONFIDENCE` 而不自动发布（符合"结果保留、发布从严"合同），且真机验证尚未执行。详见 [`MARKETSCANNER_ROUND2_REMEDIATION_2026-08-30.md`](MARKETSCANNER_ROUND2_REMEDIATION_2026-08-30.md)。
+
 ### 2026-08-15 山姆现场前端到端稳定性加固
 
 现场候选分支对冷启动、地图导入/选择、扫描事务、ARKit/深度提交、人工重定位、价签 burst、停止封口和 PC 历史恢复做了故障注入审查。App 生产 Swift 源码（不含供应商 `Libraries/`）已清除显式 `fatalError`、`precondition`、`preconditionFailure` 和强制类型转换；损坏或缺失的 Settings 值使用保守默认值并记录诊断，UIKit/FileProvider 调用在错误线程进入时回送主线程，恢复日志、定位 trace、价签 observation/burst 和地图楼层不合法时返回严格错误或降级结果，不终止进程。ARKit 图像、深度与置信度缓冲只有在 lock/base-address 成功时才提交对应证据；缺失深度返回 unavailable，不强制解包。

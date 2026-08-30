@@ -1,6 +1,18 @@
 # 地图辅助定位实现状态
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-19。
+> 文档状态：**当前有效**。最后核对日期：2026-08-30。
+
+2026-08-30 第二轮审查与价签识别优化（分支 `fix/esl-field-capture-efficiency`，基线 `96def5e`）：以仓库内真实现场数据（14 会话 / 74 burst / 233 观察）回测，确认价签链路端到端成功率为 **0%**，并定位到三道门叠加失效。修复后回测为 **64.9%**，单次采集均值耗时 4.00 s → 1.14 s。
+
+- **门 A（`PriceTagCaptureCore.resolve()`）**：要求组内全部帧 `!needsReview`，而现场 233/233 观察 `needs_review=true`（因 218/233 帧 `depth_sample_count=0`，`measurement_method` 退化为 `shelf_plane_ray`/`unavailable`），分组恒为空、`algorithmCandidateReliable` 恒 false。已改为**强弱分级 quorum**：弱帧可成组，但仅当强帧数量达标才判定可靠——成功率提升而可靠性不被虚报。
+- **门 B（采集契约 2/3/4 帧 + 4 s 窗口）**：现场 burst 帧数分布 `{1:11, 2:9, 3:4, 4:48}`，凑不齐 3 帧即等满 4 s 后丢弃。已改为 **2/2/3 帧、窗口 2.5 s、最短 0.20 s**。冻结契约测试 `tools/PriorMap/tests/swift/main.swift` 已同步更新并新增三道防回退断言。
+- **门 C（单一 0.80 ROI 门）**：贴边即 `price_tag_roi_miss` 重来。已加**面积托底的第二道门**（面积 ≥0.02 且交叠 ≥0.55），主门 0.80 保持不变，放宽候选评分乘 0.85 并打 `relaxedROI` 标记。
+- **首轮遗漏的性能缺陷（N-1）**：`ShelfLocalizationEvidence.swift` 的动态过滤对每个深度点遍历全部多边形各边，真实山姆地图（1240 多边形 / 4874 边）实测 **753.76 ms/帧**，与现场 921 ms 更新尖峰吻合。加包围盒预筛后 **34.67 ms/帧（21.7×）**，命中点逐一相等。
+- **首轮遗漏的内存缺陷（N-2）**：证据栅格 `cells` 的 50,000 上限原先只在每 100 帧检查，低帧率下可被突破；已改为每次调用检查。
+
+新增工具：`tools/PriorMap/tag_capture_backtest.py`（回测，支持 `--json` 归档供 CI）、`tools/PriorMap/dynamic_filter_benchmark.py`（基准）；新增回归测试 `tools/PriorMap/tests/test_tag_capture_backtest.py`（15 例）。`IOSCoreContractTests` 6/6 通过（含 Swift host 全量编译），CI 同款 87 文件 `swiftc -parse` 通过，tag evidence 峰值 RSS 由 687 MB 降至 549 MB。
+
+**上述 64.9% 为回测结果，非真机结果。** 签名 LiDAR 真机端到端、Xcode 全量 Release Archive、现场控制点验收、C-1/C-2/C-3 标定仍未执行；手机 `calibrationStatus` 仍硬编码 `CALIBRATION_PENDING`，PC `production_publish_permitted` 因此仍恒为 false。整体继续 **NO-GO / NOT PRODUCTION READY**。
 
 2026-08-19 ESL 现场反馈修复：新增可绑定 iPhone Action Button 的 `Scan ESL` App Shortcut，共享屏幕按钮的同一准入链；不支持且不劫持音量键/传统静音拨片。ARKit 连续自动对焦保持启用，UI 提示约 25–45 cm。EAN/UPC/ITF 与 URL 型 QR 作为疑似商品码警告并要求人工确认，不对山姆 9 位 Code128 ESL 做猜测式拦截。现场“约三个通道后要求新扫描”不是通道计数策略，而是退化深度平面把 `+Infinity` 编入 observation，触发 `JSONEncoder`/required-sidecar 粘性失败；现在非有限 residual 归一为 nil，observation 写前做有限数预检，单帧退化等待下一帧，真实 writer/framing/身份故障仍 fail closed。当前 PriorMap 370/370、Swift parse、本地化格式、patch check 和 unsigned generic iphoneos QualifiedDevice Debug 全量编译/链接 PASS，AppIntents metadata 生成成功；签名真机 Action Button、对焦/反光矩阵和连续多通道尚未执行，整体继续 **NO-GO / NOT PRODUCTION READY**。
 
