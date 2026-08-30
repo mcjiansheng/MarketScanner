@@ -271,6 +271,52 @@ python3 tools/PriorMap/localization_trace_diagnostic.py \
 **本轮未实施上述算法改动**，理由是它需要真机验证才能确认收益与风险，而本轮不具备该条件。
 这里给出的是经过数据验证的**根因定位与方案排序**，而不是猜测。
 
+### 4.6 一个被定位、被尝试、最终被回退的缺陷：唯一性度量塌陷
+
+诊断中发现了 `matchUniqueness` 的一个实现缺陷，我做了修复尝试，最终**主动回退**。记录在此，因为失败原因本身对后续工作有约束力。
+
+**缺陷**（`PriorMapScanMatcher.match()`）：
+
+```swift
+let top = Array(fine.prefix(5))
+let bestCost   = top.first?.cost ?? .infinity
+let secondCost = top.dropFirst().first?.cost
+let uniqueness = secondCost.map { max(0, min(1, ($0 - bestCost) / max($0, 0.01))) } ?? 0
+```
+
+`fine` 是细化阶段，搜索半径为 **0.2 m**、步长 0.1 m。因此 `top` 的 5 个条目天然是**同一位置的邻近采样**，
+它们的 cost 必然极为接近，比值数学上趋近 0。实测印证：候选间最小间距 p50 = **0.200 m**、p90 = 0.316 m
+（正是细化半径量级）。**"搜索与自己达成一致"被记成了"歧义"。**
+
+**尝试的修复**：改为按空间盆地计算唯一性——1.0 m 内的候选先聚类，单盆地判为"位置确定"（=1.0），多盆地按盆地间 cost 差。
+
+**离线收益可观**：唯一性通过率 19.2% → 50.4%（盆地半径 0.35 m）；原判 `ambiguous_structure_match` 的
+11,770 帧中有 **39.1%（4,602 帧）**在盆地口径下不再算歧义。
+
+**但契约测试拒绝了它**：
+
+```
+FAILED: periodic equal-cost structure basins must fail closed
+```
+
+该用例构造间距 **0.6 m** 的周期结构，要求必须 fail closed。我先后试了 1.0 m 和 0.35 m 两个半径，均失败。
+深挖后确认根因比预想更深：
+
+> `fine` 阶段的搜索半径只有 0.2 m，其候选**永远**是局部采样。无论盆地半径取多少，
+> 都无法从 `fine` 的 top-5 区分"真单盆地"与"被局部细化掩盖的周期结构"——
+> 因为周期性解如果被细化阶段收敛到同一邻域，它们在 top-5 里看起来就是一个盆地。
+
+**决策：回退该改动**（`git checkout -- PriorMapScanMatcher.swift`），保留离线分析能力。
+理由：唯一性通过率翻倍的收益是**离线估算**，而破坏"周期性结构必须 fail closed"是**已验证的回归**。
+用一个已验证的回归去换一个未验证的收益，不值得。
+
+**安全的修复路径**（留给下一轮）：唯一性必须基于 **coarse / medium 阶段**的候选计算——
+那两个阶段才做全局假设生成（coarse 的 `translationSeparationM = 0.35`、medium 的 `translationRadius = 0.4`），
+只有它们能看到"几个真正分离的全局盆地"。这属于匹配器的架构改动，需配套真机验证。
+
+对应能力已沉淀为离线分析：`localization_trace_diagnostic.py` 的"盆地唯一性分析"段会在报告里
+给出"若采用盆地口径可恢复多少"的估算，并明确标注**这是离线估算，不是生产行为**。
+
 ---
 
 ## 五、性能优化对比（动态结构过滤）

@@ -111,6 +111,70 @@ class GateFitTests(unittest.TestCase):
         self.assertLessEqual(q["p90"], q["max"])
 
 
+def _candidate(x: float, y: float, cost: float) -> dict:
+    return {"pose": {"x_m": x, "y_m": y, "yaw_rad": 0.0}, "cost": cost}
+
+
+class BasinUniquenessTests(unittest.TestCase):
+    def test_single_candidate_is_not_proof_of_uniqueness(self) -> None:
+        """One sample is absence of evidence, so it must fail closed."""
+        self.assertIsNone(diag.basin_uniqueness([_candidate(0, 0, 0.01)]))
+
+    def test_empty_is_none(self) -> None:
+        self.assertIsNone(diag.basin_uniqueness([]))
+
+    def test_converged_search_is_not_ambiguous(self) -> None:
+        """Neighbouring samples of one basin describe one location."""
+        candidates = [
+            _candidate(0.00, 0.00, 0.010),
+            _candidate(0.10, 0.00, 0.011),
+            _candidate(0.20, 0.10, 0.012),
+        ]
+        self.assertEqual(diag.basin_uniqueness(candidates), 1.0)
+
+    def test_distant_equal_cost_basins_stay_ambiguous(self) -> None:
+        """Two equally good locations several metres apart are ambiguous."""
+        candidates = [
+            _candidate(0.0, 0.0, 0.010),
+            _candidate(6.0, 0.0, 0.010),
+        ]
+        self.assertAlmostEqual(diag.basin_uniqueness(candidates), 0.0)
+
+    def test_distant_basins_use_cost_ratio(self) -> None:
+        candidates = [
+            _candidate(0.0, 0.0, 0.010),
+            _candidate(6.0, 0.0, 0.020),
+        ]
+        # (0.020 - 0.010) / 0.020 = 0.5
+        self.assertAlmostEqual(diag.basin_uniqueness(candidates), 0.5)
+
+    def test_chained_cluster_collapses_to_one_basin(self) -> None:
+        """0.3 m hops must chain together instead of being split by order."""
+        candidates = [
+            _candidate(0.0, 0.0, 0.010),
+            _candidate(0.3, 0.0, 0.010),
+            _candidate(0.6, 0.0, 0.010),
+        ]
+        self.assertEqual(diag.basin_uniqueness(candidates), 1.0)
+
+    def test_periodic_structure_at_0_6m_is_not_merged(self) -> None:
+        """The regression suite models periodic shelving at 0.6 m spacing.
+
+        Merging those would call a genuinely ambiguous scene unique, which is
+        exactly the failure the contract test guards against.
+        """
+        candidates = [
+            _candidate(0.0, 0.0, 0.010),
+            _candidate(0.6, 0.0, 0.010),
+        ]
+        value = diag.basin_uniqueness(candidates)
+        self.assertIsNotNone(value)
+        self.assertLess(value, 0.10)
+
+    def test_radius_stays_below_periodic_spacing(self) -> None:
+        self.assertLess(diag.BASIN_RADIUS_M, 0.6)
+
+
 class AnalysisTests(unittest.TestCase):
     def test_aggregates_reasons_states_and_gates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

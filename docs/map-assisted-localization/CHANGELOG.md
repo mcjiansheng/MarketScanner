@@ -32,11 +32,19 @@
   （`MapPillar`/`MapCross`/墙角/货架端头的角点显著性图，及已绑定货架的 ESL 价签作绝对锚点）。
   本轮未实施该算法改动（需真机验证收益与风险）。
 
+**唯一性度量塌陷：已定位、已尝试、**已回退**。** `match()` 用 `fine` 阶段（0.2 m 半径、0.1 m 步长）
+的邻近采样计算 `uniqueness`，比值数学上趋近 0（实测候选间距 p50 = 0.200 m），即"搜索与自己达成一致"被
+记成"歧义"。改为空间盆地口径后，离线估算唯一性通过率 19.2% → 50.4%、39.1% 的歧义判定属误判；
+但契约测试 `periodic equal-cost structure basins must fail closed` 拒绝（周期结构间距 0.6 m）。
+深挖确认：`fine` 候选永远是局部采样，**无法从中区分真单盆地与周期结构**。
+**已回退该改动**，保留离线分析（诊断工具"盆地唯一性分析"段，明确标注为估算而非生产行为）。
+安全修复需改用 coarse/medium 阶段的全局盆地，属架构改动，留待下一轮配套真机验证。
+
 新增 `tools/PriorMap/tag_capture_backtest.py`（回测，支持 `--json` 归档）、
 `tools/PriorMap/dynamic_filter_benchmark.py`（基准）、
 `tools/PriorMap/localization_trace_diagnostic.py`（定位诊断，含门限拟合表）、
 `tools/PriorMap/tests/test_tag_capture_backtest.py`（15 例）、
-`tools/PriorMap/tests/test_localization_trace_diagnostic.py`（9 例）。
+`tools/PriorMap/tests/test_localization_trace_diagnostic.py`（17 例，含盆地唯一性语义测试）。
 
 回测：成功率 **0.0% → 64.9%**，均值耗时 **4.00 s → 1.14 s（−71.5%）**，
 失败空等 **267.8 s → 59.0 s（−78.0%）**。

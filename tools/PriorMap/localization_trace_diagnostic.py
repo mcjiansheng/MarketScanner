@@ -42,6 +42,14 @@ GATES: list[tuple[str, str, float, str]] = [
 
 STATE_FIELD = "localizationState"
 
+# Spatial radius used by the *offline* basin analysis. This mirrors the
+# matcher's coarse-pass `translationSeparationM`, i.e. the distance at which
+# two hypotheses count as independent. It is an analysis constant only: the
+# production matcher was NOT changed, because a safe fix requires comparing
+# coarse/medium-stage basins rather than the fine pass's local samples. See
+# the "uniqueness collapse" note in the round-2 report.
+BASIN_RADIUS_M = 0.35
+
 
 def _read_jsonl(path: str) -> list[dict[str, Any]]:
     if not os.path.exists(path):
@@ -122,6 +130,112 @@ def _gate_fit(
     }
 
 
+def basin_uniqueness(
+    candidates: Sequence[dict[str, Any]], radius: float = BASIN_RADIUS_M
+) -> float | None:
+    """Uniqueness computed over spatial basins rather than raw samples.
+
+    The matcher's fine pass searches a 0.2 m radius in 0.1 m steps, so its top
+    entries are neighbouring samples of one location. Scoring those against
+    each other made uniqueness collapse to ~0 and mislabelled a converged
+    search as ambiguous. Candidates inside ``radius`` of one another are one
+    location; basins -- not samples -- are compared.
+
+    Returns ``1.0`` for a single basin (converged), the best-vs-runner-up cost
+    ratio for two or more basins, and ``None`` when there are fewer than two
+    candidates (absence of evidence, not proof of uniqueness).
+    """
+    if len(candidates) < 2:
+        return None
+    points = [
+        (
+            float((c.get("pose") or {}).get("x_m", 0.0)),
+            float((c.get("pose") or {}).get("y_m", 0.0)),
+            float(c.get("cost", 1e9)),
+        )
+        for c in candidates
+    ]
+    assigned = [False] * len(points)
+    basins: list[float] = []
+    for seed in range(len(points)):
+        if assigned[seed]:
+            continue
+        assigned[seed] = True
+        lowest = points[seed][2]
+        frontier = [seed]
+        while frontier:
+            current = frontier.pop()
+            for other in range(len(points)):
+                if assigned[other]:
+                    continue
+                dx = points[current][0] - points[other][0]
+                dy = points[current][1] - points[other][1]
+                if dx * dx + dy * dy > radius * radius:
+                    continue
+                assigned[other] = True
+                lowest = min(lowest, points[other][2])
+                frontier.append(other)
+        basins.append(lowest)
+    basins.sort()
+    if len(basins) < 2:
+        return 1.0
+    best, runner_up = basins[0], basins[1]
+    return max(0.0, min(1.0, (runner_up - best) / max(runner_up, 0.01)))
+
+
+def _basin_comparison(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Quantify how many `ambiguous_structure_match` rejections were mislabelled."""
+    multi = [
+        r
+        for r in records
+        if isinstance(r.get("matchCandidates"), list)
+        and len(r["matchCandidates"]) >= 2
+    ]
+    if not multi:
+        return {"samples": 0}
+
+    original_pass = 0
+    basin_pass = 0
+    single_basin = 0
+    ambiguous_total = 0
+    ambiguous_converted = 0
+    for record in multi:
+        original = record.get("matchUniqueness") or 0
+        recomputed = basin_uniqueness(record["matchCandidates"])
+        if recomputed is None:
+            continue
+        if original >= 0.10:
+            original_pass += 1
+        if recomputed >= 0.10:
+            basin_pass += 1
+        if recomputed == 1.0:
+            single_basin += 1
+        if record.get("constraintReason") == "ambiguous_structure_match":
+            ambiguous_total += 1
+            if recomputed >= 0.10:
+                ambiguous_converted += 1
+
+    return {
+        "samples": len(multi),
+        "basin_radius_m": BASIN_RADIUS_M,
+        "original_pass_rate": round(original_pass / len(multi), 4),
+        "basin_pass_rate": round(basin_pass / len(multi), 4),
+        "single_basin_count": single_basin,
+        "ambiguous_total": ambiguous_total,
+        "ambiguous_reclassified": ambiguous_converted,
+        "ambiguous_reclassified_rate": round(
+            ambiguous_converted / ambiguous_total, 4
+        )
+        if ambiguous_total
+        else None,
+        "note": (
+            "Offline estimate only. The production matcher still compares the "
+            "fine pass's neighbouring samples, so this is what a basin-aware "
+            "fix would recover -- not what the shipped build does."
+        ),
+    }
+
+
 def analyse(roots: Sequence[str]) -> dict[str, Any]:
     traces = discover_traces(roots)
     by_session: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -195,6 +309,7 @@ def analyse(roots: Sequence[str]) -> dict[str, Any]:
             for field, _label, threshold, op in GATES
         ],
         "ambiguity_vs_residual": ambiguity,
+        "basin_uniqueness_analysis": _basin_comparison(all_records),
         "per_session": sessions,
     }
 
@@ -236,6 +351,25 @@ def _print(report: dict[str, Any]) -> None:
     ):
         print("  => 多解记录的残差并不更差：低残差不能证明匹配正确，")
         print("     因此放宽残差门或安全门会引入错误匹配，不是有效修复。")
+
+    basin = report.get("basin_uniqueness_analysis") or {}
+    if basin.get("samples"):
+        print("\n=== 盆地唯一性分析（离线估算，非生产行为）===")
+        print(f"  多候选样本 {basin['samples']}，盆地半径 {basin['basin_radius_m']} m")
+        print(
+            f"  原唯一性通过率 {basin['original_pass_rate'] * 100:.1f}%  ->  "
+            f"盆地口径 {basin['basin_pass_rate'] * 100:.1f}%"
+        )
+        print(
+            f"  单盆地（搜索收敛）{basin['single_basin_count']} 帧"
+        )
+        print(
+            f"  原判 ambiguous_structure_match {basin['ambiguous_total']} 帧中，"
+            f"{basin['ambiguous_reclassified']} 帧"
+            f"（{(basin['ambiguous_reclassified_rate'] or 0) * 100:.1f}%）"
+            f"在盆地口径下不再算歧义"
+        )
+        print(f"  {basin['note']}")
 
     print("\n=== 会话级（记录数 >= 200）===")
     print(f"  {'会话':<46}{'记录':>7}{'usable':>8}{'uniq中位':>10}{'pts中位':>9}")
