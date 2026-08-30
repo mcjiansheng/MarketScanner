@@ -1066,8 +1066,12 @@ final class PriorMapStageOneLocalizer {
             correctionTranslationM = correction.translationM
             correctionYawRad = correction.yawRad
             correctionYawDeg = correction.yawRad * 180.0 / .pi
+            // Same hardcoded 45 as the matcher's acceptance test; both now
+            // use the matcher's own search threshold. Keeping two copies of a
+            // magic number in sync by hand is how they drift.
             geometryCandidate = best.cost <= 0.10
-                && (match?.effectivePointCount ?? 0) >= 45
+                && (match?.effectivePointCount ?? 0)
+                    >= PriorMapScanMatcher.minimumSearchPointCount
                 && (observation?.coverageAngleRad ?? 0) >= 0.35
             penetrationAudit = ShelfFreeSpaceAuditor.audit(
                 previous: latestEstimatedPose,

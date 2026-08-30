@@ -32,6 +32,15 @@
   （`MapPillar`/`MapCross`/墙角/货架端头的角点显著性图，及已绑定货架的 ESL 价签作绝对锚点）。
   本轮未实施该算法改动（需真机验证收益与风险）。
 
+**结构点门槛 45 修复**（`insufficient_structure_points` 占 44.0%，头号拒绝原因）：
+该门槛**不筛选质量**——按点数分桶后，<45 点帧的 cost 中位 0.00273 **优于** ≥45 点的 0.00340，
+各桶 `cost<=0.10` 通过率均在 97–99%（真正区分质量的是 cost 而非点数）。且 45 是硬编码字面量，
+与命名常量 `minimumSearchPointCount = 30`（搜索门槛）冲突，导致 30–44 点的帧付了完整搜索却被只因点数丢弃
+（占全部帧 72.5%）。**两处均改为引用 `PriorMapScanMatcher.minimumSearchPointCount`**，
+接受门槛与搜索门槛对齐、消除魔数副本；cost/唯一性/角覆盖/安全门/多帧一致性全部照旧生效。
+离线估算通过帧数 2,504 → **3,739（+49%）**。防回退：Swift 契约断言 + 新增
+`tools/PriorMap/tests/test_ios_source_contracts.py`（扫描禁止硬编码点数字面量）。
+
 **唯一性度量塌陷：已定位、已尝试、**已回退**。** `match()` 用 `fine` 阶段（0.2 m 半径、0.1 m 步长）
 的邻近采样计算 `uniqueness`，比值数学上趋近 0（实测候选间距 p50 = 0.200 m），即"搜索与自己达成一致"被
 记成"歧义"。改为空间盆地口径后，离线估算唯一性通过率 19.2% → 50.4%、39.1% 的歧义判定属误判；
@@ -44,7 +53,8 @@
 `tools/PriorMap/dynamic_filter_benchmark.py`（基准）、
 `tools/PriorMap/localization_trace_diagnostic.py`（定位诊断，含门限拟合表）、
 `tools/PriorMap/tests/test_tag_capture_backtest.py`（15 例）、
-`tools/PriorMap/tests/test_localization_trace_diagnostic.py`（17 例，含盆地唯一性语义测试）。
+`tools/PriorMap/tests/test_localization_trace_diagnostic.py`（17 例，含盆地唯一性语义测试）、
+`tools/PriorMap/tests/test_ios_source_contracts.py`（5 例，源码级防魔数回退）。
 
 回测：成功率 **0.0% → 64.9%**，均值耗时 **4.00 s → 1.14 s（−71.5%）**，
 失败空等 **267.8 s → 59.0 s（−78.0%）**。

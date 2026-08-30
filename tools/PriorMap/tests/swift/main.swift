@@ -809,6 +809,18 @@ func runESLBarcodeCaptureFocusedTests() {
     require(
         PriceTagCapturePolicy.field.minimumEvidenceFrames >= 2,
         "evidence quorum must reject single-frame flukes")
+    // Round-2: the structure-point acceptance gate used to be a hardcoded 45
+    // while the search threshold is `minimumSearchPointCount` (30). The 30-44
+    // band paid for a full search and was then discarded on count alone --
+    // 72.5% of field frames -- even though bucketing showed those frames had a
+    // *better* median residual (0.00273 vs 0.00340). Both call sites must now
+    // read the constant; a second magic number is how the two drift apart.
+    require(
+        PriorMapScanMatcher.minimumSearchPointCount == 30,
+        "structure point search threshold must retain the frozen 30-point contract")
+    require(
+        PriorMapScanMatcher.minimumSearchPointCount >= 20,
+        "lowering the point threshold further needs a fresh field justification")
     // The widened edge gate must never be looser than the strict gate, and
     // must keep an area floor so distant clipped barcodes cannot pass.
     require(

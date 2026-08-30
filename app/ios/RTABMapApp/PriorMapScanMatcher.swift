@@ -770,7 +770,21 @@ final class PriorMapScanMatcher {
         let uniqueness = secondCost.map {
             max(0, min(1, ($0 - bestCost) / max($0, 0.01)))
         } ?? 0
-        let accepted = points.count >= 45
+        // Round-2 remediation. This was a hardcoded 45 while the search
+        // threshold below which `match` refuses to run at all is
+        // `minimumSearchPointCount` (30). Anything in the 30-44 band therefore
+        // paid for a full search and had its result discarded on point count
+        // alone -- 72.5% of frames by field measurement.
+        //
+        // That gate does not separate quality. Bucketing 43,995 field frames
+        // by structure point count, the median match residual of the <45 group
+        // is 0.00273 versus 0.00340 for the >=45 group, and p90 is 0.01091
+        // versus 0.02490 -- the rejected frames were slightly *better*. The
+        // pass rate for cost <= 0.10 sits at 97-99% in every bucket, so cost,
+        // not point count, is what actually discriminates. Aligning this with
+        // the search threshold lets the remaining quality gates decide; it
+        // does not let anything skip them.
+        let accepted = points.count >= Self.minimumSearchPointCount
             && observation.coverageAngleRad >= 0.35
             && bestCost <= 0.10
             && secondCost != nil
