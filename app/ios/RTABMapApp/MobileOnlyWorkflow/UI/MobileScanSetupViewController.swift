@@ -77,6 +77,10 @@ final class MobileScanSetupViewController: UIViewController {
     /// falls back to `<store>-<floor>-MMdd-HHmm`.
     private let scanNameField = UITextField()
     private let scanNameHint = UILabel()
+    /// Read-only build stamp. Testers install several builds on one device,
+    /// so the page must state which build it came from. Never read by any
+    /// scan, gate or persistence decision.
+    private let buildVersionLabel = UILabel()
 
     private var payload: SetupPayload?
     private var selectedFloorIndex = 0
@@ -233,6 +237,15 @@ final class MobileScanSetupViewController: UIViewController {
         startButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 50)
             .isActive = true
 
+        buildVersionLabel.numberOfLines = 0
+        buildVersionLabel.textAlignment = .center
+        buildVersionLabel.font = UIFont.preferredFont(forTextStyle: .footnote)
+        buildVersionLabel.textColor = .tertiaryLabel
+        buildVersionLabel.adjustsFontForContentSizeCategory = true
+        buildVersionLabel.accessibilityIdentifier =
+            "mobile.scan.setup.buildVersion"
+        buildVersionLabel.text = Self.buildVersionDisplayText()
+
         [
             floorControl,
             loadingRow,
@@ -249,6 +262,7 @@ final class MobileScanSetupViewController: UIViewController {
             headingLabel,
             summaryLabel,
             startButton,
+            buildVersionLabel,
         ].forEach(contentStack.addArrangedSubview)
 
         NSLayoutConstraint.activate([
@@ -273,6 +287,32 @@ final class MobileScanSetupViewController: UIViewController {
             mapScrollView.heightAnchor.constraint(equalToConstant: 310),
         ])
         updateHeadingLabel()
+    }
+
+    /// Mirrors the format emitted by
+    /// `tools/Qualification/market_scanner_version_stamp.py`. CFBundleVersion
+    /// and MSBuildGitSHA / MSBuildVariant are stamped into the built product
+    /// by the "MarketScanner Version Stamp" build phase, so an unstamped
+    /// bundle degrades to `?` instead of claiming a real build.
+    private static func buildVersionDisplayText() -> String {
+        let info = Bundle.main.infoDictionary
+        let marketing =
+            info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build: String
+        if let text = info?["CFBundleVersion"] as? String {
+            build = text
+        } else if let number = info?["CFBundleVersion"] as? Int {
+            build = String(number)
+        } else {
+            build = "?"
+        }
+        let sha = info?["MSBuildGitSHA"] as? String ?? "unknown"
+        let variant = info?["MSBuildVariant"] as? String ?? ""
+        var parts = [build, sha]
+        if !variant.isEmpty {
+            parts.append(variant)
+        }
+        return "构建 \(marketing) (\(parts.joined(separator: " · ")))"
     }
 
     private func sectionLabel(_ text: String) -> UILabel {

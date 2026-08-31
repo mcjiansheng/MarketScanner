@@ -884,8 +884,8 @@
 			buildPhases = (
 				4EE015BE259A2AF0008CCE65 /* Sources */,
 				4EE015BF259A2AF0008CCE65 /* Frameworks */,
-				4EA4BDE12635BD4500706703 /* ShellScript */,
 				4EE015C0259A2AF0008CCE65 /* Resources */,
+				4EA4BDE12635BD4500706703 /* MarketScanner Version Stamp */,
 				4EA7C3000000000000300001 /* MarketScanner Build Identity */,
 			);
 			buildRules = (
@@ -954,8 +954,9 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXShellScriptBuildPhase section */
-		4EA4BDE12635BD4500706703 /* ShellScript */ = {
+		4EA4BDE12635BD4500706703 /* MarketScanner Version Stamp */ = {
 			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
 			buildActionMask = 2147483647;
 			files = (
 			);
@@ -963,13 +964,14 @@
 			);
 			inputPaths = (
 			);
+			name = "MarketScanner Version Stamp";
 			outputFileListPaths = (
 			);
 			outputPaths = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "# Type a script or drag a script file from your workspace to insert its path.\nversion=\"$MARKETING_VERSION\"\n/usr/libexec/PlistBuddy -c \"Set PreferenceSpecifiers:24:DefaultValue $version\" \"${SRCROOT}/Settings.bundle/Root.plist\"\n";
+			shellScript = "# Stamps the human-visible build version into the BUILT product. This\n# phase runs after Resources, so the source tree stays clean, and before\n# code signing, so the rewritten Info.plist is still signed correctly.\nset -e\nREPO_ROOT=\"$SRCROOT/../..\"\nINFO_PLIST=\"$TARGET_BUILD_DIR/$INFOPLIST_PATH\"\nSETTINGS_PLIST=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/Settings.bundle/Root.plist\"\nset -- --repo \"$REPO_ROOT\" --info-plist \"$INFO_PLIST\"\nif [ -f \"$SETTINGS_PLIST\" ]; then\n  set -- \"$@\" --settings-root-plist \"$SETTINGS_PLIST\"\nelse\n  echo \"warning: MarketScannerVersionStamp: Settings.bundle Root.plist not found; skipping Settings display\"\nfi\nif [ -n \"${MS_BUILD_VARIANT}\" ]; then\n  set -- \"$@\" --variant \"${MS_BUILD_VARIANT}\"\nfi\nif [ -n \"${MS_BUILD_NUMBER}\" ]; then\n  set -- \"$@\" --build-number \"${MS_BUILD_NUMBER}\"\nfi\npython3 \"$REPO_ROOT/tools/Qualification/market_scanner_version_stamp.py\" stamp \"$@\"\n";
 		};
 		4EA7C3000000000000300001 /* MarketScanner Build Identity */ = {
 			isa = PBXShellScriptBuildPhase;
@@ -1309,8 +1311,12 @@
 					"$(PROJECT_DIR)/RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/opencv4/3rdparty",
 				);
 				MARKETING_VERSION = 0.22.0;
+				MS_BUILD_NUMBER = "";
+				MS_BUILD_VARIANT = "";
+				MS_BUNDLE_ID_SUFFIX = "$(MS_BUILD_VARIANT)";
+				MS_DISPLAY_NAME_SUFFIX = "$(MS_BUILD_VARIANT)";
 				OTHER_CFLAGS = "";
-				PRODUCT_BUNDLE_IDENTIFIER = com.xiehaotian.marketscanner.dev;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.xiehaotian.marketscanner.dev$(MS_BUNDLE_ID_SUFFIX)";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SWIFT_OBJC_BRIDGING_HEADER = "RTABMapApp/$(SWIFT_MODULE_NAME)-Bridging-Header.h";
@@ -1375,9 +1381,13 @@
 					"$(PROJECT_DIR)/RTABMapApp/Libraries/$(PLATFORM_NAME)/lib/opencv4/3rdparty",
 				);
 				MARKETING_VERSION = 0.22.0;
+				MS_BUILD_NUMBER = "";
+				MS_BUILD_VARIANT = "";
+				MS_BUNDLE_ID_SUFFIX = "$(MS_BUILD_VARIANT)";
+				MS_DISPLAY_NAME_SUFFIX = "$(MS_BUILD_VARIANT)";
 				ONLY_ACTIVE_ARCH = YES;
 				OTHER_CFLAGS = "";
-				PRODUCT_BUNDLE_IDENTIFIER = com.xiehaotian.marketscanner.dev;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.xiehaotian.marketscanner.dev$(MS_BUNDLE_ID_SUFFIX)";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SWIFT_OBJC_BRIDGING_HEADER = "RTABMapApp/$(SWIFT_MODULE_NAME)-Bridging-Header.h";
