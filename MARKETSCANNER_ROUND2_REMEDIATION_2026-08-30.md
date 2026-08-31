@@ -560,6 +560,39 @@ version            = 5
 > （`sandbox_apply: Operation not permitted`），这是**执行环境限制、非代码问题**。
 > 加 `-skipPackageUpdates -scmProvider system` 后可正常构建。
 
+### 6.4 异常路径审查：三处 `Int(floor(...))` 崩溃风险已修复
+
+审查重点放在"会崩溃"而非"会算错"的路径上。Swift 中 `Int(Double.nan)` 与 `Int(Double.infinity)`
+**不是截断而是运行时 trap**——直接崩溃。定位链路上有多处 `Int(floor(...))` 网格/体素转换，
+其中三处在扫描主循环中：
+
+| 位置 | 触发条件 | 修复 |
+| --- | --- | --- |
+| `PriorMapLocalization.nearbySegments` | 位姿非有限、或地图包 `cellSizeM ≤ 0` | 有限性 + 正值守卫；非有限返回空候选；扫描范围上限 64 格 |
+| `PriorMapDepthSampler`（体素化） | 深度反投影产生非有限世界坐标 | 逐点有限性检查后跳过该采样 |
+| `ShelfFreeSpaceAuditor.audit` | 前后位姿差为 NaN/inf → `Int(ceil(distance/0.1))` | 有限性守卫，降级为"仅节点检查" |
+| `DynamicShelfEvidenceFilter.filter` | 同上（网格 key） | 位姿与逐点双重有限性检查 |
+
+**防回归**：新增源码扫描测试，对定位热路径文件（三个）强制要求每处
+`Int(floor|ceil|round(` 的邻近窗口内存在 `.isFinite` 守卫，并自检扫描非空
+（防止规则因文件移动而静默失效）。该扫描在本轮**真实发现了 `audit()` 中的一处未防护转换**——
+不是装饰性检查。
+
+其他加固：
+
+- `consecutiveUnusableMeasurements` 改为饱和递增，杜绝长期失败下的整数溢出 trap。
+- 早退逻辑要求 `maximumConsecutiveUnusableMeasurements > 0`，且新增
+  `hasSufficientEvidenceLocked()` 兜底最少 1 条证据——避免退化配置下
+  `.resolve(observationIDs: [])` 把空观测集交给下游。
+- `isWithinGate` 对非有限位姿差一律返回 `false`（任何档位）。
+- `isMapSupported` 对非有限样本直接返回 `false`；顺带避免 NaN 使包围盒比较全部为假、
+  从而让每个样本都退化回精确距离计算、悄悄抵消掉 21.7× 的优化。
+
+---
+
+
+---
+
 ### 6.5 PC 处理路径端到端验证（此前完全未验证）
 
 前两轮的工作全部集中在手机端数据与分析上，**PC 处理链路从未实际跑通过**。本轮补上，
@@ -633,17 +666,17 @@ OfflineLocalizationError: Invalid or duplicate clock node binding
 ### 6.7 修复成功率：全量回测（手机端 + PC 端）
 
 用 `tools/PriorMap/batch_verify_pc_pipeline.py` 对所有**具备匹配地图包**的会话跑完整 PC 链路
-（15 个会话，40 分钟，全部输出至独立临时目录，源数据只读）：
+（15 个会话，源数据只读，每个会话独立输出目录）：
 
 ```
-PC pipeline: 11/15 succeeded (73.3%)
+PC pipeline: 13/15 succeeded (86.7%)     ← 含旧地图包的确定性迁移
+            11/15 succeeded (73.3%)     ← 不迁移时
 含重复绑定的会话: 4 -> 3 succeeded
 ```
 
 | 结果 | 数量 | 说明 |
 | --- | ---: | --- |
-| 成功 | **11 / 15** | 73.3% |
-| 失败：地图包校验 | 2 | `162937`、`181158`（天虹店） |
+| 成功 | **13 / 15** | **86.7%** |
 | 失败：轨迹安全门 | 1 | `093330` 优化后邻居步长 15.34 m > 3.51 m 上限 |
 | 失败：时钟覆盖不足 | 1 | `093303` 仅 1 条绑定（契约要求 ≥2） |
 
@@ -655,37 +688,88 @@ PC pipeline: 11/15 succeeded (73.3%)
 | `091950` | sam | 0 | 16.2 s | OK |
 | `092035` | sam | 1 | 38.5 s | **OK**（修复前必失败） |
 | `093215` | sam | 0 | 17.0 s | OK |
-| `093303` | sam | 0 | 8.3 s | FAIL 时钟覆盖不足（仅 1 条绑定） |
-| `093330` | sam | 1 | 340.7 s | FAIL 优化后邻居步长 15.34 m 超 3.51 m 安全上限 |
-| `094042` | sam | 2 | 58.1 s | **OK**（修复前必失败） |
-| `100525` | sam | 0 | 24.7 s | OK |
-| `100739` | sam | 0 | 22.0 s | OK |
-| `101039` | sam | 0 | 19.9 s | OK |
-| `102506` | sam | 0 | 16.9 s | OK |
-| `102542` | sam | 0 | 23.2 s | OK |
-| `103343` | sam | 2 | 155.9 s | **OK**（修复前必失败，见 6.6） |
-| `162937` | tianhong | 0 | 1492.4 s | FAIL 地图包校验 |
-| `181158` | tianhong | 0 | 34.3 s | FAIL 地图包校验 |
+| `093303` | sam | 0 | 14.2 s | FAIL 仅 1 条时钟绑定（契约要求 ≥2） |
+| `093330` | sam | 1 | 342.0 s | FAIL 优化后邻居步长 15.34 m > 3.51 m 上限 |
+| `094042` | sam | 2 | 49.3 s | **OK**（修复前必失败，含 5 条价签观察） |
+| `100525` | sam | 0 | 25.4 s | OK |
+| `100739` | sam | 0 | 25.5 s | OK |
+| `101039` | sam | 0 | 27.7 s | OK |
+| `102506` | sam | 0 | 22.6 s | OK |
+| `102542` | sam | 0 | 23.0 s | OK |
+| `103343` | sam | 2 | 135.5 s | **OK**（修复前必失败，见 6.6） |
+| `162937` | tianhong | 0 | 601.0 s | **OK**（迁移后） |
+| `181158` | tianhong | 0 | 100.0 s | **OK**（迁移后） |
 
 **时钟修复的直接效果**：4 个含重复绑定的会话，**修复前 0/4 必然失败**（时钟证据 fatal），
 **修复后 3/4 成功（75%）**；唯一失败的 `093330` 原因已不是时钟，而是优化轨迹的安全门。
 
-排除 2 个地图包本身不合格的会话后：**11/13 = 84.6%**。
+#### 旧地图包的确定性迁移（把 73.3% 提到 86.7%）
 
-#### 未能通过的两类原因（如实记录）
+首轮批量验证中 `162937`、`181158`（天虹店）因地图包校验失败：
 
-1. **地图包校验失败**（`162937`、`181158`，均为天虹店 `mapcase05_tianhong`）：
-   ```
-   Prior-map validation failed:
-     v2 road_graph 未确定性绑定道路元素。
-     v2 spatial_index 未确定性绑定 elements/road_graph。
-   ```
-   这与首轮记录的"TianHong 阻断：旧编译器丢失派生道路拓扑"是同一问题——**地图包自身的派生工件不一致**，
-   不是本轮代码改动，也不在本轮修复范围（需要重新编译该地图包或走只读兼容迁移）。
+```
+v2 road_graph 未确定性绑定道路元素。
+v2 spatial_index 未确定性绑定 elements/road_graph。
+```
 
-2. **优化轨迹安全门**（`093330`）：`Optimized neighbor step 15.34 m exceeds the safe 3.51 m limit`。
-   这是 PC 优化后的轨迹本身存在大跳变，安全门按设计拒绝发布——**属于正确的保护行为**，
-   与该会话原始数据质量有关（`093330` 定位弱/丢失占比较高）。
+诊断：v2 校验会从 `elements.json` **重新推导** `road_graph` / `spatial_index` 并与包内存储比对。
+天虹包存储的派生工件由旧版推导逻辑生成，因此不一致——即首轮记录的"旧编译器丢失派生道路拓扑"。
+
+项目已自带该场景的迁移工具 `rebuild_legacy_derived_artifacts`
+（算法 `deterministic_road_graph_binding_v1`）。实测：
+
+| | 迁移前 | 迁移后 |
+| --- | --- | --- |
+| `valid` | **False** | **True** |
+| errors | `road_graph_source_binding`、`spatial_source_binding` | **无** |
+| warnings | — | 0 |
+
+**已集成到 `verify_pc_pipeline.py`（阶段 0）**：校验失败时，仅当错误全部落在
+`COMPATIBLE_BINDING_ERRORS`（即上述两个已知旧包错误）内才自动迁移，**原始地图包不被修改**，
+迁移副本写入当前任务的输出目录；其他任何校验错误仍照原样失败，不放宽判定。
+
+迁移后两个天虹会话均跑通：`181158`（1,054 节点 / 100.0 s）与 `162937`（3,663 节点 / 601.0 s），
+产物齐全。**成功率 73.3% → 86.7%（+13.4 个百分点）。**
+
+#### 未通过的 2 个会话（如实记录，均非本轮改动所致）
+
+1. `093303`：**仅 1 条时钟绑定**，而契约要求 ≥2 条才能建立时钟映射。属数据覆盖不足。
+2. `093330`：`Optimized neighbor step 15.34 m exceeds the safe 3.51 m limit`——PC 优化后的轨迹
+   确实存在该跳变，**安全门按设计拒绝发布**，属正确保护行为。
+
+### 旧地图包的确定性迁移（把 73.3% 提到 86.7%）
+
+首轮批量验证中 `162937`、`181158`（天虹店）因地图包校验失败：
+
+```
+v2 road_graph 未确定性绑定道路元素。
+v2 spatial_index 未确定性绑定 elements/road_graph。
+```
+
+诊断：v2 校验会从 `elements.json` **重新推导** `road_graph` / `spatial_index` 并与包内存储比对。
+天虹包存储的派生工件由旧版推导逻辑生成，因此不一致——即首轮记录的"旧编译器丢失派生道路拓扑"。
+
+项目已自带该场景的迁移工具 `rebuild_legacy_derived_artifacts`
+（算法 `deterministic_road_graph_binding_v1`）。实测：
+
+| | 迁移前 | 迁移后 |
+| --- | --- | --- |
+| `valid` | **False** | **True** |
+| errors | `road_graph_source_binding`、`spatial_source_binding` | **无** |
+| warnings | — | 0 |
+
+**已集成到 `verify_pc_pipeline.py`（阶段 0）**：校验失败时，仅当错误全部落在
+`COMPATIBLE_BINDING_ERRORS`（即上述两个已知旧包错误）内才自动迁移，**原始地图包不被修改**，
+迁移副本写入当前任务的输出目录；其他任何校验错误仍照原样失败，不放宽判定。
+
+迁移后两个天虹会话均跑通：
+
+| 会话 | 节点 | 耗时 | 结果 |
+| --- | ---: | ---: | --- |
+| `181158` | 1,054 | 100.0 s | OK |
+| `162937` | 3,663 | 601.0 s | OK |
+
+**成功率 73.3% → 86.7%（+13.4 个百分点）。** 定位弱/丢失占比较高）。
 
 #### 汇总：本轮各环节的修复效果
 
@@ -697,7 +781,7 @@ PC pipeline: 11/15 succeeded (73.3%)
 | 定位单帧通过（geometryCandidate） | 2,504 帧 | **3,739 帧**（+49.3%） | 43,995 帧 trace |
 | 定位 trusted（分级安全门） | 162 帧 | **1,818 帧**（约 11×） | 同上，离线估算 |
 | 动态过滤热循环 | 753.76 ms/帧 | **34.67 ms**（21.7×） | 真实地图包基准 |
-| PC 端到端成功率 | — | **73.3%**（11/15） | 批量真机数据回测 |
+| PC 端到端成功率 | — | **86.7%**（13/15，含旧包迁移） | 批量真机数据回测 |
 | 含重复绑定会话的 PC 成功率 | **0%**（0/4） | **75%**（3/4） | 同上 |
 
 > 上述均为**回测/离线估算**，不含真机验证。定位类数字尤其需要真机确认：
@@ -706,35 +790,6 @@ PC pipeline: 11/15 succeeded (73.3%)
 这一构建把所有 Swift 改动（价签采集、包围盒预筛、栅格上界、结构点门槛、分级安全门）都做了
 **真实的编译与链接**，强于 `swiftc -parse` 的语法检查。
 
-### 6.4 异常路径审查：三处 `Int(floor(...))` 崩溃风险已修复
-
-审查重点放在"会崩溃"而非"会算错"的路径上。Swift 中 `Int(Double.nan)` 与 `Int(Double.infinity)`
-**不是截断而是运行时 trap**——直接崩溃。定位链路上有多处 `Int(floor(...))` 网格/体素转换，
-其中三处在扫描主循环中：
-
-| 位置 | 触发条件 | 修复 |
-| --- | --- | --- |
-| `PriorMapLocalization.nearbySegments` | 位姿非有限、或地图包 `cellSizeM ≤ 0` | 有限性 + 正值守卫；非有限返回空候选；扫描范围上限 64 格 |
-| `PriorMapDepthSampler`（体素化） | 深度反投影产生非有限世界坐标 | 逐点有限性检查后跳过该采样 |
-| `ShelfFreeSpaceAuditor.audit` | 前后位姿差为 NaN/inf → `Int(ceil(distance/0.1))` | 有限性守卫，降级为"仅节点检查" |
-| `DynamicShelfEvidenceFilter.filter` | 同上（网格 key） | 位姿与逐点双重有限性检查 |
-
-**防回归**：新增源码扫描测试，对定位热路径文件（三个）强制要求每处
-`Int(floor|ceil|round(` 的邻近窗口内存在 `.isFinite` 守卫，并自检扫描非空
-（防止规则因文件移动而静默失效）。该扫描在本轮**真实发现了 `audit()` 中的一处未防护转换**——
-不是装饰性检查。
-
-其他加固：
-
-- `consecutiveUnusableMeasurements` 改为饱和递增，杜绝长期失败下的整数溢出 trap。
-- 早退逻辑要求 `maximumConsecutiveUnusableMeasurements > 0`，且新增
-  `hasSufficientEvidenceLocked()` 兜底最少 1 条证据——避免退化配置下
-  `.resolve(observationIDs: [])` 把空观测集交给下游。
-- `isWithinGate` 对非有限位姿差一律返回 `false`（任何档位）。
-- `isMapSupported` 对非有限样本直接返回 `false`；顺带避免 NaN 使包围盒比较全部为假、
-  从而让每个样本都退化回精确距离计算、悄悄抵消掉 21.7× 的优化。
-
----
 
 ## 七、新增/修改文件
 

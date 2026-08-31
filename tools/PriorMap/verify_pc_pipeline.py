@@ -65,6 +65,51 @@ def _read_optimized_poses(database: Path, horizontal_axes: str = "xz") -> list:
     )
 
 
+def _resolve_prior_map(prior_map: Path, workdir: Path) -> tuple[Path, dict | None]:
+    """Validate the package, migrating it only if it fails on known-legacy grounds.
+
+    Some packages were produced before the derived artifacts (road_graph,
+    spatial_index) were deterministically bound to elements. They fail
+    validation with `road_graph_source_binding` / `spatial_source_binding`, and
+    the project already ships a deterministic migration for exactly that case.
+    The original package is never touched: a compatibility copy is built into
+    the scratch directory and used instead.
+    """
+    from tools.PriorMap import prior_map_compatibility as compat
+    from tools.PriorMap.prior_map_schema import validate_package
+
+    validation = validate_package(prior_map)
+    if validation.get("valid") is True:
+        return prior_map, None
+    codes = {
+        str(item.get("code"))
+        for item in (validation.get("errors") or [])
+        if isinstance(item, dict)
+    }
+    if not codes <= compat.COMPATIBLE_BINDING_ERRORS:
+        return prior_map, {
+            "migrated": False,
+            "reason": "package has errors outside the compatible legacy set",
+            "codes": sorted(codes),
+        }
+    destination = workdir / "migrated-prior-map"
+    if destination.exists():
+        shutil.rmtree(destination)
+    compat.rebuild_legacy_derived_artifacts(prior_map, destination)
+    after = validate_package(destination)
+    return destination, {
+        "migrated": True,
+        "source": str(prior_map),
+        "destination": str(destination),
+        "errors_before": sorted(codes),
+        "algorithm": compat.MIGRATION_ALGORITHM,
+        "valid_after": after.get("valid"),
+        "errors_after": [
+            str(item.get("code")) for item in (after.get("errors") or [])
+        ],
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--session", required=True)
@@ -86,6 +131,14 @@ def main() -> int:
         "stages": {},
     }
     started = time.time()
+
+    # ---------------------------------------------------------------- stage 0
+    _stage("0. prior-map package validation (with legacy migration)")
+    prior_map, migration = _resolve_prior_map(prior_map, output)
+    print(f"using package: {prior_map}")
+    if migration:
+        print(json.dumps(migration, ensure_ascii=False, indent=2))
+    report["stages"]["prior_map_migration"] = migration or {"migrated": False}
 
     # ---------------------------------------------------------------- stage 1
     _stage("1. locate session database")
