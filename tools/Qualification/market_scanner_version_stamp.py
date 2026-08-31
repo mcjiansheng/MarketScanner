@@ -58,6 +58,7 @@ FALLBACK_BUILD_NUMBER = "1"
 UNKNOWN_SHA = "unknown"
 DIRTY_SUFFIX = "+"
 VARIANT_SEPARATOR = " · "
+GIT_TIMEOUT_SECONDS = 30
 # A variant is appended verbatim to CFBundleIdentifier and CFBundleDisplayName,
 # so it may only contain alphanumerics, hyphen and period, never whitespace.
 # A leading "." or "-" is the recommended separator (".b1" -> "...dev.b1");
@@ -82,8 +83,13 @@ def _git(repo_root: str, args: list[str]) -> str | None:
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
+            # A stalled git (large repo, network-mounted checkout, corrupted
+            # index) would otherwise hang the Xcode build forever, which is
+            # far more expensive than falling back to an unknown SHA.
+            timeout=GIT_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.CalledProcessError):
+    except (OSError, subprocess.SubprocessError):
+        # SubprocessError covers CalledProcessError and TimeoutExpired.
         return None
     return result.stdout.decode("utf-8", "replace").strip()
 

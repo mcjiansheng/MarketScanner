@@ -7,6 +7,7 @@ import re
 import subprocess
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from tools.Qualification import market_scanner_version_stamp as stamp
@@ -255,6 +256,21 @@ class VersionStampWriteTests(unittest.TestCase):
             self.assertEqual(payload["MSBuildGitSHA"], stamp.UNKNOWN_SHA)
             self.assertIn("warning", rc.stderr)
 
+    def test_git_timeout_degrades_instead_of_hanging(self) -> None:
+        # A stalled git (huge repo, network-mounted checkout, broken index)
+        # must not hang the Xcode build. The timeout is patched small but
+        # nonzero so the real subprocess call expires on any machine; this
+        # also proves the constant actually reaches subprocess.run.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            make_repo(repo)
+            with unittest.mock.patch.object(
+                stamp, "GIT_TIMEOUT_SECONDS", 0.001
+            ):
+                self.assertIsNone(stamp.git_short_sha(str(repo)))
+                self.assertIsNone(stamp.build_number(str(repo)))
+                self.assertFalse(stamp.tracked_tree_is_dirty(str(repo)))
+
     def test_stamp_fails_closed_on_missing_info_plist(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -343,6 +359,22 @@ class XcodeWiringTests(unittest.TestCase):
             "RTAB-Map$(MS_DISPLAY_NAME_SUFFIX)",
         )
 
+    def test_display_name_equals_bundle_name_without_a_variant(self) -> None:
+        # iOS shows CFBundleName whenever CFBundleDisplayName is absent, so
+        # the two must stay identical once the empty default suffix is
+        # expanded -- otherwise adding this key would have silently renamed
+        # the app on the home screen for every default build. They are
+        # hard-coded as two separate strings in Info.plist, so pin the
+        # equality here rather than trusting the next edit to update both.
+        payload = read_plist(INFO_PLIST)
+        suffix = "$(MS_DISPLAY_NAME_SUFFIX)"
+        display_name = payload["CFBundleDisplayName"]
+        self.assertTrue(
+            display_name.endswith(suffix),
+            "CFBundleDisplayName must end with %s: %r" % (suffix, display_name),
+        )
+        self.assertEqual(display_name[: -len(suffix)], payload["CFBundleName"])
+
     def test_version_stamp_phase_runs_after_resources(self) -> None:
         project = PBXPROJ.read_text(encoding="utf-8")
         target = project.split(
@@ -396,6 +428,11 @@ class XcodeWiringTests(unittest.TestCase):
         script = BUILD_SCRIPT.read_text(encoding="utf-8")
         self.assertIn("MS_BUILD_VARIANT=", script)
         self.assertIn('VARIANT="${2:-}"', script)
+        # The build-number escape hatch must reach the build phase too,
+        # otherwise the fallback documented for old-branch checkouts is not
+        # actually reachable from the packaging entry point.
+        self.assertIn("MS_BUILD_NUMBER=", script)
+        self.assertIn('BUILD_NUMBER="${3:-}"', script)
 
 
 if __name__ == "__main__":
