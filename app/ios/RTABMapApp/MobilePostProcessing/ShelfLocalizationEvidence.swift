@@ -967,7 +967,17 @@ enum ShelfFreeSpaceAuditor {
         }
         var segmentViolation = false
         if let previous {
-            let distance = hypot(current.xM - previous.xM, current.yM - previous.yM)
+            let deltaX = current.xM - previous.xM
+            let deltaY = current.yM - previous.yM
+            // `Int(ceil(x))` traps on NaN/infinity. A degenerate pose pair
+            // would otherwise crash the scan loop here; falling back to the
+            // node-only result is the conservative but safe outcome.
+            guard deltaX.isFinite, deltaY.isFinite else {
+                return ShelfPenetrationAudit(
+                    nodeInsideShelfCount: nodeViolation ? 1 : 0,
+                    segmentCrossingCount: 0)
+            }
+            let distance = hypot(deltaX, deltaY)
             // Bounded at 256 samples even for a hostile discontinuity. The
             // pose-jump gate rejects such edges separately.
             let steps = min(256, max(1, Int(ceil(distance / 0.1))))
@@ -1072,8 +1082,16 @@ final class DynamicShelfEvidenceFilter {
         authoritativeShelfPolygons: [[PriorMapPose2D]] = []
     ) -> (points: [PriorMapPose2D], rejectedCount: Int) {
         guard timestamp.isFinite else { return (localPoints, 0) }
+        // A non-finite pose would propagate into the grid key below, and
+        // `Int(floor(x))` traps on NaN/infinity -- a hard crash rather than a
+        // rejected sample. Reject the whole frame's filtering instead by
+        // passing the points through untouched.
+        guard mapPose.xM.isFinite, mapPose.yM.isFinite, mapPose.yawRad.isFinite
+        else {
+            return (localPoints, 0)
+        }
         if firstTimestamp == nil { firstTimestamp = timestamp }
-        frameSequence += 1
+        if frameSequence < Int.max { frameSequence += 1 }
         let cosine = cos(mapPose.yawRad)
         let sine = sin(mapPose.yawRad)
         var retained: [PriorMapPose2D] = []
@@ -1113,8 +1131,12 @@ final class DynamicShelfEvidenceFilter {
         let warmedUp = timestamp - (firstTimestamp ?? timestamp)
             >= ShelfLocalizationPolicy.calibrationPendingDynamicPersistenceSeconds
         for point in localPoints {
+            // Individually degenerate depth samples must be skipped rather
+            // than converted: `Int(floor(x))` traps on non-finite input.
+            guard point.xM.isFinite, point.yM.isFinite else { continue }
             let mapX = mapPose.xM + cosine * point.xM - sine * point.yM
             let mapY = mapPose.yM + sine * point.xM + cosine * point.yM
+            guard mapX.isFinite, mapY.isFinite else { continue }
             let key = "\(Int(floor(mapX / cellSizeM))),\(Int(floor(mapY / cellSizeM)))"
             var cell = cells[key] ?? Cell(
                 firstSeen: timestamp,
@@ -1185,7 +1207,15 @@ final class DynamicShelfEvidenceFilter {
         boxes: [Bounds],
         toleranceM: Double
     ) -> Bool {
-        guard polygons.count == boxes.count else { return false }
+        guard polygons.count == boxes.count,
+              x.isFinite, y.isFinite, toleranceM.isFinite else {
+            // A non-finite sample cannot be "supported" by any mapped
+            // geometry. Bailing out early also keeps NaN from defeating the
+            // bounding-box reject below (NaN comparisons are all false, which
+            // would otherwise send the sample through the exact path for every
+            // polygon and silently undo the optimisation).
+            return false
+        }
         for index in polygons.indices {
             let box = boxes[index]
             if x < box.minX - toleranceM || x > box.maxX + toleranceM

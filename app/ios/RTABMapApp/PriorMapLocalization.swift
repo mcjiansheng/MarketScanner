@@ -626,10 +626,29 @@ final class PriorMapStageOneLocalizer {
         guard !roadCells.isEmpty else {
             return segmentsById.keys.sorted().compactMap { segmentsById[$0] }
         }
+        // `Int(floor(x))` traps on non-finite input, and a zero or negative
+        // cell size would divide into infinity. This runs on every evaluated
+        // frame, so a single degenerate pose -- or a malformed package with a
+        // bad cell size -- would otherwise crash the scan loop. Returning no
+        // road candidates is the safe outcome: the caller simply scores
+        // nothing for this frame.
+        guard point.x.isFinite, point.y.isFinite,
+              cellSizeM.isFinite, cellSizeM > 0,
+              candidateRadiusM.isFinite, candidateRadiusM >= 0
+        else {
+            return []
+        }
         let minimumX = Int(floor((point.x - candidateRadiusM) / cellSizeM))
         let maximumX = Int(floor((point.x + candidateRadiusM) / cellSizeM))
         let minimumY = Int(floor((point.y - candidateRadiusM) / cellSizeM))
         let maximumY = Int(floor((point.y + candidateRadiusM) / cellSizeM))
+        guard minimumX <= maximumX, minimumY <= maximumY else { return [] }
+        // A legitimate neighbourhood spans a handful of cells. Cap the sweep
+        // so an unexpected configuration cannot turn one frame into a huge
+        // nested loop.
+        guard maximumX - minimumX <= 64, maximumY - minimumY <= 64 else {
+            return []
+        }
         var identifiers = Set<String>()
         for cellX in minimumX...maximumX {
             for cellY in minimumY...maximumY {
@@ -1081,7 +1100,12 @@ final class PriorMapStageOneLocalizer {
                 && PriorMapCorrectionSafety.isWithinGate(
                     current: rawPose,
                     target: targetPose,
-                    recoverySearch: recoverySearch)
+                    recoverySearch: recoverySearch,
+                    // A hypothesis corroborated across many frames is allowed
+                    // a proportionally larger correction; see
+                    // PriorMapCorrectionSafety.translationLimit for the field
+                    // data behind the tiers.
+                    supportFrames: hypothesis?.supportFrames ?? 0)
                 && penetrationAudit.nodeInsideShelfCount == 0
                 && penetrationAudit.segmentCrossingCount == 0
         }

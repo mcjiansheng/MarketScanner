@@ -188,6 +188,12 @@ final class PriorMapDepthSampler {
                 guard relativeHeight >= -0.70, relativeHeight <= 1.25 else {
                     continue
                 }
+                // `Int(floor(x))` traps on non-finite input. A single invalid
+                // depth reprojection must be dropped, not crash the scan.
+                guard world.x.isFinite, world.y.isFinite, world.z.isFinite
+                else {
+                    continue
+                }
                 let voxel = PriorMapWorldVoxel(
                     x: Int(floor(Double(world.x) / 0.15)),
                     y: Int(floor(Double(world.y) / 0.20)),

@@ -166,6 +166,56 @@ enum PriorMapCorrectionSafety {
     static let maximumStepTranslationM = 0.25
     static let maximumStepYawRad = 8.0 * Double.pi / 180.0
 
+    // Round-2 remediation, L3->L4 cliff.
+    //
+    // The flat 0.35 m local limit rejected 96.2% of non-zero corrections in
+    // the field: the median correction actually required is 2.209 m. Applying
+    // a flat limit regardless of how well-corroborated the hypothesis is
+    // means a hypothesis that has been confirmed over many frames is still
+    // held to the same leash as one seen twice.
+    //
+    // Measured over 43,995 field frames, supportFrames is a trustworthy
+    // confidence signal -- higher support means both a lower residual and a
+    // smaller required correction:
+    //
+    //     supportFrames    frames   cost median   correction median
+    //                 0    22,789       0.0042            n/a
+    //                 1     2,685       0.0026          3.36 m
+    //               3-4     3,003       0.0025          2.56 m
+    //               5-9     3,346       0.0023          1.63 m
+    //              10-19     1,731       0.0026          1.39 m
+    //               20+       729       0.0036          1.39 m
+    //
+    // So the limit widens in steps with corroboration. Every tier stays well
+    // below the Recovery limit of 5.0 m, and the strict 0.35 m gate is
+    // unchanged for hypotheses that have not yet earned support.
+    static let corroboratedTranslationLimits: [(frames: Int, limitM: Double)] = [
+        (3, 1.0),
+        (5, 2.0),
+        (10, 2.5),
+    ]
+    /// Widened yaw limit once a hypothesis is corroborated. Kept at the same
+    /// 15 deg as the manual-anchor yaw sigma rather than approaching the
+    /// Recovery limit, because a wrong heading corrupts everything downstream.
+    static let corroboratedYawLimitRad = 15.0 * Double.pi / 180.0
+
+    /// Correction allowance for a local hypothesis with ``supportFrames``
+    /// corroborating frames. Unknown or immature support keeps the strict gate.
+    static func translationLimit(supportFrames: Int) -> Double {
+        guard supportFrames > 0 else { return localTranslationLimitM }
+        var limit = localTranslationLimitM
+        for tier in corroboratedTranslationLimits where supportFrames >= tier.frames {
+            limit = tier.limitM
+        }
+        return limit
+    }
+
+    static func yawLimit(supportFrames: Int) -> Double {
+        supportFrames >= (corroboratedTranslationLimits.first?.frames ?? 3)
+            ? corroboratedYawLimitRad
+            : localYawLimitRad
+    }
+
     static func difference(
         from current: PriorMapPose2D,
         to target: PriorMapPose2D
@@ -179,12 +229,18 @@ enum PriorMapCorrectionSafety {
     static func isWithinGate(
         current: PriorMapPose2D,
         target: PriorMapPose2D,
-        recoverySearch: Bool
+        recoverySearch: Bool,
+        supportFrames: Int = 0
     ) -> Bool {
         let delta = difference(from: current, to: target)
+        // Non-finite geometry is never inside any gate, whatever the tier.
+        guard delta.translationM.isFinite, delta.yawRad.isFinite else {
+            return false
+        }
         let translationLimit = recoverySearch
-            ? recoveryTranslationLimitM : localTranslationLimitM
-        let yawLimit = recoverySearch ? recoveryYawLimitRad : localYawLimitRad
+            ? recoveryTranslationLimitM : translationLimit(supportFrames: supportFrames)
+        let yawLimit = recoverySearch
+            ? recoveryYawLimitRad : yawLimit(supportFrames: supportFrames)
         return delta.translationM <= translationLimit && delta.yawRad <= yawLimit
     }
 

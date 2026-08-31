@@ -1356,6 +1356,18 @@ final class PriceTagCaptureCoordinator {
     /// Consecutive frames whose measurement was unusable. Drives the
     /// early-exit in `deferEvidenceUntilUsableMeasurement`.
     private var consecutiveUnusableMeasurements = 0
+    /// Whether a capture holds enough observations to be resolved.
+    ///
+    /// The floor of 1 exists because `.resolve(observationIDs:)` is the single
+    /// durable handoff to shelf confirmation: resolving with an empty set would
+    /// hand downstream an unattributable burst. A degenerate policy that asks
+    /// for zero frames must not be able to produce that.
+    ///
+    /// Callers must hold `lock`.
+    private func hasSufficientEvidenceLocked(accepted: Int) -> Bool {
+        accepted >= max(1, policy.minimumEvidenceFrames)
+    }
+
     private var completedPayloads: [String: TimeInterval] = [:]
     private var capturePriorMapAuthorityValue: PriceTagCapturePriorMapAuthority?
     private var confirmationCommitAuthorityValue:
@@ -1772,7 +1784,8 @@ final class PriceTagCaptureCoordinator {
         let reachedDeadline = deadlinePending
             || duration >= policy.maximumCaptureDuration
         if reachedTarget
-            || (reachedDeadline && accepted >= policy.minimumEvidenceFrames) {
+            || (reachedDeadline
+                && hasSufficientEvidenceLocked(accepted: accepted)) {
             stateValue = .resolving(
                 generation: generation,
                 captureID: captureID)
@@ -1848,12 +1861,23 @@ final class PriceTagCaptureCoordinator {
         }
         evidenceInFlight = false
         pendingEvidenceFrameTimestamp = nil
-        consecutiveUnusableMeasurements += 1
+        // Saturating increment: this counter only resets on a successful
+        // frame or a collection reset, so a long uninterrupted failure run
+        // must never be able to overflow and trap.
+        if consecutiveUnusableMeasurements < Int.max {
+            consecutiveUnusableMeasurements += 1
+        }
         // Banked evidence is already sufficient: further waiting only burns
         // the window, because the measurement path is failing consistently
         // rather than transiently. Resolve now so the operator sees a result
         // (LOW_CONFIDENCE) instead of a timeout after a multi-second hold.
-        if acceptedFrames >= policy.minimumEvidenceFrames,
+        //
+        // The policy guards matter: a non-positive threshold would otherwise
+        // make both comparisons vacuously true and resolve a capture that has
+        // no observations at all.
+        let earlyExitEnabled = policy.maximumConsecutiveUnusableMeasurements > 0
+        if hasSufficientEvidenceLocked(accepted: acceptedFrames),
+           earlyExitEnabled,
            consecutiveUnusableMeasurements
                >= policy.maximumConsecutiveUnusableMeasurements {
             stateValue = .resolving(

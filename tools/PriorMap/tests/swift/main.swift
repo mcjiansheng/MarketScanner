@@ -821,6 +821,67 @@ func runESLBarcodeCaptureFocusedTests() {
     require(
         PriorMapScanMatcher.minimumSearchPointCount >= 20,
         "lowering the point threshold further needs a fresh field justification")
+    // Round-2, L3->L4 cliff: the local correction limit must widen with
+    // corroboration, because a flat 0.35 m gate rejected 96.2% of non-zero
+    // field corrections (median required: 2.209 m). Tiers are ordered and must
+    // stay far below the Recovery limit of 5.0 m.
+    require(
+        PriorMapCorrectionSafety.translationLimit(supportFrames: 0) == 0.35
+            && PriorMapCorrectionSafety.translationLimit(supportFrames: 2) == 0.35
+            && PriorMapCorrectionSafety.translationLimit(supportFrames: 3) == 1.0
+            && PriorMapCorrectionSafety.translationLimit(supportFrames: 5) == 2.0
+            && PriorMapCorrectionSafety.translationLimit(supportFrames: 10) == 2.5
+            && PriorMapCorrectionSafety.translationLimit(supportFrames: 500) == 2.5,
+        "corroborated correction limits must follow the frozen tier table")
+    require(
+        PriorMapCorrectionSafety.translationLimit(supportFrames: -7) == 0.35,
+        "a negative support count must fall back to the strict gate")
+    var monotonic = true
+    var previous = 0.0
+    for frames in stride(from: 0, through: 40, by: 1) {
+        let limit = PriorMapCorrectionSafety.translationLimit(supportFrames: frames)
+        if limit < previous { monotonic = false }
+        previous = limit
+    }
+    require(monotonic, "correction limit must never shrink as support grows")
+    require(
+        PriorMapCorrectionSafety.translationLimit(supportFrames: 10)
+            < PriorMapCorrectionSafety.recoveryTranslationLimitM,
+        "corroborated limit must stay below the recovery limit")
+    // Widened yaw stays at the manual-anchor sigma (15 deg), not the 30 deg
+    // Recovery allowance: a wrong heading corrupts everything downstream.
+    require(
+        abs(PriorMapCorrectionSafety.yawLimit(supportFrames: 10)
+            - 15.0 * Double.pi / 180.0) < 1e-12
+            && abs(PriorMapCorrectionSafety.yawLimit(supportFrames: 1)
+                - 8.0 * Double.pi / 180.0) < 1e-12,
+        "corroborated yaw limit must widen to 15 deg only")
+    // Non-finite geometry is never inside any gate, at any tier.
+    let finitePose = PriorMapPose2D(xM: 0, yM: 0, yawRad: 0)
+    let nanPose = PriorMapPose2D(xM: Double.nan, yM: 0, yawRad: 0)
+    let infPose = PriorMapPose2D(xM: Double.infinity, yM: 0, yawRad: 0)
+    require(
+        !PriorMapCorrectionSafety.isWithinGate(
+            current: finitePose, target: nanPose, recoverySearch: false,
+            supportFrames: 10)
+            && !PriorMapCorrectionSafety.isWithinGate(
+                current: finitePose, target: infPose, recoverySearch: false,
+                supportFrames: 10),
+        "non-finite corrections must never pass the safety gate")
+    require(
+        PriorMapCorrectionSafety.isWithinGate(
+            current: finitePose,
+            target: PriorMapPose2D(xM: 0.9, yM: 0, yawRad: 0),
+            recoverySearch: false,
+            supportFrames: 10),
+        "a corroborated 0.9 m correction must pass the widened gate")
+    require(
+        !PriorMapCorrectionSafety.isWithinGate(
+            current: finitePose,
+            target: PriorMapPose2D(xM: 0.9, yM: 0, yawRad: 0),
+            recoverySearch: false,
+            supportFrames: 0),
+        "an uncorroborated 0.9 m correction must still be rejected")
     // The widened edge gate must never be looser than the strict gate, and
     // must keep an area floor so distant clipped barcodes cannot pass.
     require(

@@ -77,5 +77,64 @@ class StructurePointThresholdTests(unittest.TestCase):
         )
 
 
+class NonFiniteGridConversionTests(unittest.TestCase):
+    """`Int(floor(x))` traps on NaN/infinity -- it crashes, it does not clamp.
+
+    Every grid/voxel conversion on the scan hot path therefore needs a
+    finiteness guard nearby. This scan enforces that for the files touched this
+    round, so a future conversion cannot be added without one.
+    """
+
+    # Files on the localization hot path that this round reviewed.
+    GUARDED_FILES = (
+        "PriorMapLocalization.swift",
+        "MobilePostProcessing/ShelfLocalizationEvidence.swift",
+        "PriorMapDepthSampler.swift",
+    )
+    CONVERSION = re.compile(r"Int\((?:floor|ceil|round)\(")
+    GUARD = ".isFinite"
+    WINDOW = 20
+
+    def _scan(self) -> list[tuple[str, int, str]]:
+        offenders = []
+        for relative in self.GUARDED_FILES:
+            path = IOS / relative
+            if not path.is_file():
+                continue
+            lines = _read(path).splitlines()
+            for index, line in enumerate(lines):
+                stripped = line.strip()
+                # Skip prose: the explanatory comments quote the same
+                # expression and would otherwise be flagged.
+                if stripped.startswith("//") or stripped.startswith("*"):
+                    continue
+                if not self.CONVERSION.search(line):
+                    continue
+                window = lines[max(0, index - self.WINDOW) : index]
+                if not any(self.GUARD in candidate for candidate in window):
+                    offenders.append((relative, index + 1, stripped))
+        return offenders
+
+    def test_grid_conversions_have_finiteness_guards(self) -> None:
+        offenders = self._scan()
+        self.assertEqual(
+            offenders,
+            [],
+            "grid conversions without a nearby .isFinite guard would trap on "
+            f"NaN/infinity: {offenders}",
+        )
+
+    def test_scan_actually_exercises_conversions(self) -> None:
+        """Guard against the scan silently going vacuous."""
+        found = 0
+        for relative in self.GUARDED_FILES:
+            path = IOS / relative
+            if path.is_file():
+                found += len(self.CONVERSION.findall(_read(path)))
+        self.assertGreater(
+            found, 0, "no grid conversions found; the scan target moved"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
