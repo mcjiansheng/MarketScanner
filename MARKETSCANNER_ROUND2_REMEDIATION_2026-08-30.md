@@ -485,14 +485,15 @@ python3 tools/PriorMap/dynamic_filter_benchmark.py \
 
 | 套件 | 用例数 | 结果 | 耗时 |
 | --- | --- | --- | --- |
-| PriorMap（`discover -s tools/PriorMap/tests -t .`） | **402** | **OK / 402 passed** | 635–870 s |
+| PriorMap（`discover -s tools/PriorMap/tests -t .`） | **409** | **OK / 409 passed** | 638 s |
 | Map Studio（`tests` 目录下三模块） | 148 | **OK / 148 passed** | 10.7 s |
 | Qualification（`discover -s tools/Qualification/tests -t .`） | 32 | **31 passed / 1 error** | 30.4 s |
 | `IOSCoreContractTests`（含 Swift host 全量编译 + 契约断言） | 6 | **OK / 6 passed** | 394–493 s |
 | CI 同款 Swift 语法检查（87 个源文件） | — | **PASS** | — |
-| **Xcode Release unsigned arm64 构建** | — | **BUILD SUCCEEDED** + `build identity verified` | 见 6.3 |
+| **Xcode Release unsigned arm64 构建** | — | **BUILD SUCCEEDED** + `build identity verified`（clean tree，绑定 `27b117d`） | 见 6.3 |
 
-> 用例数演进：370（原始）→ 385（+价签回测 15）→ 394（+定位诊断 9）→ **402（+源码契约 5）**。
+> 用例数演进：370（原始）→ 385（+价签回测 15）→ 394（+定位诊断 9）→ 402（+源码契约 5）→
+> **409（+非有限转换扫描 2、既有测试扩充）**。
 
 **关于 Qualification 的 1 个 error**：失败点是
 `test_device_evidence_fails_missing_scenario_and_is_immutable`，异常来自
