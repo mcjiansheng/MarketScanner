@@ -2,6 +2,41 @@
 
 > 文档状态：**当前有效**。最后核对日期：2026-08-30。
 
+## 2026-08-31 — PC 路径端到端验证、时钟重复绑定修复、L3→L4 断崖修复
+
+**PC 处理路径端到端验证（此前完全未验证）**：新增 `tools/PriorMap/verify_pc_pipeline.py`。
+实测会话 `103343`（2,284 节点 / 994 MB，132.5 s，产出 25 个文件）：数据库校验 ok；
+`rtabmap-reprocess` 成功，优化位姿 **190 → 2,284（覆盖率 8.3% → 100%）**；
+native 因子图 `solver=rtabmap_g2o_slam2d`、`full_factor_graph=true`、**`converged=true`**；
+产物含 `calibrated_positions_by_node.csv`、`_1s.csv`、`localized_price_tags.{json,csv,geojson}`、
+`optimized_map_trajectory.geojson` 等。**修正首轮判断**：native helper 一直存在且可用，
+历史 28 份结果退化为 `bounded_correction_field` 是**调用未传 `factor_graph_binary`**，非能力缺失。
+结果仍不可发布（`maximum_correction_m=35.6`、质量策略仍 `candidate`），根因仍在手机端 usable 0.2%。
+
+**时钟节点重复绑定修复（阻断性）**：`process_localized_session` 首步即抛
+`Invalid or duplicate clock node binding`。取证为同一 `node_id`+同一 `node_stamp` 被写入两次
+（手机复用冻结 exact-ID snapshot 所致）。**影响 14/36 会话（38.9%）、共 80 条**，
+这些会话此前完全无法被 PC 处理（含山姆现场两个最严重会话 2.16%/0.95%）。
+修复：区分**冗余重复**（同 id+同 stamp，身份可界定）与**身份冲突**（stamp 不同）。
+冗余重复保留以维持 metadata 水位、豁免 stamp 严格递增、记降级码
+`clock_node_binding_redundant_duplicate_retained` 保持可见；真冲突仍 fatal。
+既有测试 `test_clock_v4_integrity_failures_and_cross_check_degradation` 的重复用例改为真冲突场景，
+冗余语义由新增 `test_clock_binding_redundancy.py` 覆盖（4 例）。
+
+**L3→L4 断崖修复**：`PriorMapCorrectionSafety` 由固定 0.35 m 改为随 `supportFrames` 分级
+（0-2 帧 0.35 m/8°；3-4 → 1.0 m；5-9 → 2.0 m；≥10 → 2.5 m，航向 15°）。
+依据：支持帧越多残差越低、所需修正越小（3.36 m → 1.39 m 单调下降），
+而现场修正量中位 2.209 m 被 0.35 m 门拒绝 96.2%。单步上限 0.25 m 不变（多步渐进而非跳变）。
+离线估算 trusted 帧数 **162 → 1,818（约 11×）**。
+
+**异常路径审查**：修掉三处 `Int(floor(...))` trap（Swift 中 NaN/Infinity 转 Int 会崩溃而非截断）——
+`PriorMapLocalization.nearbySegments`（每帧）、`PriorMapDepthSampler` 体素化、
+`ShelfFreeSpaceAuditor.audit`；另加 `filter()` 位姿级守卫。新增源码扫描测试强制热路径文件中
+每处网格转换附近有 `.isFinite` 守卫（该扫描编写时即抓出 `audit()` 未防护的一处）。
+其他：饱和递增防溢出、早退要求正阈值+最少 1 条证据、`isWithinGate`/`isMapSupported` 拒非有限输入。
+
+**价签 2 帧 quorum 已于 2026-08-31 获产品侧确认**。
+
 ## 2026-08-30 — 第二轮审查与价签识别优化（ESL 采集效率）
 
 动机：现场反馈"价签识别困难、依赖多帧定位导致耗时过长"。以仓库内真实现场数据

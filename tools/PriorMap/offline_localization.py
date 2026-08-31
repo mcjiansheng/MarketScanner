@@ -1226,6 +1226,10 @@ def _read_clock_evidence_bytes(
     correlations: list[dict[str, Any]] = []
     pending_bindings: list[ClockBinding] = []
     seen_node_ids: set[int] = set()
+    # Authoritative stamp recorded the first time a node is bound, used to tell
+    # a redundant re-binding from a genuine identity conflict.
+    binding_stamps_by_id: dict[int, float] = {}
+    redundant_binding_count = 0
     previous_monotonic: float | None = None
     previous_correlation_utc: float | None = None
     previous_binding_stamp: float | None = None
@@ -1312,7 +1316,39 @@ def _read_clock_evidence_bytes(
         node_id = _strict_integer(value.get("node_id"))
         node_stamp = float(value["node_stamp"])
         binding_utc = float(value["utc_unix_seconds"])
-        if (
+        # Round-2 remediation.
+        #
+        # Field data: 14 of 36 sessions (38.9%) contain a node id bound more
+        # than once -- 80 occurrences in total -- because the phone reuses a
+        # frozen exact-ID snapshot when no live snapshot is available, and that
+        # reuse can write a second correlation for an already-bound node. The
+        # second record repeats node_id and node_stamp and only carries a later
+        # sample time. Every one of those sessions previously aborted here with
+        # "Invalid or duplicate clock node binding", so the PC path could not
+        # process them at all.
+        #
+        # The contract's actual intent is that identity must be decidable. A
+        # repeat of the same node with the same stamp is redundant, not
+        # ambiguous: identity is fully determined. It is therefore retained (so
+        # the binding count still matches the metadata watermark) but exempted
+        # from the strictly-increasing stamp test, which it cannot satisfy
+        # because the stamp is by definition equal. Cross-checking below still
+        # validates each retained binding against the correlation timeline and
+        # drops any that disagree.
+        #
+        # A repeat that carries a *different* stamp, or any other violation,
+        # remains fatal -- that is a genuine identity conflict.
+        is_redundant_duplicate = (
+            node_id is not None
+            and node_id in seen_node_ids
+            and node_id in binding_stamps_by_id
+            and node_id in node_stamps_by_id
+            and abs(binding_stamps_by_id[node_id] - node_stamp) <= 1.0e-6
+            and abs(node_stamps_by_id[node_id] - node_stamp) <= 1.0e-6
+        )
+        if is_redundant_duplicate:
+            redundant_binding_count += 1
+        elif (
             value.get("reason") != "node_bound"
             or node_id is None
             or node_id <= 0
@@ -1327,8 +1363,14 @@ def _read_clock_evidence_bytes(
             raise OfflineLocalizationError(
                 f"Invalid or duplicate clock node binding at clock_correlations.jsonl:{line_number}"
             )
-        seen_node_ids.add(node_id)
-        previous_binding_stamp = node_stamp
+        if not is_redundant_duplicate:
+            previous_binding_stamp = node_stamp
+        # Record the authoritative stamp for this node the first time it is
+        # seen, so a later conflicting repeat can be detected.
+        if node_id is not None and node_id not in binding_stamps_by_id:
+            binding_stamps_by_id[node_id] = node_stamp
+        if node_id is not None:
+            seen_node_ids.add(node_id)
         previous_binding_utc = binding_utc
         pending_bindings.append(
             ClockBinding(
@@ -1419,6 +1461,11 @@ def _read_clock_evidence_bytes(
         or retained_bindings[-1].node_id != max(node_stamps_by_id)
     ):
         degradation_codes.add("clock_end_node_unbound")
+    if redundant_binding_count:
+        # Kept visible rather than silently swallowed: a non-zero count means
+        # the phone re-bound nodes, which is worth surfacing even though the
+        # identity stayed decidable.
+        degradation_codes.add("clock_node_binding_redundant_duplicate_retained")
     diagnostics = {
         "file": "clock_correlations.jsonl",
         "contract": "clock_correlations_v2",
@@ -1428,6 +1475,7 @@ def _read_clock_evidence_bytes(
         "database_node_count": len(node_stamps_by_id),
         "unbound_database_node_count": len(missing),
         "discontinuity_count": len(binding_edges),
+        "redundant_duplicate_binding_count": redundant_binding_count,
         "degradation_codes": sorted(degradation_codes),
     }
     return (

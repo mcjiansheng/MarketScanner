@@ -3574,9 +3574,19 @@ class LocalizedPipelineTests(unittest.TestCase):
 
         clock_path.write_bytes(original)
         records = [json.loads(line) for line in original.decode().splitlines()]
+        # A repeat carrying a DIFFERENT stamp is a genuine identity conflict
+        # and stays fatal.
+        #
+        # A repeat with an *identical* stamp is redundant rather than
+        # ambiguous: identity is still decidable. Field data showed 14 of 36
+        # sessions (38.9%) hit exactly that, because the phone reuses a frozen
+        # exact-ID snapshot and re-binds an already-bound node; those sessions
+        # used to abort here and could not be processed at all. The redundant
+        # case is now retained as a visible degradation and is covered by
+        # tests/test_clock_binding_redundancy.py.
         records[3]["node_id"] = 1
-        records[3]["node_stamp"] = self.node_timebase_offset
-        records[3]["sampled_frame_timestamp"] = self.node_timebase_offset
+        records[3]["node_stamp"] = self.node_timebase_offset + 0.25
+        records[3]["sampled_frame_timestamp"] = self.node_timebase_offset + 0.25
         jsonl_write(clock_path, records)
         with self.assertRaisesRegex(
             OfflineLocalizationError, "duplicate clock node binding"

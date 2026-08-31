@@ -560,6 +560,76 @@ version            = 5
 > （`sandbox_apply: Operation not permitted`），这是**执行环境限制、非代码问题**。
 > 加 `-skipPackageUpdates -scmProvider system` 后可正常构建。
 
+### 6.5 PC 处理路径端到端验证（此前完全未验证）
+
+前两轮的工作全部集中在手机端数据与分析上，**PC 处理链路从未实际跑通过**。本轮补上，
+并新建 `tools/PriorMap/verify_pc_pipeline.py` 固化这一验证。
+
+```bash
+python3 tools/PriorMap/verify_pc_pipeline.py \
+  --session 扫描结果/0811/SupermarketSession-20260811-103343 \
+  --prior-map /path/to/mapcase03_sam \
+  --output /tmp/pc-pipeline-check --json report.json
+```
+
+实测（2,284 节点 / 994 MB 数据库，132.5 s 跑完，产出 25 个文件）：
+
+| 阶段 | 结果 |
+| --- | --- |
+| 数据库校验（只读） | integrity ok，2,284 节点，1,631 条闭环，299 条长程闭环对 |
+| `rtabmap-reprocess` | 成功；优化位姿 **2,284**（输入仅 190 有优化位姿，覆盖率 8.3% → **100%**） |
+| native 因子图 helper | 存在：`build/marketscanner-macos-release/bin/rtabmap-prior-map-factor-graph` |
+| localized 处理 | `solver=rtabmap_g2o_slam2d`，**`full_factor_graph: True`，`converged: True`** |
+| 结果产物 | `calibrated_positions_by_node.csv`、`_1s.csv`、`localized_price_tags.{json,csv,geojson}`、`optimized_map_trajectory.geojson`、`factor_graph_report.json` 等齐全 |
+
+**这修正了首轮的一个判断**：首轮看到 28 份历史结果全部 `solver_not_full_relative_se2_factor_graph`，
+据此认为 native helper 不可用。实际 helper 一直存在且可用，只要正确传入 `factor_graph_binary`
+就能跑完整因子图并收敛——历史结果退化是**调用未传 helper**，不是能力缺失。
+
+**但结果仍不可发布**（`publish_permitted: false`），原因是首轮已定位的根本问题：
+
+- `factor_graph_quality_policy_not_frozen` — 质量策略仍为 `candidate`，即 C-1/C-2/C-3 未标定
+- `relative_translation_max_exceeded` = 32.9 m、`relative_yaw_max_exceeded` = 47.4°
+- `maximum_correction_m` = **35.6**，`weak_lost_duration_seconds` = 707
+
+即：**手机原始轨迹与先验地图的偏差是数十米量级**，与首轮"不是米级漂移可校准"的判断一致。
+PC 链路打通了，但定位精度问题的根因仍在手机端（`usable` 0.2%）。
+
+### 6.6 修复：时钟节点重复绑定导致 39% 会话无法被 PC 处理
+
+**这是本轮 PC 验证直接暴露的阻断性缺陷。**
+
+跑通链路前，`process_localized_session` 在第一步就抛异常终止：
+
+```
+OfflineLocalizationError: Invalid or duplicate clock node binding
+                          at clock_correlations.jsonl:2115
+```
+
+取证：该文件 `node_id 2170` 出现两次——`node_id` 与 `node_stamp` 完全相同，仅
+`sampled_frame_timestamp` 更晚。这是手机端"复用已冻结 exact-ID snapshot"机制的副作用
+（拿不到 live snapshot 时复用旧快照，从而对已绑定节点又写了一条 correlation）。
+
+影响范围（全量统计 36 个含绑定记录的会话）：
+
+| 指标 | 值 |
+| --- | ---: |
+| 存在重复绑定的会话 | **14 / 36（38.9%）** |
+| 重复绑定总数 | 80 |
+| 最严重会话 | `103145` 2.16%（24 条）、`084247` 0.95%（32 条）——均为山姆现场会话 |
+
+**这 14 个会话此前完全无法被 PC 端处理。**
+
+修复：区分**冗余重复**与**身份冲突**。契约真正要防的是"身份不可界定"；同一 node_id 且
+同一 `node_stamp` 的重复，身份是完全确定的，属于冗余。因此：
+
+- 冗余重复 → 保留（维持与 metadata 水位一致的绑定数），豁免"stamp 严格递增"检查，
+  并在 diagnostics 中记 `clock_node_binding_redundant_duplicate_retained` 保持可见；
+- stamp 不一致的重复、或与数据库 stamp 不符 → **仍然 fatal**。
+
+修复后该会话的 `clock_evidence.degradation_codes` 出现
+`clock_node_binding_redundant_duplicate_retained`，处理正常完成——降级可见，而非静默通过。
+
 这一构建把所有 Swift 改动（价签采集、包围盒预筛、栅格上界、结构点门槛、分级安全门）都做了
 **真实的编译与链接**，强于 `swiftc -parse` 的语法检查。
 
