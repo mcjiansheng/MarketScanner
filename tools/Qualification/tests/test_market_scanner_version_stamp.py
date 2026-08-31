@@ -387,6 +387,12 @@ class XcodeWiringTests(unittest.TestCase):
         self.assertNotIn("${SRCROOT}/Settings.bundle", phase)
 
     def test_build_script_passes_the_variant_through(self) -> None:
+        # releases/ holds local build artifacts and is not tracked, so a
+        # clean checkout has no script to inspect. Skip rather than fail:
+        # the contract is still checked on every machine that builds ipas.
+        if not BUILD_SCRIPT.is_file():
+            self.skipTest("%s is untracked and absent from this checkout"
+                          % BUILD_SCRIPT.relative_to(ROOT))
         script = BUILD_SCRIPT.read_text(encoding="utf-8")
         self.assertIn("MS_BUILD_VARIANT=", script)
         self.assertIn('VARIANT="${2:-}"', script)
