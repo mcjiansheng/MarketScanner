@@ -418,6 +418,27 @@ class XcodeWiringTests(unittest.TestCase):
         # the clean-tree gate enforced by the build-identity phase.
         self.assertNotIn("${SRCROOT}/Settings.bundle", phase)
 
+    def test_stamp_phase_depends_on_the_processed_info_plist(self) -> None:
+        # Xcode's ProcessInfoPlistFile regenerates the product Info.plist
+        # and shares no phase-order edge with script phases. On an
+        # incremental build that changes any plist-relevant setting (for
+        # example MS_BUILD_VARIANT), it was observed to run after this
+        # phase and silently revert CFBundleVersion to 1 while dropping
+        # MSBuildGitSHA / MSBuildVariant, leaving the in-app label at
+        # "? / unknown" even though Settings showed the real stamp.
+        # Declaring the processed plist as an input forces the dependency
+        # edge; outputPaths is not an option because the new build system
+        # rejects two producers of the same file. Pin the input here so a
+        # future phase edit cannot re-introduce the race.
+        project = PBXPROJ.read_text(encoding="utf-8")
+        phase = project.split(
+            "%s /* MarketScanner Version Stamp */ = {" % (
+                VERSION_STAMP_PHASE,))[1].split("};")[0]
+        inputs = re.search(r"inputPaths = \((.*?)\);", phase, re.S)
+        self.assertIsNotNone(inputs)
+        self.assertIn('"$(TARGET_BUILD_DIR)/$(INFOPLIST_PATH)"',
+                      inputs.group(1))  # type: ignore[union-attr]
+
     def test_build_script_passes_the_variant_through(self) -> None:
         # releases/ holds local build artifacts and is not tracked, so a
         # clean checkout has no script to inspect. Skip rather than fail:
