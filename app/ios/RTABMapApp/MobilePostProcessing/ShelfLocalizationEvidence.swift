@@ -40,6 +40,20 @@ enum ShelfLocalizationPolicy {
     static let calibrationPendingReliableLoopDistanceM = 30.0
     static let calibrationPendingDynamicPersistenceSeconds = 10.0
 
+    /// C-3a map-anchored static occluder classification (2026-09-03
+    /// redesign). Scanning advances along a shelf at ~1-2 m/s, so a standing
+    /// customer or parked cart occludes its shelf for the entire pass and
+    /// occlusion duration carries no information. The prior map is
+    /// authoritative (S-1): an interior observation gap along a mapped
+    /// continuous shelf bounded by observations on both sides is a static
+    /// occluder and the shelf behind it is presumed present but unobserved.
+    /// Interior gaps below the minimum width are sampling noise; gaps above
+    /// the maximum width get no presence assertion. Moving customers remain
+    /// handled by the temporal `DynamicShelfEvidenceFilter` below. Parity
+    /// implementation: `tools/PriorMap/shelf_occlusion_classifier.py`.
+    static let mapAnchoredStaticOccluderMinGapM = 0.3
+    static let mapAnchoredStaticOccluderMaxGapM = 2.5
+
     static let maximumCorridorHypotheses = 24
     static let maximumShelfCandidates = 24
     static let maximumBridgeEvidence = 16
@@ -1055,6 +1069,14 @@ enum ShelfFreeSpaceAuditor {
 /// transient/moving structure is excluded after the C-3 warm-up while the
 /// prior map remains authoritative (S-1). C-3 is explicitly pending field
 /// calibration.
+///
+/// 2026-09-03 policy refinement: the persistence gate below only ever gates
+/// *unmatched* (off-map) transient structure. A static occluder standing in
+/// front of a mapped shelf never produces matched depth on the shelf
+/// itself, so duration cannot decide shelf presence; those observation gaps
+/// are classified geometrically by the map-anchored rule instead (see
+/// `mapAnchoredStaticOccluderMinGapM/MaxGapM` and
+/// `tools/PriorMap/shelf_occlusion_classifier.py`).
 final class DynamicShelfEvidenceFilter {
     private struct Cell {
         var firstSeen: TimeInterval

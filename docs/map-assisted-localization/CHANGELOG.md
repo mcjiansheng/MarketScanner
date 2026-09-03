@@ -1,6 +1,14 @@
 # 地图辅助定位变更记录
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-30。
+> 文档状态：**当前有效**。最后核对日期：2026-09-03。
+
+## 2026-09-03 — 资源门重锚定、C-3 地图锚定遮挡、C-1/C-2 判定窗口设计
+
+**去除 768 MiB tag-evidence host RSS 绝对门**：真机长扫实测（`0815-sam-084247`，39.3 min）进程内存峰值 1551 MB、系统可用最低 4592 MB、thermal 进入 fair、全程无崩溃，证明该门与设备事实脱节。硬门改为“真机不闪退/不 OOM”（`performance_samples.jsonl` + MetricKit）；host 压力测试继续报告 RSS 并改为基线增长预警，不再以绝对值 fail 流水线。`localization_constraints.jsonl` 的 768 MiB 解析器文件上限保持不变（防恶意输入，与内存门无关）。
+
+**C-3 重构（C-3a/C-3b）**：1–2 m/s 行进下遮挡时长无信息量，静止判定改由地图锚定：地图连续货架的内部观测缺口（两侧均有观测）判定为静止遮挡物，货架推定存在但未被观测。新增 `tools/PriorMap/shelf_occlusion_classifier.py`（14/14 回归）与 Swift 策略常量；`DynamicShelfEvidenceFilter` 行为不变，manifest v5 合同零变更。
+
+**C-1/C-2 判定窗口设计冻结**：新增 [`C1_C2_JUDGMENT_WINDOW_DESIGN_2026-09-03.md`](C1_C2_JUDGMENT_WINDOW_DESIGN_2026-09-03.md)；C-2 现场横幅 + 人工重定位入口 + 自动标定标签，C-1 闭环通知 + 后期回放标定。HUD 接线与阈值冻结不在本版。
 
 ## 2026-08-31 — PC 路径端到端验证、时钟重复绑定修复、L3→L4 断崖修复
 

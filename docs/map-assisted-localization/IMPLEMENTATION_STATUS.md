@@ -1,6 +1,13 @@
 # 地图辅助定位实现状态
 
-> 文档状态：**当前有效**。最后核对日期：2026-08-30。
+> 文档状态：**当前有效**。最后核对日期：2026-09-03。
+
+2026-09-03 资源门重锚定、C-3 地图锚定遮挡重构与 C-1/C-2 判定窗口设计：
+
+**1. 去除 768 MiB tag-evidence host RSS 绝对门。** 依据仓库内两条真机长扫实测：`0815-sam-084247`（39.3 min / 442 样本）进程物理内存 153 MB 起步、峰值 **1551 MB**、收尾 943 MB，系统可用内存最低仍剩 4592 MB，thermal fair 336 / nominal 106，CPU 峰值 135%，FPS 稳定 ~29，电量 90%→70%，`performance_qualified=true`，全程无崩溃；`0815-sam-103145`（15.1 min）同样通过。真机实际内存行为已超过该门一倍而稳定运行，证明该门与设备事实脱节。新政策：**硬门 = 真机不闪退/不 OOM**，由 `performance_samples.jsonl` + MetricKit 判定；host 规模压力测试继续执行并继续报告真实输入字节/耗时/峰值 RSS，但改为与上一发布基线对比的**增长预警**，不再以绝对值 fail 流水线。768 MiB 仅保留为 `localization_constraints.jsonl` 的解析器防恶意输入**文件**上限（`contracts/mobile_only_v1r5_input_limits.json`），与内存门无关且不变。同时确认 400,000 条合成压力规模与真实会话相差数个数量级（真实会话 `tag_observations.jsonl` 为个位数行），该规模本身的合理性待重新论证。这不关闭 2 小时热/低磁盘/低内存矩阵与签名真机资格。
+**2. C-3 重构为 C-3a/C-3b（用户现场洞察）。** 行进速度 1–2 m/s 下，站立顾客/购物车在整个扫描区间内全程遮挡货架，**遮挡持续时长不携带任何信息**；“顾客停多久算静态”的原 C-3 标定项废弃。新规则（地图权威，S-1）：地图上已知的连续货架，其观测覆盖出现两侧均有观测的内部缺口 → 判定为静止遮挡物，**货架推定存在但未被观测**；缺口 <0.3 m 视为采样噪声，>2.5 m 不做存在断言、进复核。新增 `tools/PriorMap/shelf_occlusion_classifier.py` 与 14 例回归（14/14 PASS）；Swift 侧 `ShelfLocalizationPolicy` 同步新增 `mapAnchoredStaticOccluderMinGapM/MaxGapM` 常量与注释，`DynamicShelfEvidenceFilter` 行为不变（继续按跨帧一致性排除移动碎片，即 C-3b），manifest v5 四流合同字段零变更。0.3/2.5 m 为工程初值，现场复核可修订。
+**3. C-1/C-2 判定窗口设计冻结。** 见 [`C1_C2_JUDGMENT_WINDOW_DESIGN_2026-09-03.md`](C1_C2_JUDGMENT_WINDOW_DESIGN_2026-09-03.md)。判定逻辑均已存在（`ShelfTrackingStateMachine` 触发低置信、`ShelfLoopVerifier.accepts` 手机侧实时两侧一致性），本版冻结现场交互/显示/标签回收设计：C-2 = 现场横幅 + `核对位置` 入口（复用现有人工重定位选择器，`manual_localization_events.jsonl` 自动构成标定标签）；C-1 = 闭环确认绿色通知（不拦截），阈值标定走后期回放拟合。ViewController HUD 接线、真机可见性验证与阈值数值冻结不在本版。
+本轮可执行证据：新增回归 **14/14 PASS**、`swiftc -parse` 修改文件 PASS、`py_compile` PASS。unsigned 全量构建、exact-SHA CI、签名真机与现场资格均未执行；整体继续 **NO-GO / NOT PRODUCTION READY**。
 
 2026-08-30 第二轮审查与价签识别优化（分支 `fix/esl-field-capture-efficiency`，基线 `96def5e`）：以仓库内真实现场数据（14 会话 / 74 burst / 233 观察）回测，确认价签链路端到端成功率为 **0%**，并定位到三道门叠加失效。修复后回测为 **64.9%**，单次采集均值耗时 4.00 s → 1.14 s。
 
