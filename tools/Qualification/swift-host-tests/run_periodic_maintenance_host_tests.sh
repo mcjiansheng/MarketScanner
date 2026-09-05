@@ -15,11 +15,14 @@ TESTS_DIR="$REPO_ROOT/tools/Qualification/swift-host-tests"
 OUTPUT=${TMPDIR:-/tmp}/periodic-maintenance-host-tests
 
 mkdir -p "$OUTPUT"
+MODULE_CACHE="$OUTPUT/module-cache"
+mkdir -p "$MODULE_CACHE"
 BINARY="$OUTPUT/PeriodicMaintenanceHostTests"
 
 echo "Compiling periodic maintenance host tests..."
 swiftc \
   -O \
+  -module-cache-path "$MODULE_CACHE" \
   -target "$(uname -m)-apple-macosx13.0" \
   -sdk "$(xcrun --show-sdk-path --sdk macosx)" \
   -o "$BINARY" \

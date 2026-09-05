@@ -113,6 +113,17 @@ struct PeriodicMaintenancePolicy: Equatable {
                 severity: .fatal,
                 code: "policy_grace_invalid",
                 message: "gracePeriodS must be finite and non-negative."))
+        } else if gracePeriodS != 0 {
+            findings.append(MissionFinding(
+                severity: .fatal,
+                code: "policy_grace_unsupported",
+                message: "The active policy does not allow a grace period."))
+        }
+        if !growthProjectionHorizonS.isFinite || growthProjectionHorizonS < 0 {
+            findings.append(MissionFinding(
+                severity: .fatal,
+                code: "policy_growth_horizon_invalid",
+                message: "growthProjectionHorizonS must be finite and non-negative."))
         }
         if minimumGrowthSamples < 2 {
             findings.append(MissionFinding(
@@ -1179,6 +1190,11 @@ struct MissionLiveCheckpoint: Codable, Equatable {
             && policyVersion == PeriodicMaintenancePolicy.currentPolicyVersion
             && !missionId.isEmpty
             && identity.missionId == missionId
+            && identity.priorMapId?.isEmpty == false
+            && isSHA256(identity.priorMapPackageSha256)
+            && identity.storeId?.isEmpty == false
+            && identity.floorId?.isEmpty == false
+            && identity.buildIdentity?.isEmpty == false
             && activeCaptureElapsedS.isFinite
             && activeCaptureElapsedS >= 0
             && nextMaintenanceAtActiveS.isFinite
@@ -1203,18 +1219,48 @@ struct MissionLiveCheckpoint: Codable, Equatable {
         if finalizedUnits.contains(where: { !$0.finalized }) {
             return false
         }
+        let finalizedIndices = finalizedUnits.map(\.unitIndex).sorted()
+        let expectedFinalizedIndices = finalizedUnits.isEmpty
+            ? []
+            : Array(1...finalizedUnits.count)
+        guard finalizedIndices == expectedFinalizedIndices else {
+            return false
+        }
+        if let currentUnit {
+            guard currentUnit.relativePath.hasPrefix("units/"),
+                  currentUnit.databaseRelativePath
+                    == currentUnit.relativePath + "/segment_0001/rtabmap_segment_0001.db",
+                  currentUnit.metadataRelativePath
+                    == currentUnit.relativePath + "/segment_0001/metadata.json" else {
+                return false
+            }
+            do {
+                _ = try validatedMissionRelativePath(currentUnit.relativePath)
+                _ = try validatedMissionRelativePath(currentUnit.databaseRelativePath)
+                _ = try validatedMissionRelativePath(currentUnit.metadataRelativePath)
+            } catch {
+                return false
+            }
+        }
         switch state {
         case .scanning, .warning:
-            return currentUnit != nil && pendingTrigger == nil
+            return currentUnit != nil
+                && currentUnit?.finalized == false
+                && currentUnit?.unitIndex == finalizedUnits.count + 1
+                && pendingTrigger == nil
         case .gate, .anchoring:
             return currentUnit != nil
+                && currentUnit?.finalized == false
+                && currentUnit?.unitIndex == finalizedUnits.count + 1
                 && decodedPendingTrigger?.startsNextUnit == true
         case .finalizingUnit, .preparingNextUnit:
             return currentUnit != nil
+                && currentUnit?.finalized == false
+                && currentUnit?.unitIndex == finalizedUnits.count + 1
                 && decodedPendingTrigger?.startsNextUnit == true
                 && pendingBoundaryId?.isEmpty == false
         case .finalizingMission:
-            return currentUnit != nil
+            return currentUnit != nil && currentUnit?.unitIndex == finalizedUnits.count + 1
         case .idle, .terminalRecovery, .completed:
             return true
         case .none:
@@ -1905,7 +1951,7 @@ func planMissionRecovery(_ input: MissionRecoveryInput) -> MissionRecoveryPlan {
         }
         guard observation.databasePresent,
               observation.liveCheckpointPresent,
-              observation.metadataFinalized != true else {
+              (!observation.metadataPresent || observation.metadataFinalized == false) else {
             findings.append(MissionFinding(
                 severity: .fatal,
                 code: "recovery_capture_evidence_incomplete",

@@ -721,6 +721,32 @@ do {
         ghost.action == .operatorReview(reason: "current_unit_unobserved"),
         "a scanning checkpoint without an observed database cannot resume")
 
+    let malformedMetadata = planMissionRecovery(MissionRecoveryInput(
+        checkpoint: checkpoint(state: .scanning, elapsed: 10),
+        observations: [MissionRecoveryObservation(
+            relativePath: "units/SupermarketSession-20260904-100000-U0001",
+            metadataPresent: true,
+            metadataFinalized: nil,
+            databasePresent: true,
+            liveCheckpointPresent: true)],
+        monotonicNow: 0,
+        policy: policy))
+    harness.expect(
+        malformedMetadata.action == .operatorReview(reason: "capture_evidence_incomplete"),
+        "unreadable metadata cannot resume capture")
+
+    var finalizedCurrent = checkpoint(state: .scanning)
+    finalizedCurrent.currentUnit?.finalized = true
+    harness.expect(
+        !finalizedCurrent.isWellFormed,
+        "a scanning checkpoint cannot name an already finalized unit")
+
+    var skippedFinalizedIndex = checkpoint(state: .scanning)
+    skippedFinalizedIndex.finalizedUnits = [makeUnit(index: 2, unitId: "unit-0002")]
+    harness.expect(
+        !skippedFinalizedIndex.isWellFormed,
+        "finalized checkpoint indices must be contiguous")
+
     harness.expectEqual(
         nextMissionUnitIndex(
             checkpoint: checkpoint(state: .preparingNextUnit),
@@ -859,6 +885,45 @@ do {
         harness.expect(error == .linkDetected("SupermarketSession-20260904-100000-U0002"), "the symlink is named")
     }
     try fileManager.removeItem(at: linkedUnit)
+
+    let danglingUnit = store.unitsRoot.appendingPathComponent(
+        "SupermarketSession-20260904-100000-U0003", isDirectory: true)
+    try fileManager.createSymbolicLink(
+        atPath: danglingUnit.path,
+        withDestinationPath: base.appendingPathComponent("missing-unit").path)
+    do {
+        _ = try store.observeUnits()
+        harness.expect(false, "a dangling unit symlink must be refused")
+    } catch let error as MissionStoreError {
+        harness.expect(
+            error == .linkDetected("SupermarketSession-20260904-100000-U0003"),
+            "a dangling symlink is named")
+    }
+    try fileManager.removeItem(at: danglingUnit)
+
+    let unexpectedUnitEntry = store.unitsRoot.appendingPathComponent("unexpected.txt")
+    try Data("unexpected".utf8).write(to: unexpectedUnitEntry)
+    do {
+        _ = try store.observeUnits()
+        harness.expect(false, "a non-directory in units must be refused")
+    } catch let error as MissionStoreError {
+        harness.expect(
+            error == .unitDirectoryMissing("unexpected.txt"),
+            "a non-directory unit entry is named")
+    }
+    try fileManager.removeItem(at: unexpectedUnitEntry)
+
+    let unexpectedBoundary = store.boundariesRoot.appendingPathComponent("notes.txt")
+    try Data("unexpected".utf8).write(to: unexpectedBoundary)
+    do {
+        _ = try store.readBoundaries()
+        harness.expect(false, "an unexpected boundary file must be refused")
+    } catch let error as MissionStoreError {
+        harness.expect(
+            error == .manifestUnreadable("notes.txt"),
+            "an unexpected boundary file is named")
+    }
+    try fileManager.removeItem(at: unexpectedBoundary)
 }
 
 // MARK: 14. Store fault injection
@@ -928,6 +993,14 @@ do {
 
     let badSoftMax = makePolicy(softMax: 50, headroom: 100)
     harness.expect(!badSoftMax.isValid, "a soft limit below the headroom is refused")
+
+    var badGrace = makePolicy()
+    badGrace.gracePeriodS = 1
+    harness.expect(!badGrace.isValid, "a non-zero grace period is refused")
+
+    var badGrowthHorizon = makePolicy()
+    badGrowthHorizon.growthProjectionHorizonS = -.infinity
+    harness.expect(!badGrowthHorizon.isValid, "an invalid growth horizon is refused")
 
     var wrongVersion = makePolicy()
     wrongVersion.policyVersion = 99

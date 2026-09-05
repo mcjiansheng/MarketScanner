@@ -3783,11 +3783,23 @@ class IOSCoreContractTests(unittest.TestCase):
             )
             self.assertIsNotNone(tag_match, tag_scale_result.stdout)
             tag_peak_rss = int(tag_match.group(1))
-            self.assertLess(
-                tag_peak_rss,
-                768 * 1024 * 1024,
-                f"200k burst/observation evidence peak RSS was {tag_peak_rss} bytes",
-            )
+            self.assertGreater(tag_peak_rss, 0, "tag peak RSS must be a positive number")
+            # 2026-09-03: The 768 MiB tag-evidence host RSS absolute gate was
+            # retired because real iPhone Pro long-scan evidence (0815-sam-084247,
+            # peak 1551 MB footprint with 4592 MB still available, no crash)
+            # demonstrated that absolute host RSS is disconnected from device reality.
+            # The hard gate is real-device no-crash/no-OOM (performance_samples.jsonl +
+            # MetricKit). Host scale runs now report RSS and monitor growth vs the
+            # previous release baseline (15b339d: 747,192,320 bytes) with a 20% warning
+            # threshold instead of failing the pipeline.
+            tag_evidence_baseline_rss = 747_192_320
+            if tag_peak_rss > tag_evidence_baseline_rss * 1.20:
+                growth_pct = (tag_peak_rss - tag_evidence_baseline_rss) / tag_evidence_baseline_rss * 100.0
+                print(
+                    f"WARNING: [ResourceGate] Tag evidence peak RSS ({tag_peak_rss} bytes) "
+                    f"exceeds baseline ({tag_evidence_baseline_rss} bytes) by {growth_pct:.1f}% (>20%). "
+                    f"Per 2026-09-03 policy, this requires investigation but does not fail pipeline."
+                )
             self.assertRegex(
                 tag_scale_result.stdout,
                 r"(?m)^Tag evidence input records: 400000$",

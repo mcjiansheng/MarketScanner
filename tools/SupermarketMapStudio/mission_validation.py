@@ -26,6 +26,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 import stat
 from contextlib import closing
@@ -92,6 +93,7 @@ class UnitReport:
     workflow_mode: Optional[str] = None
     segment_count: int = 0
     database_bytes: Optional[int] = None
+    unit_storage_bytes: Optional[int] = None
     database_sha256: Optional[str] = None
     metadata_sha256: Optional[str] = None
     previous_unit_id: Optional[str] = None
@@ -223,15 +225,19 @@ def _is_link(path: Path) -> bool:
 
 def _safe_relative_path(root: Path, candidate: Any) -> Tuple[Optional[Path], Optional[str]]:
     """Resolve a mission-relative path, rejecting every escape variant."""
-    if not isinstance(candidate, str) or not candidate.strip():
+    if not isinstance(candidate, str) or not candidate:
         return None, "path_missing"
-    raw = candidate.strip()
+    raw = candidate
+    if raw != raw.strip():
+        return None, "path_not_canonical"
     if raw.startswith("/") or raw.startswith("~") or "\\" in raw:
         return None, "path_not_relative"
     if raw.startswith(":") or ":" in raw.split("/")[0]:
         return None, "path_not_relative"
     if any(part == ".." for part in raw.split("/")):
         return None, "path_parent_escape"
+    if raw != "." and any(part in {"", "."} for part in raw.split("/")):
+        return None, "path_not_canonical"
     resolved_root = root.resolve()
     parts = [part for part in raw.split("/") if part not in ("", ".")]
     if not parts:
@@ -293,6 +299,37 @@ def _read_regular_bytes(
             return None, "identity_changed"
         return data, None
     except OSError as error:
+        return None, f"unreadable:{error.__class__.__name__}"
+
+
+def _regular_tree_bytes(root: Path) -> Tuple[Optional[int], Optional[str]]:
+    """Return exact regular-file bytes without following links or races."""
+    try:
+        root_info = os.lstat(root)
+        if not stat.S_ISDIR(root_info.st_mode) or root.is_symlink():
+            return None, "root_not_directory_or_link"
+        pending = [root]
+        total = 0
+        while pending:
+            directory = pending.pop()
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    before = entry.stat(follow_symlinks=False)
+                    if stat.S_ISLNK(before.st_mode):
+                        return None, f"link_detected:{entry.name}"
+                    if stat.S_ISDIR(before.st_mode):
+                        pending.append(Path(entry.path))
+                        continue
+                    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                        return None, f"unsafe_file:{entry.name}"
+                    after = os.stat(entry.path, follow_symlinks=False)
+                    if _stat_identity(before) != _stat_identity(after):
+                        return None, f"changed_during_size:{entry.name}"
+                    if before.st_size < 0:
+                        return None, f"negative_size:{entry.name}"
+                    total += int(before.st_size)
+        return total, None
+    except (OSError, OverflowError) as error:
         return None, f"unreadable:{error.__class__.__name__}"
 
 
@@ -676,6 +713,13 @@ def validate_unit(
             ))
     if require_mission_fields:
         report.findings.extend(_validate_sidecars(segment))
+        report.unit_storage_bytes, storage_error = _regular_tree_bytes(target)
+        if storage_error is not None:
+            report.findings.append(_finding(
+                SEVERITY_FATAL,
+                "unit_storage_unreadable",
+                f"{relative_path}: {storage_error}",
+            ))
     # lexists: a dangling symlink at the checkpoint path is still a checkpoint
     # as far as the PC is concerned and must block publication.
     if os.path.lexists(live_checkpoint):
@@ -1039,7 +1083,7 @@ def validate_mission(root: Path) -> MissionReport:
         report.findings.append(
             _finding(SEVERITY_FATAL, "mission_identity_missing", MANIFEST_NAME)
         )
-    if manifest.get("policyVersion") is not None and manifest.get("policyVersion") != POLICY_VERSION:
+    if manifest.get("policyVersion") != POLICY_VERSION:
         report.findings.append(
             _finding(
                 SEVERITY_FATAL,
@@ -1080,6 +1124,7 @@ def validate_mission(root: Path) -> MissionReport:
         declared_boundaries = []
 
     _validate_units(report, path, declared_units)
+    _validate_unit_inventory(report, path, declared_units)
     _validate_hash_chain(report)
     _validate_boundaries(report, path, declared_boundaries)
     _validate_identity_consistency(report)
@@ -1267,6 +1312,90 @@ def _validate_units(report: MissionReport, root: Path, declared_units: List[Any]
         )
 
 
+def _validate_unit_inventory(
+    report: MissionReport, root: Path, declared_units: List[Any]
+) -> None:
+    """Reject unit directories that the immutable manifest does not own."""
+    units_root = root / UNITS_DIRNAME
+    if not os.path.lexists(units_root):
+        report.findings.append(
+            _finding(SEVERITY_FATAL, "mission_units_directory_missing", UNITS_DIRNAME)
+        )
+        return
+    if _is_link(units_root):
+        report.findings.append(
+            _finding(SEVERITY_FATAL, "mission_units_directory_link", UNITS_DIRNAME)
+        )
+        return
+    try:
+        units_info = os.lstat(units_root)
+    except OSError as error:
+        report.findings.append(
+            _finding(
+                SEVERITY_FATAL,
+                "mission_units_directory_unreadable",
+                f"{UNITS_DIRNAME}: {error.__class__.__name__}",
+            )
+        )
+        return
+    if not stat.S_ISDIR(units_info.st_mode):
+        report.findings.append(
+            _finding(SEVERITY_FATAL, "mission_units_directory_invalid", UNITS_DIRNAME)
+        )
+        return
+
+    expected_names: set[str] = set()
+    resolved_root = root.resolve()
+    for entry in declared_units:
+        relative = entry.get("relativePath") if isinstance(entry, dict) else None
+        target, error = _safe_relative_path(root, relative)
+        if error is not None or target is None:
+            continue
+        try:
+            relative_target = target.relative_to(resolved_root)
+        except ValueError:
+            continue
+        if len(relative_target.parts) == 2 and relative_target.parts[0] == UNITS_DIRNAME:
+            expected_names.add(relative_target.parts[1])
+
+    try:
+        children = sorted(units_root.iterdir(), key=lambda item: item.name)
+    except OSError as error:
+        report.findings.append(
+            _finding(
+                SEVERITY_FATAL,
+                "mission_units_directory_unreadable",
+                f"{UNITS_DIRNAME}: {error.__class__.__name__}",
+            )
+        )
+        return
+    for child in children:
+        if _is_link(child):
+            report.findings.append(
+                _finding(SEVERITY_FATAL, "mission_undeclared_unit_link", child.name)
+            )
+            continue
+        try:
+            child_info = os.lstat(child)
+        except OSError as error:
+            report.findings.append(
+                _finding(
+                    SEVERITY_FATAL,
+                    "mission_unit_entry_unreadable",
+                    f"{child.name}: {error.__class__.__name__}",
+                )
+            )
+            continue
+        if not stat.S_ISDIR(child_info.st_mode):
+            report.findings.append(
+                _finding(SEVERITY_FATAL, "mission_unit_entry_invalid", child.name)
+            )
+        elif child.name not in expected_names:
+            report.findings.append(
+                _finding(SEVERITY_FATAL, "mission_undeclared_unit", child.name)
+            )
+
+
 def _validate_declared_digests(entry: Dict[str, Any], unit: UnitReport) -> List[Finding]:
     findings: List[Finding] = []
     declared_metadata = entry.get("metadataSha256")
@@ -1357,6 +1486,13 @@ def _validate_declared_digests(entry: Dict[str, Any], unit: UnitReport) -> List[
             str(unit.relative_path),
             unit=unit.unit_index,
         ))
+    elif unit.unit_storage_bytes is not None and storage_bytes != unit.unit_storage_bytes:
+        findings.append(_finding(
+            SEVERITY_FATAL,
+            "mission_unit_storage_bytes_mismatch",
+            f"{unit.relative_path}: declared {storage_bytes} but measured {unit.unit_storage_bytes}.",
+            unit=unit.unit_index,
+        ))
     if entry.get("previousUnitId") != unit.previous_unit_id:
         findings.append(_finding(
             SEVERITY_FATAL,
@@ -1427,11 +1563,36 @@ def _validate_boundaries(
 ) -> None:
     boundaries_root = root / BOUNDARIES_DIRNAME
     on_disk: Dict[str, List[Tuple[Path, Dict[str, Any], str]]] = {}
-    if boundaries_root.is_dir():
-        for candidate in sorted(boundaries_root.glob("boundary_*.json")):
+    if os.path.lexists(boundaries_root) and _is_link(boundaries_root):
+        report.findings.append(
+            _finding(SEVERITY_FATAL, "boundary_directory_link", BOUNDARIES_DIRNAME)
+        )
+    elif boundaries_root.is_dir():
+        try:
+            candidates = sorted(boundaries_root.iterdir(), key=lambda item: item.name)
+        except OSError as error:
+            report.findings.append(
+                _finding(
+                    SEVERITY_FATAL,
+                    "boundary_directory_unreadable",
+                    f"{BOUNDARIES_DIRNAME}: {error.__class__.__name__}",
+                )
+            )
+            candidates = []
+        for candidate in candidates:
             if _is_link(candidate):
                 report.findings.append(
                     _finding(SEVERITY_FATAL, "boundary_link_detected", candidate.name)
+                )
+                continue
+            if not re.fullmatch(r"boundary_[0-9]+\.json", candidate.name):
+                report.findings.append(
+                    _finding(SEVERITY_FATAL, "boundary_file_unexpected", candidate.name)
+                )
+                continue
+            if not candidate.is_file():
+                report.findings.append(
+                    _finding(SEVERITY_FATAL, "boundary_file_invalid", candidate.name)
                 )
                 continue
             payload, error = _read_json(candidate)
@@ -1448,6 +1609,10 @@ def _validate_boundaries(
             on_disk.setdefault(payload["boundaryId"], []).append(
                 (candidate, payload, digest)
             )
+    elif os.path.lexists(boundaries_root):
+        report.findings.append(
+            _finding(SEVERITY_FATAL, "boundary_directory_invalid", BOUNDARIES_DIRNAME)
+        )
     elif declared_boundaries:
         report.findings.append(_finding(
             SEVERITY_FATAL, "boundary_directory_missing", BOUNDARIES_DIRNAME

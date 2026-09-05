@@ -342,6 +342,9 @@ struct MissionStore {
     }
 
     func unitURL(name: String) throws -> URL {
+        guard !name.isEmpty, !name.contains("/") else {
+            throw MissionStoreError.pathEscape(name)
+        }
         _ = try validatedMissionRelativePath("\(MissionLayout.unitsDirectoryName)/\(name)")
         let url = unitsRoot.appendingPathComponent(name, isDirectory: true)
         guard url.path.hasPrefix(root.path + "/") else {
@@ -416,12 +419,19 @@ struct MissionStore {
     }
 
     func readBoundaries() throws -> [MissionBoundaryRecord] {
+        guard !writer.isLink(at: boundariesRoot) else {
+            throw MissionStoreError.linkDetected(boundariesRoot.lastPathComponent)
+        }
         guard writer.directoryExists(at: boundariesRoot) else { return [] }
         var records: [MissionBoundaryRecord] = []
-        for url in try writer.contentsOfDirectory(at: boundariesRoot)
-        where url.pathExtension == "json" {
+        for url in try writer.contentsOfDirectory(at: boundariesRoot) {
             if writer.isLink(at: url) {
                 throw MissionStoreError.linkDetected(url.lastPathComponent)
+            }
+            guard writer.isRegularFile(at: url),
+                  url.lastPathComponent.range(
+                    of: #"^boundary_[0-9]+\.json$"#, options: .regularExpression) != nil else {
+                throw MissionStoreError.manifestUnreadable(url.lastPathComponent)
             }
             let data = try writer.read(at: url)
             var record = try decodeJSON(MissionBoundaryRecord.self, from: data)
@@ -546,9 +556,11 @@ struct MissionStore {
     /// `O_NOFOLLOW` semantics through the injected writer so a linked unit
     /// directory is reported instead of being followed.
     func observeUnits() throws -> [MissionRecoveryObservation] {
+        guard !writer.isLink(at: unitsRoot) else {
+            throw MissionStoreError.linkDetected(unitsRoot.lastPathComponent)
+        }
         guard writer.directoryExists(at: unitsRoot) else { return [] }
         let directories = try writer.contentsOfDirectory(at: unitsRoot)
-            .filter { writer.directoryExists(at: $0) }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
         var observations: [MissionRecoveryObservation] = []
         for directory in directories {
@@ -557,6 +569,9 @@ struct MissionStore {
             // planner must quarantine it instead of planning a resume.
             if writer.isLink(at: directory) {
                 throw MissionStoreError.linkDetected(name)
+            }
+            guard writer.directoryExists(at: directory) else {
+                throw MissionStoreError.unitDirectoryMissing(name)
             }
             let relativePath = "\(MissionLayout.unitsDirectoryName)/\(name)"
             let segment = directory.appendingPathComponent("segment_0001", isDirectory: true)
@@ -784,11 +799,20 @@ struct MissionStore {
                     guard writer.isRegularFile(at: child) else {
                         throw MissionStoreError.hashUnavailable(child.lastPathComponent)
                     }
-                    let attributes = try FileManager.default.attributesOfItem(atPath: child.path)
-                    guard let size = attributes[.size] as? NSNumber else {
+                    var before = Darwin.stat()
+                    guard Darwin.lstat(child.path, &before) == 0,
+                          (before.st_mode & S_IFMT) == S_IFREG,
+                          before.st_nlink == 1,
+                          before.st_size >= 0 else {
                         throw MissionStoreError.hashUnavailable(child.lastPathComponent)
                     }
-                    let added = total.addingReportingOverflow(size.uint64Value)
+                    var after = Darwin.stat()
+                    guard Darwin.lstat(child.path, &after) == 0,
+                          sameFileIdentity(before, after) else {
+                        throw MissionStoreError.hashUnavailable(
+                            "\(child.lastPathComponent):changed_during_size")
+                    }
+                    let added = total.addingReportingOverflow(UInt64(before.st_size))
                     guard !added.overflow else {
                         throw MissionStoreError.hashUnavailable("unit_size_overflow")
                     }

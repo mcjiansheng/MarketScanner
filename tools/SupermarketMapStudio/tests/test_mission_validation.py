@@ -196,7 +196,9 @@ def _unit_entry(root: Path, unit_dir: Path, unit_id: str, index: int, previous: 
         "previousUnitMetadataSha256": previous.get("metadataSha256") if previous else None,
         "rolloverTrigger": "time_limit",
         "activeCaptureDurationS": 1800.0,
-        "unitStorageBytes": database_path.stat().st_size,
+        "unitStorageBytes": sum(
+            path.stat().st_size for path in unit_dir.rglob("*") if path.is_file()
+        ),
         "finalizedAtUnix": 2.0 + index,
         "finalized": True,
     }
@@ -288,6 +290,62 @@ class MissionValidationTestCase(unittest.TestCase):
         root = self._make_mission(1)
         report = mv.validate_mission(root)
         self.assertTrue(report.publish_permitted, report.findings)
+
+    def test_declared_storage_bytes_cover_the_entire_unit(self) -> None:
+        root = self._make_mission(1)
+        manifest_path = root / "mission_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["units"][0]["unitStorageBytes"] -= 1
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+        report = mv.validate_mission(root)
+        self.assertFalse(report.publish_permitted)
+        self.assertIn(
+            "mission_unit_storage_bytes_mismatch",
+            {item.code for item in report.findings},
+        )
+
+    def test_missing_policy_version_is_fatal(self) -> None:
+        root = self._make_mission(1)
+        manifest_path = root / "mission_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest.pop("policyVersion")
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+        report = mv.validate_mission(root)
+        self.assertFalse(report.publish_permitted)
+        self.assertIn(
+            "mission_policy_version_unsupported",
+            {item.code for item in report.findings},
+        )
+
+    def test_undeclared_unit_directory_is_fatal(self) -> None:
+        root = self._make_mission(1)
+        extra = root / "units" / "SupermarketSession-20260904-100000-U0002"
+        _write_unit(
+            root,
+            extra.name,
+            _metadata(unit_id="unit-0002", unit_index=2),
+        )
+        report = mv.validate_mission(root)
+        self.assertFalse(report.publish_permitted)
+        self.assertIn(
+            "mission_undeclared_unit",
+            {item.code for item in report.findings},
+        )
+
+    def test_noncanonical_declared_path_is_fatal(self) -> None:
+        root = self._make_mission(1)
+        manifest_path = root / "mission_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["units"][0]["relativePath"] = (
+            "units//SupermarketSession-20260904-100000-U0001"
+        )
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+        report = mv.validate_mission(root)
+        self.assertFalse(report.publish_permitted)
+        self.assertIn(
+            "unit_path_not_canonical",
+            {item.code for item in report.findings},
+        )
 
     def test_missing_unit_directory_is_fatal(self) -> None:
         root = self._make_mission(3)
@@ -772,6 +830,16 @@ class MissionValidationTestCase(unittest.TestCase):
         codes = {item.code for item in report.findings}
         self.assertFalse(report.publish_permitted)
         self.assertTrue({"boundary_units_nonadjacent", "boundary_nonadjacent"} & codes)
+
+    def test_unexpected_boundary_file_is_fatal(self) -> None:
+        root = self._make_mission(1)
+        (root / "boundaries" / "notes.txt").write_text("unexpected", encoding="utf-8")
+        report = mv.validate_mission(root)
+        self.assertFalse(report.publish_permitted)
+        self.assertIn(
+            "boundary_file_unexpected",
+            {item.code for item in report.findings},
+        )
 
     def test_report_is_json_serialisable(self) -> None:
         root = self._make_mission(2)

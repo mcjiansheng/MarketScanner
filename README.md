@@ -187,7 +187,7 @@ Xcode Release 全量构建（CI 同款命令）已通过：`BUILD SUCCEEDED`，�
 
 人工地图锚点在 iOS 与 PC 统一为 canonical SE(2)。PC 工作台不再提供容易产生不可控跳变的连续 yaw slider，只保留 X/Y/yaw 数值输入、0.1/0.5/1.0 m 四向微调、±1/±5/±15°旋转、东/北/西/南和键盘操作；界面显示值就是服务端提交值，不进行隐藏坐标或朝向变换。低置信度、部分图、平行通道/货架多解、时钟局部缺口和可恢复的关联不足只降低发布资格，不得删除源节点、durable 价签或整个处理版本。
 
-本轮主机证据包括 PriorMap 全量 329/329（378.876 s）、Qualification 30/30、Map Studio 完整 API 131/131、原生检查 7884/0，以及 macOS Release `rtabmap-reprocess` 构建。规模子进程处理 300,000 finalization（8.111 s，峰值 RSS 13,287,424 bytes）、1,728,000 trace（保留 172,801，0.405 s，峰值 59,146,240 bytes）和 400,000 tag evidence（输入 282,352,646 bytes，接受 200,000，29.046 s，峰值 747,192,320 bytes）；tag 路径仍低于冻结的 768 MiB host 门，但余量有限。真实浏览器响应式自动化仍受浏览器 localhost 安全策略限制；签名真机、LiDAR、Files provider、热/低磁盘和现场非空价签真值仍属于设备/现场验收，不能由上述主机结果替代。
+本轮主机证据包括 PriorMap 全量 329/329（378.876 s）、Qualification 30/30、Map Studio 完整 API 131/131、原生检查 7884/0，以及 macOS Release `rtabmap-reprocess` 构建。规模子进程处理 300,000 finalization（8.111 s，峰值 RSS 13,287,424 bytes）、1,728,000 trace（保留 172,801，0.405 s，峰值 59,146,240 bytes）和 400,000 tag evidence（输入 282,352,646 bytes，接受 200,000，29.046 s，峰值 747,192,320 bytes）；747,192,320 bytes 是当时的 host 基线记录，768 MiB 绝对 host 门已由 2026-09-03 的设备证据政策取代，当前 host 只报告相对基线增长预警，硬门是签名真机无崩溃/无 OOM。真实浏览器响应式自动化仍受浏览器 localhost 安全策略限制；签名真机、LiDAR、Files provider、热/低磁盘和现场非空价签真值仍属于设备/现场验收，不能由上述主机结果替代。
 
 ### MapCase02 标准工作簿状态（2026-08-09）
 
