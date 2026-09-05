@@ -8,15 +8,17 @@
 
 1. **时间与提醒**：`tools/Qualification/swift-host-tests/main.swift` 的 1799/1800/1801 秒边界（1799 为 warning 且普通采集仍开、1800 立即关门）、Timer 延迟不额外给时间、提醒阶梯 5 min/1 min/30 s 各触发一次且不重复、时钟回拨记为异常且累计值不倒退、重启恢复累计值（恢复 1200 s 后再走 600 s 即到期，绝不会重新获得 30 分钟）。
 2. **强制门**：维护门内 `ordinaryNodeWrites / priceTagConfirmation / localizationCorrection` 全为 false，`oneShotAnchorNode` 仍为 true；`finalizingUnit / preparingNextUnit / terminalRecovery / completed` 为全关闭。
-3. **状态机**：`scanning` 不能直达 `finalizingUnit`；空 boundary id 不能开启封口；锚点失败回到 gate；`operator_stop / safety_stop` 不允许进入 `preparingNextUnit`；`completeNextUnitPreparation` 的 index 必须为 `current+1`。
+3. **状态机**：`scanning` 不能直达 `finalizingUnit`；空 boundary id 不能开启封口；锚点失败回到 gate；可恢复的 unit finalization/next-unit prepare 只能通过带 durable trigger + boundary id 的显式重试边，且普通 admission 始终关闭；`operator_stop / safety_stop` 不允许进入 `preparingNextUnit`；首卷必须从 1 开始，`completeNextUnitPreparation` 的 index 必须为 `current+1`。
 4. **安全优先级**：证据/数据库写失败、可用空间 <1 GiB、thermal critical 一律 `terminalRecovery` 且不开新卷；8 GiB 仅告警；安全门优先于时间与字节门。
 5. **字节门**：≥3 样本估计增长并预测未来 60 s；`softMaxUnitBytes=nil`（真机基线未冻结）时字节门不激活，不得宣称存在严格字节上限。
-6. **恢复幂等**：`finalizingUnit` 重试同 index、`preparingNextUnit` 重试同 next index、`finalized=false` 直判 terminal、无 checkpoint 目录一律隔离为 orphan、重复输入产生同一 idempotency key 与同一动作。
-7. **PC 校验**：`tools/SupermarketMapStudio/tests/test_mission_validation.py` 26 例——完整 4 单元可发布；缺卷/乱序/重复 index/断链/单边 boundary/符号链接/路径逃逸/运行中 mission/legacy 会话/manifest 虚报/缺 unit-mission 身份/缺 boundary unit id/重复 boundary id/链接数据库/悬挂 checkpoint 全部 `publish_permitted=false`。
-8. **原子提交故障注入**：rename/flush 阶段失败时不留任何半成品文件。
-9. **feature flag**：关闭时 engine 不开门、不发提醒、恢复规划不产生任何 mission 动作；开启后 engine 状态必须能写回 checkpoint（elapsed / state / pending trigger / last error）。
+6. **恢复幂等**：`finalizingUnit` 重试同 index、pending U0002 的 `preparingNextUnit` 仍重试 U0002、`finalized=false` 直判 terminal、无 checkpoint 目录一律隔离为 orphan、重复输入产生同一 idempotency key 与同一动作；未知 state、缺/未知 trigger、负 elapsed、缺当前 unit/DB/live checkpoint 一律人工复核，不自动续采。
+7. **PC 校验**：`tools/SupermarketMapStudio/tests/test_mission_validation.py` **33/33 PASS**——除原有缺卷/乱序/重复/断链/单边/链接/逃逸/运行中/legacy 之外，新增伪 SQLite + 缺 sidecar、foreign mission、`free_mapping`、声明路径逃逸、缺摘要、unverified/deny manifest 与 live checkpoint 并存、boundary 错类型/负 generation/错误 tracking/坏 hash、额外非相邻完整 boundary；全部 `publish_permitted=false`。
+8. **原子与不可变提交**：write/flush/commit 失败不留可误认的半成品；不完整 boundary、phantom finalized unit、缺 required sidecar、top-level mission identity 漂移、第二次 manifest 写入全部拒绝；文件 SHA 校验前后复核 inode/size/mtime/link identity，极端字节预测饱和而不 trap。
+9. **schema/工程合同**：feature flag 关闭时 engine 不开门、不发提醒、恢复规划不产生 mission 动作；开启后 engine 状态写回 checkpoint 并清除已恢复错误。`ScanLiveCheckpoint` 的 10 个 mission 字段必须参与 synthesized decoding，active duration 写 metadata 前必须清洗；Xcode target membership 审计确保两个周期维护源码真实进入 RTABMapApp Sources。
 
-尚未执行（功能未上线，按 §14.2/§14.3 必须补齐后才能声称完成）：签名 iOS 全量构建（本机沙箱阻止 SwiftPM 解析，本轮未执行）、iOS HUD/提醒/维护页手测、Dynamic Type/VoiceOver、真机 30 分钟/65 分钟/2 小时、4 单元 3 边界、20 次边界校准、热/低磁盘/强杀/外部存储矩阵、PC 处理编排与回放。
+本轮汇总：Swift host **173 断言 PASS**、mission validator **33/33 PASS**、Map Studio **181/181 PASS**、Qualification **58/58 PASS**。
+
+已执行 unsigned generic iPhoneOS Debug 全量编译/链接，证明修正后的两个周期维护源码进入生产 target；该 dirty Debug bundle 仅为编译证据，`production_eligible=false`。尚未执行（功能未上线，按 §14.2/§14.3 必须补齐后才能声称完成）：clean Release exact-SHA、签名安装/真机运行、iOS HUD/提醒/维护页手测、Dynamic Type/VoiceOver、真机 30 分钟/65 分钟/2 小时、4 单元 3 边界、20 次边界校准、热/低磁盘/强杀/外部存储矩阵、PC 处理编排与回放。
 
 ## 2026-09-03 资源门重锚定（取代 768 MiB 绝对门）
 

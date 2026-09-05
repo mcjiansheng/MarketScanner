@@ -434,7 +434,8 @@ struct StorageGrowthEstimator: Equatable {
               horizonS >= 0 else { return nil }
         let projected = Double(current) + rate * horizonS
         guard projected.isFinite, projected >= 0 else { return nil }
-        return UInt64(min(projected, Double(UInt64.max)))
+        if projected >= Double(UInt64.max) { return UInt64.max }
+        return UInt64(projected.rounded(.down))
     }
 }
 
@@ -548,6 +549,10 @@ struct PeriodicMaintenanceEngine: Equatable {
         index: Int,
         at monotonic: TimeInterval
     ) -> Result<Void, PeriodicMaintenanceTransitionError> {
+        let expectedIndex = unitIndex + 1
+        guard index == expectedIndex else {
+            return .failure(.invalidUnitIndex(expected: expectedIndex, actual: index))
+        }
         guard policy.isActive else {
             return .failure(.denied(from: state, to: .scanning))
         }
@@ -773,7 +778,8 @@ struct PeriodicMaintenanceEngine: Equatable {
     /// `metadata.finalized == true` for the outgoing unit.
     mutating func completeUnitFinalization(at monotonic: TimeInterval)
         -> Result<Void, PeriodicMaintenanceTransitionError> {
-        guard (pendingTrigger ?? .timeLimit).startsNextUnit else {
+        guard let trigger = pendingTrigger, trigger.startsNextUnit,
+              let boundaryID = pendingBoundaryID, !boundaryID.isEmpty else {
             return .failure(.denied(from: state, to: .preparingNextUnit))
         }
         let outcome = requestTransition(to: .preparingNextUnit)
@@ -781,6 +787,22 @@ struct PeriodicMaintenanceEngine: Equatable {
             _ = pauseEffectiveCapture(at: monotonic)
         }
         return outcome
+    }
+
+    /// Re-enters the exact failed finalization transaction. The durable
+    /// trigger and boundary id are required so an ordinary gate can never be
+    /// mistaken for a save retry.
+    mutating func retryUnitFinalization(at monotonic: TimeInterval)
+        -> Result<Void, PeriodicMaintenanceTransitionError> {
+        guard state == .gate, stickyFailure == nil,
+              let trigger = pendingTrigger, trigger.startsNextUnit,
+              let boundaryID = pendingBoundaryID, !boundaryID.isEmpty else {
+            return .failure(.denied(from: state, to: .finalizingUnit))
+        }
+        state = .finalizingUnit
+        _ = pauseEffectiveCapture(at: monotonic)
+        lastFailure = nil
+        return .success(())
     }
 
     /// New unit start failed (§10): the finished unit is never rolled back and
@@ -802,6 +824,21 @@ struct PeriodicMaintenanceEngine: Equatable {
         if periodicMaintenanceAllowsTransition(from: state, to: .gate) {
             state = .gate
         }
+    }
+
+    /// Re-enters preparation without incrementing the in-memory unit index.
+    /// The executor derives the pending index from the durable checkpoint.
+    mutating func retryNextUnitPreparation(at monotonic: TimeInterval)
+        -> Result<Void, PeriodicMaintenanceTransitionError> {
+        guard state == .gate, stickyFailure == nil,
+              let trigger = pendingTrigger, trigger.startsNextUnit,
+              let boundaryID = pendingBoundaryID, !boundaryID.isEmpty else {
+            return .failure(.denied(from: state, to: .preparingNextUnit))
+        }
+        state = .preparingNextUnit
+        _ = pauseEffectiveCapture(at: monotonic)
+        lastFailure = nil
+        return .success(())
     }
 
     /// Next-unit receipt and incoming boundary binding are durable: ordinary
@@ -852,9 +889,7 @@ struct PeriodicMaintenanceEngine: Equatable {
         checkpoint.nextMaintenanceAtActiveS = policy.calibrationIntervalS
         checkpoint.maintenanceState = state.rawValue
         checkpoint.pendingTrigger = pendingTrigger?.rawValue
-        if let failure = lastFailure {
-            checkpoint.lastError = failure.code
-        }
+        checkpoint.lastError = lastFailure?.code
         checkpoint.pendingBoundaryId = pendingBoundaryID
     }
 
@@ -906,6 +941,7 @@ struct MissionIdentity: Codable, Equatable {
             && priorMapPackageSha256 == other.priorMapPackageSha256
             && storeId == other.storeId
             && floorId == other.floorId
+            && buildIdentity == other.buildIdentity
     }
 }
 
@@ -1024,10 +1060,43 @@ struct MissionBoundaryRecord: Codable, Equatable {
     /// processable but never publishes the mission.
     var isComplete: Bool {
         guard let outgoing, let incoming else { return false }
-        return outgoing.poseIsFinite
+        guard let createdAtUnix, let committedAtUnix else { return false }
+        return !missionId.isEmpty
+            && !boundaryId.isEmpty
+            && !fromUnitId.isEmpty
+            && !toUnitId.isEmpty
+            && fromUnitId != toUnitId
+            && createdAtUnix.isFinite
+            && committedAtUnix.isFinite
+            && createdAtUnix >= 0
+            && committedAtUnix >= createdAtUnix
+            && confirmedX.isFinite
+            && confirmedY.isFinite
+            && confirmedYaw.isFinite
+            && outgoing.poseIsFinite
             && incoming.poseIsFinite
             && outgoing.unitId == fromUnitId
             && incoming.unitId == toUnitId
+            && outgoing.unitIndex >= 1
+            && incoming.unitIndex == outgoing.unitIndex + 1
+            && outgoing.trackingSessionId.isEmpty == false
+            && incoming.trackingSessionId.isEmpty == false
+            && outgoing.nodeId > 0
+            && incoming.nodeId > 0
+            && outgoing.nodeStamp.isFinite
+            && incoming.nodeStamp.isFinite
+            && outgoing.nodeStamp >= 0
+            && incoming.nodeStamp >= 0
+            && outgoing.nodeTimeSnapshotGeneration > 0
+            && incoming.nodeTimeSnapshotGeneration > 0
+            // The outgoing end is authorized by the manual calibration event;
+            // the incoming end is authorized by the next-unit start receipt.
+            // The shared schema permits the opposite-role hashes to be absent,
+            // but rejects them if a producer does include malformed values.
+            && isSHA256(outgoing.manualEventSha256)
+            && isNilOrSHA256(outgoing.startReceiptSha256)
+            && isNilOrSHA256(incoming.manualEventSha256)
+            && isSHA256(incoming.startReceiptSha256)
             && abs(outgoing.confirmedX - confirmedX) <= Self.poseToleranceMeters
             && abs(incoming.confirmedX - confirmedX) <= Self.poseToleranceMeters
             && abs(outgoing.confirmedY - confirmedY) <= Self.poseToleranceMeters
@@ -1038,6 +1107,19 @@ struct MissionBoundaryRecord: Codable, Equatable {
 
     static let poseToleranceMeters = 1e-6
     static let yawToleranceRadians = 1e-6
+}
+
+private func isSHA256(_ value: String?) -> Bool {
+    guard let value, value.utf8.count == 64 else { return false }
+    return value.utf8.allSatisfy { byte in
+        (byte >= 48 && byte <= 57)
+            || (byte >= 65 && byte <= 70)
+            || (byte >= 97 && byte <= 102)
+    }
+}
+
+private func isNilOrSHA256(_ value: String?) -> Bool {
+    value == nil || isSHA256(value)
 }
 
 private func normalizedYawDelta(_ lhs: Double, _ rhs: Double) -> Double {
@@ -1092,9 +1174,52 @@ struct MissionLiveCheckpoint: Codable, Equatable {
     }
 
     var isWellFormed: Bool {
-        format == MissionLiveCheckpoint.format
+        guard format == MissionLiveCheckpoint.format
             && version == MissionLiveCheckpoint.currentVersion
             && policyVersion == PeriodicMaintenancePolicy.currentPolicyVersion
+            && !missionId.isEmpty
+            && identity.missionId == missionId
+            && activeCaptureElapsedS.isFinite
+            && activeCaptureElapsedS >= 0
+            && nextMaintenanceAtActiveS.isFinite
+            && nextMaintenanceAtActiveS > 0
+            && state != nil else {
+            return false
+        }
+        if let rawTrigger = pendingTrigger,
+           MaintenanceTrigger(rawValue: rawTrigger) == nil {
+            return false
+        }
+        let ownedUnits = finalizedUnits + [currentUnit].compactMap { $0 }
+        if ownedUnits.contains(where: {
+            $0.unitIndex < 1 || $0.unitId.isEmpty || $0.trackingSessionId.isEmpty
+        }) {
+            return false
+        }
+        if Set(ownedUnits.map(\.unitIndex)).count != ownedUnits.count
+            || Set(ownedUnits.map(\.unitId)).count != ownedUnits.count {
+            return false
+        }
+        if finalizedUnits.contains(where: { !$0.finalized }) {
+            return false
+        }
+        switch state {
+        case .scanning, .warning:
+            return currentUnit != nil && pendingTrigger == nil
+        case .gate, .anchoring:
+            return currentUnit != nil
+                && decodedPendingTrigger?.startsNextUnit == true
+        case .finalizingUnit, .preparingNextUnit:
+            return currentUnit != nil
+                && decodedPendingTrigger?.startsNextUnit == true
+                && pendingBoundaryId?.isEmpty == false
+        case .finalizingMission:
+            return currentUnit != nil
+        case .idle, .terminalRecovery, .completed:
+            return true
+        case .none:
+            return false
+        }
     }
 
     /// The stored trigger, decoded fail-closed: an unknown value is reported
@@ -1204,6 +1329,22 @@ func validateMissionStructure(
         return findings
     }
 
+    let requiredIdentityValues = [
+        identity.missionId,
+        identity.priorMapId ?? "",
+        identity.priorMapPackageSha256 ?? "",
+        identity.storeId ?? "",
+        identity.floorId ?? "",
+        identity.buildIdentity ?? ""
+    ]
+    if requiredIdentityValues.contains(where: { $0.isEmpty })
+        || !isSHA256(identity.priorMapPackageSha256) {
+        findings.append(MissionFinding(
+            severity: .fatal,
+            code: "mission_identity_incomplete",
+            message: "Mission/map/package/store/floor/build identity must be complete."))
+    }
+
     let indices = units.map(\.unitIndex).sorted()
     let expected = Array(1...units.count)
     if indices != expected {
@@ -1216,6 +1357,12 @@ func validateMissionStructure(
     var seenIds = Set<String>()
     var seenTracking = Set<String>()
     for unit in units {
+        if unit.unitId.isEmpty || unit.trackingSessionId.isEmpty || unit.unitIndex < 1 {
+            findings.append(MissionFinding(
+                severity: .fatal,
+                code: "mission_unit_identity_incomplete",
+                message: "Unit \(unit.unitIndex) has an empty id or tracking session."))
+        }
         if !seenIds.insert(unit.unitId).inserted {
             findings.append(MissionFinding(
                 severity: .fatal,
@@ -1232,6 +1379,16 @@ func validateMissionStructure(
             _ = try validatedMissionRelativePath(unit.relativePath)
             _ = try validatedMissionRelativePath(unit.databaseRelativePath)
             _ = try validatedMissionRelativePath(unit.metadataRelativePath)
+            let expectedDatabase = unit.relativePath
+                + "/segment_0001/rtabmap_segment_0001.db"
+            let expectedMetadata = unit.relativePath + "/segment_0001/metadata.json"
+            if unit.databaseRelativePath != expectedDatabase
+                || unit.metadataRelativePath != expectedMetadata {
+                findings.append(MissionFinding(
+                    severity: .fatal,
+                    code: "mission_unit_declared_path_mismatch",
+                    message: "Unit \(unit.unitIndex) file paths do not match its directory."))
+            }
         } catch {
             findings.append(MissionFinding(
                 severity: .fatal,
@@ -1244,11 +1401,43 @@ func validateMissionStructure(
                 code: "mission_unit_not_finalized",
                 message: "Unit \(unit.unitIndex) is not finalized."))
         }
-        if let priorMapId = identity.priorMapId, priorMapId.isEmpty {
+        if !isSHA256(unit.databaseSha256) || !isSHA256(unit.metadataSha256) {
             findings.append(MissionFinding(
                 severity: .fatal,
-                code: "mission_identity_empty",
-                message: "priorMapId must not be empty for a prior-map mission."))
+                code: "mission_unit_digest_missing",
+                message: "Unit \(unit.unitIndex) must carry database and metadata SHA-256."))
+        }
+        if unit.activeCaptureDurationS == nil
+            || unit.activeCaptureDurationS?.isFinite != true
+            || (unit.activeCaptureDurationS ?? -1) < 0 {
+            findings.append(MissionFinding(
+                severity: .fatal,
+                code: "mission_unit_duration_invalid",
+                message: "Unit \(unit.unitIndex) active duration is invalid."))
+        }
+        if unit.rolloverTrigger == nil {
+            findings.append(MissionFinding(
+                severity: .fatal,
+                code: "mission_unit_trigger_missing",
+                message: "Unit \(unit.unitIndex) has no finalization trigger."))
+        }
+        if unit.unitStorageBytes == nil || unit.unitStorageBytes == 0 {
+            findings.append(MissionFinding(
+                severity: .fatal,
+                code: "mission_unit_storage_missing",
+                message: "Unit \(unit.unitIndex) has no verified storage size."))
+        }
+        if let finalizedAt = unit.finalizedAtUnix,
+           !finalizedAt.isFinite || finalizedAt < 0 {
+            findings.append(MissionFinding(
+                severity: .fatal,
+                code: "mission_unit_finalized_time_invalid",
+                message: "Unit \(unit.unitIndex) finalized time is invalid."))
+        } else if unit.finalizedAtUnix == nil {
+            findings.append(MissionFinding(
+                severity: .fatal,
+                code: "mission_unit_finalized_time_missing",
+                message: "Unit \(unit.unitIndex) has no finalization timestamp."))
         }
     }
 
@@ -1256,21 +1445,19 @@ func validateMissionStructure(
     for index in 1..<ordered.count {
         let previous = ordered[index - 1]
         let current = ordered[index]
-        if let expectedPreviousId = current.previousUnitId,
-           expectedPreviousId != previous.unitId {
+        if current.previousUnitId != previous.unitId {
             findings.append(MissionFinding(
                 severity: .fatal,
                 code: "mission_previous_unit_id_mismatch",
                 message: "Unit \(current.unitIndex) points at an unexpected previous unit."))
         }
-        if let expectedHash = current.previousUnitMetadataSha256,
-           expectedHash != previous.metadataSha256 {
+        if current.previousUnitMetadataSha256 != previous.metadataSha256 {
             findings.append(MissionFinding(
                 severity: .fatal,
                 code: "mission_hash_chain_broken",
                 message: "Unit \(current.unitIndex) metadata hash chain is broken."))
         }
-        if previous.metadataSha256 != nil && current.previousUnitMetadataSha256 == nil {
+        if current.previousUnitMetadataSha256 == nil {
             findings.append(MissionFinding(
                 severity: .fatal,
                 code: "mission_hash_chain_missing",
@@ -1282,6 +1469,13 @@ func validateMissionStructure(
                 code: "mission_unit_order_invalid",
                 message: "Unit indices must strictly increase."))
         }
+    }
+    if ordered.first?.previousUnitId != nil
+        || ordered.first?.previousUnitMetadataSha256 != nil {
+        findings.append(MissionFinding(
+            severity: .fatal,
+            code: "mission_first_unit_has_predecessor",
+            message: "Unit 1 must not declare a predecessor."))
     }
 
     // Exactly one complete boundary between every adjacent pair.
@@ -1301,6 +1495,12 @@ func validateMissionStructure(
             code: "mission_duplicate_boundary_pair",
             message: "More than one boundary links the same unit pair."))
     }
+    if boundaries.count != max(0, units.count - 1) {
+        findings.append(MissionFinding(
+            severity: .fatal,
+            code: "mission_boundary_count_invalid",
+            message: "A mission must contain exactly one boundary per adjacent unit pair."))
+    }
     for index in 1..<ordered.count {
         let previous = ordered[index - 1]
         let current = ordered[index]
@@ -1317,12 +1517,47 @@ func validateMissionStructure(
                 code: "mission_boundary_mission_mismatch",
                 message: "Boundary \(boundary.boundaryId) belongs to another mission."))
         }
+        if boundary.priorMapId != identity.priorMapId
+            || boundary.priorMapPackageSha256 != identity.priorMapPackageSha256
+            || boundary.storeId != identity.storeId
+            || boundary.floorId != identity.floorId {
+            findings.append(MissionFinding(
+                severity: .fatal,
+                code: "mission_boundary_identity_mismatch",
+                message: "Boundary \(boundary.boundaryId) identity differs from the mission."))
+        }
+        if boundary.outgoing?.unitIndex != previous.unitIndex
+            || boundary.incoming?.unitIndex != current.unitIndex
+            || boundary.outgoing?.trackingSessionId != previous.trackingSessionId
+            || boundary.incoming?.trackingSessionId != current.trackingSessionId {
+            findings.append(MissionFinding(
+                severity: .fatal,
+                code: "mission_boundary_unit_mismatch",
+                message: "Boundary \(boundary.boundaryId) end identity differs from its units."))
+        }
+        if !isSHA256(boundary.fileSha256) {
+            findings.append(MissionFinding(
+                severity: .fatal,
+                code: "mission_boundary_digest_missing",
+                message: "Boundary \(boundary.boundaryId) has no file SHA-256."))
+        }
         if !boundary.isComplete {
             findings.append(MissionFinding(
                 severity: .fatal,
                 code: "mission_boundary_incomplete",
                 message: "Boundary \(boundary.boundaryId) lacks durable two-sided evidence."))
         }
+    }
+
+    let expectedPairs = Set((1..<ordered.count).map {
+        "\(ordered[$0 - 1].unitId)->\(ordered[$0].unitId)"
+    })
+    for boundary in boundaries
+    where !expectedPairs.contains("\(boundary.fromUnitId)->\(boundary.toUnitId)") {
+        findings.append(MissionFinding(
+            severity: .fatal,
+            code: "mission_boundary_nonadjacent",
+            message: "Boundary \(boundary.boundaryId) does not link adjacent units."))
     }
 
     return findings
@@ -1405,8 +1640,12 @@ func nextMissionUnitIndex(
     observations: [MissionRecoveryObservation]
 ) -> Int {
     let finalizedMax = checkpoint?.finalizedUnits.map(\.unitIndex).max() ?? 0
-    let currentMax = checkpoint?.currentUnit?.unitIndex ?? 0
-    return max(finalizedMax, currentMax) + 1
+    if let current = checkpoint?.currentUnit,
+       !current.finalized,
+       current.unitIndex == finalizedMax + 1 {
+        return current.unitIndex
+    }
+    return finalizedMax + 1
 }
 
 func planMissionRecovery(_ input: MissionRecoveryInput) -> MissionRecoveryPlan {
@@ -1516,7 +1755,17 @@ func planMissionRecovery(_ input: MissionRecoveryInput) -> MissionRecoveryPlan {
             idempotencyKey: idempotencyKey)
     }
 
-    let state = checkpoint.state ?? .idle
+    guard let state = checkpoint.state else {
+        findings.append(MissionFinding(
+            severity: .fatal,
+            code: "recovery_checkpoint_state_unknown",
+            message: "The checkpoint maintenance state is unknown."))
+        return MissionRecoveryPlan(
+            action: .operatorReview(reason: "mission_checkpoint_state_unknown"),
+            findings: findings,
+            requiresOperatorConfirmation: true,
+            idempotencyKey: idempotencyKey)
+    }
     let currentIndex = checkpoint.currentUnit?.unitIndex ?? 0
 
     switch state {
@@ -1548,7 +1797,8 @@ func planMissionRecovery(_ input: MissionRecoveryInput) -> MissionRecoveryPlan {
             idempotencyKey: idempotencyKey)
 
     case .preparingNextUnit:
-        let next = max(currentIndex, checkpoint.finalizedUnits.map(\.unitIndex).max() ?? 0) + 1
+        let next = nextMissionUnitIndex(
+            checkpoint: checkpoint, observations: observations)
         return MissionRecoveryPlan(
             action: .retryNextUnitPreparation(
                 unitIndex: next,
@@ -1558,10 +1808,17 @@ func planMissionRecovery(_ input: MissionRecoveryInput) -> MissionRecoveryPlan {
             idempotencyKey: idempotencyKey)
 
     case .gate, .anchoring:
-        // The stored trigger decides whether a new unit may follow; an unknown
-        // or missing trigger falls back to the time gate and still requires
-        // operator confirmation.
-        let trigger = checkpoint.decodedPendingTrigger ?? .timeLimit
+        guard let trigger = checkpoint.decodedPendingTrigger else {
+            findings.append(MissionFinding(
+                severity: .fatal,
+                code: "recovery_trigger_missing",
+                message: "The maintenance gate has no valid durable trigger."))
+            return MissionRecoveryPlan(
+                action: .operatorReview(reason: "maintenance_trigger_missing"),
+                findings: findings,
+                requiresOperatorConfirmation: true,
+                idempotencyKey: idempotencyKey)
+        }
         return MissionRecoveryPlan(
             action: .enterMaintenanceGate(
                 unitIndex: currentIndex,
@@ -1580,10 +1837,7 @@ func planMissionRecovery(_ input: MissionRecoveryInput) -> MissionRecoveryPlan {
 
     case .idle:
         return MissionRecoveryPlan(
-            action: .enterMaintenanceGate(
-                unitIndex: max(currentIndex, 1),
-                trigger: .timeLimit,
-                reason: "idle_mission_checkpoint"),
+            action: .operatorReview(reason: "idle_mission_checkpoint"),
             findings: findings,
             requiresOperatorConfirmation: true,
             idempotencyKey: idempotencyKey)
@@ -1602,7 +1856,18 @@ func planMissionRecovery(_ input: MissionRecoveryInput) -> MissionRecoveryPlan {
                 requiresOperatorConfirmation: true,
                 idempotencyKey: idempotencyKey)
         }
-        if let current = checkpoint.currentUnit, current.finalized {
+        guard let current = checkpoint.currentUnit, currentIndex > 0 else {
+            findings.append(MissionFinding(
+                severity: .fatal,
+                code: "recovery_current_unit_missing",
+                message: "A scanning checkpoint has no current unit."))
+            return MissionRecoveryPlan(
+                action: .operatorReview(reason: "current_unit_missing"),
+                findings: findings,
+                requiresOperatorConfirmation: true,
+                idempotencyKey: idempotencyKey)
+        }
+        if current.finalized {
             findings.append(MissionFinding(
                 severity: .fatal,
                 code: "recovery_current_unit_finalized",
@@ -1613,9 +1878,20 @@ func planMissionRecovery(_ input: MissionRecoveryInput) -> MissionRecoveryPlan {
                 requiresOperatorConfirmation: true,
                 idempotencyKey: idempotencyKey)
         }
-        if let currentPath = checkpoint.currentUnit?.relativePath,
-           let observation = observations.first(where: { $0.relativePath == currentPath }),
-           observation.metadataFinalized == true,
+        guard let observation = observations.first(where: {
+            $0.relativePath == current.relativePath
+        }) else {
+            findings.append(MissionFinding(
+                severity: .fatal,
+                code: "recovery_current_unit_unobserved",
+                message: "The current unit directory is not present on disk."))
+            return MissionRecoveryPlan(
+                action: .operatorReview(reason: "current_unit_unobserved"),
+                findings: findings,
+                requiresOperatorConfirmation: true,
+                idempotencyKey: idempotencyKey)
+        }
+        if observation.metadataFinalized == true,
            observation.liveCheckpointPresent {
             // §10: the unit sealed itself but the live checkpoint survived.
             // Finish the identity-checked CAS cleanup before continuing.
@@ -1623,6 +1899,19 @@ func planMissionRecovery(_ input: MissionRecoveryInput) -> MissionRecoveryPlan {
                 action: .retryCheckpointCleanup(
                     unitIndex: currentIndex,
                     reason: "live_checkpoint_present_after_finalize"),
+                findings: findings,
+                requiresOperatorConfirmation: true,
+                idempotencyKey: idempotencyKey)
+        }
+        guard observation.databasePresent,
+              observation.liveCheckpointPresent,
+              observation.metadataFinalized != true else {
+            findings.append(MissionFinding(
+                severity: .fatal,
+                code: "recovery_capture_evidence_incomplete",
+                message: "The current database/checkpoint state cannot prove a live capture."))
+            return MissionRecoveryPlan(
+                action: .operatorReview(reason: "capture_evidence_incomplete"),
                 findings: findings,
                 requiresOperatorConfirmation: true,
                 idempotencyKey: idempotencyKey)

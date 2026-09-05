@@ -120,6 +120,7 @@ protocol MissionFileWriting {
     func contentsOfDirectory(at url: URL) throws -> [URL]
     func read(at url: URL) throws -> Data
     func writeAtomic(_ data: Data, to url: URL) throws
+    func writeAtomicExclusive(_ data: Data, to url: URL) throws
     func append(_ data: Data, to url: URL) throws
     func removeItem(at url: URL) throws
     /// Returns true when the path itself is a symlink or carries more than one
@@ -172,6 +173,14 @@ struct FoundationMissionFileWriter: MissionFileWriting {
     }
 
     func writeAtomic(_ data: Data, to url: URL) throws {
+        try writeAtomic(data, to: url, replacing: true)
+    }
+
+    func writeAtomicExclusive(_ data: Data, to url: URL) throws {
+        try writeAtomic(data, to: url, replacing: false)
+    }
+
+    private func writeAtomic(_ data: Data, to url: URL, replacing: Bool) throws {
         let directory = url.deletingLastPathComponent()
         if !directoryExists(at: directory) {
             try createDirectory(at: directory)
@@ -187,10 +196,10 @@ struct FoundationMissionFileWriter: MissionFileWriting {
         }
         let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
         var closed = false
-        var renamed = false
+        var committed = false
         defer {
             if !closed { try? handle.close() }
-            if !renamed {
+            if !committed {
                 try? fileManager.removeItem(at: temporaryURL)
             }
         }
@@ -201,16 +210,33 @@ struct FoundationMissionFileWriter: MissionFileWriting {
         try handle.close()
         closed = true
         try fault?(.rename, url)
-        guard Darwin.rename(temporaryURL.path, url.path) == 0 else {
-            throw MissionStoreError.atomicWriteFailed("atomic_rename_failed")
+        if replacing {
+            guard Darwin.rename(temporaryURL.path, url.path) == 0 else {
+                throw MissionStoreError.atomicWriteFailed("atomic_rename_failed")
+            }
+        } else {
+            // `link` is an atomic create-if-absent commit on the same file
+            // system. Unlike rename(2), it cannot replace an immutable
+            // boundary or completion manifest between the preflight and the
+            // commit syscall.
+            guard Darwin.link(temporaryURL.path, url.path) == 0 else {
+                throw MissionStoreError.atomicWriteFailed(
+                    errno == EEXIST ? "destination_exists" : "atomic_link_failed")
+            }
+            guard Darwin.unlink(temporaryURL.path) == 0 else {
+                throw MissionStoreError.atomicWriteFailed("temporary_unlink_failed")
+            }
         }
-        renamed = true
+        committed = true
         // The rename itself must survive a power loss, which requires fsync on
         // the containing directory, not only on the file.
         let directoryDescriptor = Darwin.open(directory.path, O_RDONLY | O_DIRECTORY)
-        if directoryDescriptor >= 0 {
-            _ = Darwin.fsync(directoryDescriptor)
-            Darwin.close(directoryDescriptor)
+        guard directoryDescriptor >= 0 else {
+            throw MissionStoreError.atomicWriteFailed("directory_open_failed")
+        }
+        defer { Darwin.close(directoryDescriptor) }
+        guard Darwin.fsync(directoryDescriptor) == 0 else {
+            throw MissionStoreError.atomicWriteFailed("directory_fsync_failed")
         }
     }
 
@@ -327,6 +353,9 @@ struct MissionStore {
     // MARK: Checkpoint and manifest
 
     func writeLiveCheckpoint(_ checkpoint: MissionLiveCheckpoint) throws {
+        guard checkpoint.isWellFormed else {
+            throw MissionStoreError.checkpointUnreadable("malformed_checkpoint")
+        }
         let data = try encodeJSON(checkpoint)
         try writer.writeAtomic(data, to: liveCheckpointURL)
     }
@@ -367,14 +396,21 @@ struct MissionStore {
     func writeBoundary(_ boundary: MissionBoundaryRecord, unitIndex index: Int) throws
         -> MissionBoundaryRecord {
         guard index >= 1 else { throw MissionStoreError.invalidUnitIndex(index) }
+        guard boundary.isComplete,
+              boundary.outgoing?.unitIndex == index,
+              boundary.incoming?.unitIndex == index + 1 else {
+            throw MissionStoreError.missionNotComplete("boundary_incomplete")
+        }
         let url = boundariesRoot.appendingPathComponent(
             MissionLayout.boundaryFileName(unitIndex: index))
         guard !writer.fileExists(at: url) else {
             throw MissionStoreError.unitDirectoryExists(url.lastPathComponent)
         }
-        let data = try encodeJSON(boundary)
-        try writer.writeAtomic(data, to: url)
-        var committed = boundary
+        var onDisk = boundary
+        onDisk.fileSha256 = nil
+        let data = try encodeJSON(onDisk)
+        try writer.writeAtomicExclusive(data, to: url)
+        var committed = onDisk
         committed.fileSha256 = Self.sha256(of: data)
         return committed
     }
@@ -388,11 +424,20 @@ struct MissionStore {
                 throw MissionStoreError.linkDetected(url.lastPathComponent)
             }
             let data = try writer.read(at: url)
-            let record = try decodeJSON(MissionBoundaryRecord.self, from: data)
+            var record = try decodeJSON(MissionBoundaryRecord.self, from: data)
             guard record.format == MissionBoundaryRecord.format,
                   record.version == MissionBoundaryRecord.currentVersion else {
                 throw MissionStoreError.manifestUnreadable(url.lastPathComponent)
             }
+            guard record.isComplete else {
+                throw MissionStoreError.manifestUnreadable("boundary_incomplete")
+            }
+            guard let outgoingIndex = record.outgoing?.unitIndex,
+                  url.lastPathComponent
+                    == MissionLayout.boundaryFileName(unitIndex: outgoingIndex) else {
+                throw MissionStoreError.manifestUnreadable("boundary_filename_mismatch")
+            }
+            record.fileSha256 = Self.sha256(of: data)
             records.append(record)
         }
         return records.sorted { $0.boundaryId < $1.boundaryId }
@@ -408,6 +453,18 @@ struct MissionStore {
         boundaries: [MissionBoundaryRecord],
         completedAtUnix: TimeInterval
     ) throws -> MissionManifest {
+        guard missionId == identity.missionId, !missionId.isEmpty else {
+            throw MissionStoreError.missionNotComplete("mission_identity_mismatch")
+        }
+        guard completedAtUnix.isFinite, completedAtUnix >= 0 else {
+            throw MissionStoreError.missionNotComplete("completed_time_invalid")
+        }
+        guard !writer.fileExists(at: manifestURL), !writer.isLink(at: manifestURL) else {
+            throw MissionStoreError.missionNotComplete("manifest_already_exists")
+        }
+        guard !writer.fileExists(at: liveCheckpointURL), !writer.isLink(at: liveCheckpointURL) else {
+            throw MissionStoreError.missionNotComplete("live_checkpoint_present")
+        }
         guard !units.isEmpty else {
             throw MissionStoreError.missionNotComplete("no_units")
         }
@@ -420,6 +477,31 @@ struct MissionStore {
             throw MissionStoreError.missionNotComplete(
                 structural.map(\.code).joined(separator: ","))
         }
+        for unit in units {
+            let verified = try verifiedFinalizedUnit(unit, identity: identity)
+            guard verified.databaseSha256 == unit.databaseSha256,
+                  verified.metadataSha256 == unit.metadataSha256,
+                  verified.unitStorageBytes == unit.unitStorageBytes else {
+                throw MissionStoreError.missionNotComplete("unit_file_digest_mismatch")
+            }
+        }
+        let committedBoundaries = try readBoundaries()
+        guard committedBoundaries.count == boundaries.count else {
+            throw MissionStoreError.missionNotComplete("boundary_file_count_mismatch")
+        }
+        var committedByID: [String: MissionBoundaryRecord] = [:]
+        for boundary in committedBoundaries {
+            guard committedByID.updateValue(boundary, forKey: boundary.boundaryId) == nil else {
+                throw MissionStoreError.missionNotComplete("duplicate_boundary_file_id")
+            }
+        }
+        for boundary in boundaries {
+            guard let committed = committedByID[boundary.boundaryId],
+                  committed.fileSha256 == boundary.fileSha256,
+                  committed == boundary else {
+                throw MissionStoreError.missionNotComplete("boundary_file_mismatch")
+            }
+        }
         var manifest = MissionManifest(
             missionId: missionId,
             identity: identity,
@@ -429,7 +511,7 @@ struct MissionStore {
         manifest.integrity = "verified"
         manifest.publishPermitted = true
         let data = try encodeJSON(manifest)
-        try writer.writeAtomic(data, to: manifestURL)
+        try writer.writeAtomicExclusive(data, to: manifestURL)
         return manifest
     }
 
@@ -481,6 +563,10 @@ struct MissionStore {
             let metadataURL = segment.appendingPathComponent("metadata.json")
             let checkpointURL = segment.appendingPathComponent("live_checkpoint.json")
             let databaseURL = segment.appendingPathComponent("rtabmap_segment_0001.db")
+            for path in [segment, metadataURL, checkpointURL, databaseURL]
+            where writer.isLink(at: path) {
+                throw MissionStoreError.linkDetected(path.lastPathComponent)
+            }
             var finalized: Bool?
             let metadataPresent = writer.fileExists(at: metadataURL)
             if metadataPresent {
@@ -517,7 +603,23 @@ struct MissionStore {
         guard writer.isRegularFile(at: url), !writer.isLink(at: url) else {
             throw MissionStoreError.hashUnavailable(url.lastPathComponent)
         }
-        let handle = try FileHandle(forReadingFrom: url)
+        var before = Darwin.stat()
+        guard Darwin.lstat(url.path, &before) == 0,
+              (before.st_mode & S_IFMT) == S_IFREG,
+              before.st_nlink == 1 else {
+            throw MissionStoreError.hashUnavailable(url.lastPathComponent)
+        }
+        let descriptor = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW)
+        guard descriptor >= 0 else {
+            throw MissionStoreError.hashUnavailable(url.lastPathComponent)
+        }
+        var opened = Darwin.stat()
+        guard Darwin.fstat(descriptor, &opened) == 0,
+              sameFileIdentity(before, opened) else {
+            Darwin.close(descriptor)
+            throw MissionStoreError.hashUnavailable(url.lastPathComponent)
+        }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
         defer { try? handle.close() }
         var digest = SHA256()
         while true {
@@ -528,7 +630,24 @@ struct MissionStore {
                 break
             }
         }
+        var afterOpen = Darwin.stat()
+        var afterPath = Darwin.stat()
+        guard Darwin.fstat(descriptor, &afterOpen) == 0,
+              Darwin.lstat(url.path, &afterPath) == 0,
+              sameFileIdentity(before, afterOpen),
+              sameFileIdentity(before, afterPath) else {
+            throw MissionStoreError.hashUnavailable("\(url.lastPathComponent):changed_during_hash")
+        }
         return digest.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func sameFileIdentity(_ lhs: Darwin.stat, _ rhs: Darwin.stat) -> Bool {
+        lhs.st_dev == rhs.st_dev
+            && lhs.st_ino == rhs.st_ino
+            && lhs.st_size == rhs.st_size
+            && lhs.st_mtimespec.tv_sec == rhs.st_mtimespec.tv_sec
+            && lhs.st_mtimespec.tv_nsec == rhs.st_mtimespec.tv_nsec
+            && lhs.st_nlink == rhs.st_nlink
     }
 
     /// Seals a unit descriptor with the digests of the files that were actually
@@ -539,18 +658,163 @@ struct MissionStore {
         _ unit: MissionUnitDescriptor,
         finalizedAtUnix: TimeInterval
     ) throws -> MissionUnitDescriptor {
+        guard finalizedAtUnix.isFinite, finalizedAtUnix >= 0 else {
+            throw MissionStoreError.missionNotComplete("finalized_time_invalid")
+        }
         var sealed = unit
-        let databaseURL = root.appendingPathComponent(unit.databaseRelativePath)
-        let metadataURL = root.appendingPathComponent(unit.metadataRelativePath)
+        let databaseURL = try safeFileURL(relativePath: unit.databaseRelativePath)
+        let metadataURL = try safeFileURL(relativePath: unit.metadataRelativePath)
+        let metadataData = try writer.read(at: metadataURL)
+        guard let metadata = try JSONSerialization.jsonObject(with: metadataData)
+                as? [String: Any],
+              metadata["finalized"] as? Bool == true else {
+            throw MissionStoreError.missionNotComplete("metadata_not_finalized")
+        }
         sealed.databaseSha256 = try sha256OfFile(at: databaseURL)
         sealed.metadataSha256 = try sha256OfFile(at: metadataURL)
-        let attributes = try? FileManager.default.attributesOfItem(atPath: databaseURL.path)
-        if let size = attributes?[.size] as? NSNumber {
-            sealed.unitStorageBytes = size.uint64Value
-        }
+        sealed.unitStorageBytes = try totalRegularFileBytes(
+            under: root.appendingPathComponent(unit.relativePath, isDirectory: true))
         sealed.finalized = true
         sealed.finalizedAtUnix = finalizedAtUnix
         return sealed
+    }
+
+    private func verifiedFinalizedUnit(
+        _ unit: MissionUnitDescriptor,
+        identity: MissionIdentity
+    ) throws -> MissionUnitDescriptor {
+        let metadataURL = try safeFileURL(relativePath: unit.metadataRelativePath)
+        let data = try writer.read(at: metadataURL)
+        guard let metadata = try JSONSerialization.jsonObject(with: data)
+                as? [String: Any],
+              metadata["finalized"] as? Bool == true,
+              metadata["scanMode"] as? String == "continuous_streaming",
+              metadata["workflowMode"] as? String == "prior_map_localized",
+              metadata["missionId"] as? String == identity.missionId,
+              metadata["unitId"] as? String == unit.unitId,
+              metadata["unitIndex"] as? Int == unit.unitIndex,
+              metadata["trackingSessionId"] as? String == unit.trackingSessionId,
+              metadata["priorMapId"] as? String == identity.priorMapId,
+              metadata["priorMapSha256"] as? String == identity.priorMapPackageSha256,
+              metadata["storeId"] as? String == identity.storeId,
+              metadata["floorId"] as? String == identity.floorId,
+              (metadata["buildIdentity"] as? String
+                ?? metadata["appGitSHA"] as? String) == identity.buildIdentity,
+              metadata["previousUnitId"] as? String == unit.previousUnitId,
+              metadata["previousUnitMetadataSha256"] as? String
+                == unit.previousUnitMetadataSha256 else {
+            throw MissionStoreError.missionNotComplete("unit_metadata_identity_mismatch")
+        }
+        try validateRequiredSidecars(
+            segment: metadataURL.deletingLastPathComponent(), unit: unit)
+        return try finalizedUnitDescriptor(
+            unit, finalizedAtUnix: unit.finalizedAtUnix ?? -1)
+    }
+
+    private func validateRequiredSidecars(
+        segment: URL,
+        unit: MissionUnitDescriptor
+    ) throws {
+        let databaseURL = try safeFileURL(relativePath: unit.databaseRelativePath)
+        for suffix in ["-wal", "-shm", "-journal"]
+        where writer.fileExists(at: URL(fileURLWithPath: databaseURL.path + suffix)) {
+            throw MissionStoreError.missionNotComplete("database_residue_present")
+        }
+        let jsonShapes: [(String, Bool)] = [
+            ("price_tags.json", true),
+            ("scan_area_cells.json", false),
+            ("structure_coverage_cells.json", false),
+            ("trajectory_samples.json", true)
+        ]
+        for (name, allowsArray) in jsonShapes {
+            let url = segment.appendingPathComponent(name)
+            guard writer.isRegularFile(at: url), !writer.isLink(at: url) else {
+                throw MissionStoreError.missionNotComplete("sidecar_missing:\(name)")
+            }
+            let object = try JSONSerialization.jsonObject(with: writer.read(at: url))
+            let valid = object is [String: Any] || (allowsArray && object is [Any])
+            guard valid else {
+                throw MissionStoreError.missionNotComplete("sidecar_shape_invalid:\(name)")
+            }
+        }
+        for name in ["price_tags.csv", "trajectory_samples.csv"] {
+            let url = segment.appendingPathComponent(name)
+            guard writer.isRegularFile(at: url), !writer.isLink(at: url) else {
+                throw MissionStoreError.missionNotComplete("sidecar_missing:\(name)")
+            }
+            let data = try writer.read(at: url)
+            guard String(data: data, encoding: .utf8) != nil,
+                  data.isEmpty || data.last == 0x0A else {
+                throw MissionStoreError.missionNotComplete("sidecar_text_invalid:\(name)")
+            }
+        }
+        let eventsURL = segment.appendingPathComponent("scan_events.jsonl")
+        guard writer.isRegularFile(at: eventsURL), !writer.isLink(at: eventsURL) else {
+            throw MissionStoreError.missionNotComplete("sidecar_missing:scan_events.jsonl")
+        }
+        let eventData = try writer.read(at: eventsURL)
+        guard !eventData.isEmpty, eventData.last == 0x0A,
+              let eventText = String(data: eventData, encoding: .utf8) else {
+            throw MissionStoreError.missionNotComplete("sidecar_text_invalid:scan_events.jsonl")
+        }
+        for line in eventText.split(separator: "\n", omittingEmptySubsequences: false).dropLast() {
+            guard !line.isEmpty,
+                  let object = try JSONSerialization.jsonObject(with: Data(line.utf8))
+                    as? [String: Any],
+                  !object.isEmpty else {
+                throw MissionStoreError.missionNotComplete("sidecar_jsonl_invalid:scan_events.jsonl")
+            }
+        }
+    }
+
+    private func totalRegularFileBytes(under directory: URL) throws -> UInt64 {
+        guard writer.directoryExists(at: directory), !writer.isLink(at: directory) else {
+            throw MissionStoreError.unitDirectoryMissing(directory.lastPathComponent)
+        }
+        var pending = [directory]
+        var total: UInt64 = 0
+        while let current = pending.popLast() {
+            for child in try writer.contentsOfDirectory(at: current) {
+                if writer.isLink(at: child) {
+                    throw MissionStoreError.linkDetected(child.lastPathComponent)
+                }
+                if writer.directoryExists(at: child) {
+                    pending.append(child)
+                } else {
+                    guard writer.isRegularFile(at: child) else {
+                        throw MissionStoreError.hashUnavailable(child.lastPathComponent)
+                    }
+                    let attributes = try FileManager.default.attributesOfItem(atPath: child.path)
+                    guard let size = attributes[.size] as? NSNumber else {
+                        throw MissionStoreError.hashUnavailable(child.lastPathComponent)
+                    }
+                    let added = total.addingReportingOverflow(size.uint64Value)
+                    guard !added.overflow else {
+                        throw MissionStoreError.hashUnavailable("unit_size_overflow")
+                    }
+                    total = added.partialValue
+                }
+            }
+        }
+        return total
+    }
+
+    private func safeFileURL(relativePath: String) throws -> URL {
+        _ = try validatedMissionRelativePath(relativePath)
+        var cursor = root
+        for component in relativePath.split(separator: "/") {
+            cursor.appendPathComponent(String(component))
+            if writer.isLink(at: cursor) {
+                throw MissionStoreError.linkDetected(String(component))
+            }
+        }
+        let url = root.appendingPathComponent(relativePath).standardizedFileURL
+        guard url.path.hasPrefix(root.path + "/"),
+              writer.isRegularFile(at: url),
+              !writer.isLink(at: url) else {
+            throw MissionStoreError.pathEscape(relativePath)
+        }
+        return url
     }
 
     // MARK: Encoding

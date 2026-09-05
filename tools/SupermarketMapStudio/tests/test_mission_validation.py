@@ -7,11 +7,18 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 import mission_validation as mv
+
+
+PACKAGE_SHA = "a" * 64
+BUILD_IDENTITY = "build-20260905"
+EVIDENCE_SHA = "b" * 64
 
 
 def _sha256_bytes(payload: bytes) -> str:
@@ -46,12 +53,18 @@ def _metadata(
         "workflowMode": "prior_map_localized",
         "exportedAt": "2026-09-04 10:00:00",
         "knownAreaM2": 120.0,
-        "nodeCount": 500,
+        "nodeCount": 1,
         "trackingSessionId": f"tracking-{unit_id}",
+        "captureHealth": {
+            "localizationRequiredWriteFailureCount": 0,
+            "localizationEvidenceComplete": True,
+        },
+        "processingEligibility": {"status": "eligible", "blockers": []},
         "priorMapId": prior_map_id,
-        "priorMapSha256": "package-sha",
+        "priorMapSha256": PACKAGE_SHA,
         "storeId": store_id,
         "floorId": floor_id,
+        "buildIdentity": BUILD_IDENTITY,
         "missionId": "mission-0001",
         "missionFormatVersion": 1,
         "unitId": unit_id,
@@ -73,20 +86,45 @@ def _write_unit(
     name: str,
     metadata: dict,
     *,
-    database_bytes: bytes = b"sqlite-payload",
+    database_bytes: bytes | None = None,
     live_checkpoint: bool = False,
     segment_name: str = "segment_0001",
 ) -> Path:
     unit_dir = root / "units" / name
     segment_dir = unit_dir / segment_name
     segment_dir.mkdir(parents=True, exist_ok=True)
-    (segment_dir / "rtabmap_segment_0001.db").write_bytes(database_bytes)
+    database_path = segment_dir / "rtabmap_segment_0001.db"
+    if database_bytes is None:
+        _create_database(database_path)
+    else:
+        database_path.write_bytes(database_bytes)
     (segment_dir / "metadata.json").write_text(
         json.dumps(metadata, sort_keys=True), encoding="utf-8"
     )
     if live_checkpoint:
         (segment_dir / "live_checkpoint.json").write_text("{}", encoding="utf-8")
+    _write_required_sidecars(segment_dir)
     return unit_dir
+
+
+def _write_required_sidecars(segment_dir: Path) -> None:
+    (segment_dir / "price_tags.json").write_text("[]", encoding="utf-8")
+    (segment_dir / "price_tags.csv").write_text("barcode\n", encoding="utf-8")
+    (segment_dir / "scan_area_cells.json").write_text("{}", encoding="utf-8")
+    (segment_dir / "structure_coverage_cells.json").write_text("{}", encoding="utf-8")
+    (segment_dir / "trajectory_samples.json").write_text("[]", encoding="utf-8")
+    (segment_dir / "trajectory_samples.csv").write_text("timestamp\n", encoding="utf-8")
+    (segment_dir / "scan_events.jsonl").write_text(
+        '{"event":"scan_finalized"}\n', encoding="utf-8"
+    )
+
+
+def _create_database(path: Path) -> None:
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute("CREATE TABLE Node (id INTEGER PRIMARY KEY, stamp REAL)")
+        connection.execute("CREATE TABLE Data (image BLOB, depth BLOB, calibration BLOB)")
+        connection.execute("INSERT INTO Node VALUES (1, 1.0)")
+        connection.execute("INSERT INTO Data VALUES (?, ?, ?)", (b"i", b"d", b"c"))
 
 
 def _boundary(
@@ -99,8 +137,8 @@ def _boundary(
     incoming: bool = True,
     pose=(10.0, 20.0, 0.5),
 ) -> dict:
-    def end(unit_id: str, index: int) -> dict:
-        return {
+    def end(unit_id: str, index: int, *, outgoing_end: bool) -> dict:
+        value = {
             "unitId": unit_id,
             "unitIndex": index,
             "trackingSessionId": f"tracking-{unit_id}",
@@ -110,9 +148,12 @@ def _boundary(
             "confirmedX": pose[0],
             "confirmedY": pose[1],
             "confirmedYaw": pose[2],
-            "manualEventSha256": "manual-sha",
-            "startReceiptSha256": "receipt-sha",
         }
+        if outgoing_end:
+            value["manualEventSha256"] = EVIDENCE_SHA
+        else:
+            value["startReceiptSha256"] = "c" * 64
+        return value
 
     return {
         "format": mv.FORMAT_BOUNDARY,
@@ -120,7 +161,7 @@ def _boundary(
         "missionId": mission_id,
         "boundaryId": boundary_id,
         "priorMapId": "map-01",
-        "priorMapPackageSha256": "package-sha",
+        "priorMapPackageSha256": PACKAGE_SHA,
         "storeId": "store-01",
         "floorId": "F1",
         "fromUnitId": from_unit,
@@ -128,8 +169,12 @@ def _boundary(
         "confirmedX": pose[0],
         "confirmedY": pose[1],
         "confirmedYaw": pose[2],
-        "outgoing": end(from_unit, 1) if outgoing else None,
-        "incoming": end(to_unit, 2) if incoming else None,
+        "outgoing": end(
+            from_unit, int(from_unit.rsplit("-", 1)[-1]), outgoing_end=True
+        ) if outgoing else None,
+        "incoming": end(
+            to_unit, int(to_unit.rsplit("-", 1)[-1]), outgoing_end=False
+        ) if incoming else None,
         "createdAtUnix": 1.0,
         "committedAtUnix": 2.0,
     }
@@ -151,6 +196,8 @@ def _unit_entry(root: Path, unit_dir: Path, unit_id: str, index: int, previous: 
         "previousUnitMetadataSha256": previous.get("metadataSha256") if previous else None,
         "rolloverTrigger": "time_limit",
         "activeCaptureDurationS": 1800.0,
+        "unitStorageBytes": database_path.stat().st_size,
+        "finalizedAtUnix": 2.0 + index,
         "finalized": True,
     }
 
@@ -207,9 +254,10 @@ class MissionValidationTestCase(unittest.TestCase):
             "identity": {
                 "missionId": "mission-0001",
                 "priorMapId": "map-01",
-                "priorMapPackageSha256": "package-sha",
+                "priorMapPackageSha256": PACKAGE_SHA,
                 "storeId": "store-01",
                 "floorId": "F1",
+                "buildIdentity": BUILD_IDENTITY,
             },
             "units": entries,
             "boundaries": boundaries,
@@ -450,7 +498,8 @@ class MissionValidationTestCase(unittest.TestCase):
     def test_legacy_single_session_is_one_unit_mission(self) -> None:
         session = self.tmp / "SupermarketSession-20260904-090000"
         (session / "segment_0001").mkdir(parents=True)
-        (session / "segment_0001" / "rtabmap_segment_0001.db").write_bytes(b"db")
+        _create_database(session / "segment_0001" / "rtabmap_segment_0001.db")
+        _write_required_sidecars(session / "segment_0001")
         (session / "segment_0001" / "metadata.json").write_text(
             json.dumps(_metadata(unit_id="legacy", unit_index=1), sort_keys=True),
             encoding="utf-8",
@@ -463,7 +512,8 @@ class MissionValidationTestCase(unittest.TestCase):
     def test_legacy_session_with_live_checkpoint_is_rejected(self) -> None:
         session = self.tmp / "SupermarketSession-20260904-090001"
         (session / "segment_0001").mkdir(parents=True)
-        (session / "segment_0001" / "rtabmap_segment_0001.db").write_bytes(b"db")
+        _create_database(session / "segment_0001" / "rtabmap_segment_0001.db")
+        _write_required_sidecars(session / "segment_0001")
         metadata = _metadata(unit_id="legacy", unit_index=1)
         metadata["finalized"] = False
         (session / "segment_0001" / "metadata.json").write_text(
@@ -529,7 +579,8 @@ class MissionValidationTestCase(unittest.TestCase):
     def test_legacy_session_without_mission_fields_publishes(self) -> None:
         session = self.tmp / "SupermarketSession-20260801-080000"
         (session / "segment_0001").mkdir(parents=True)
-        (session / "segment_0001" / "rtabmap_segment_0001.db").write_bytes(b"db")
+        _create_database(session / "segment_0001" / "rtabmap_segment_0001.db")
+        _write_required_sidecars(session / "segment_0001")
         metadata = _metadata(unit_id="legacy", unit_index=1)
         metadata.pop("missionId")
         metadata.pop("unitId")
@@ -551,7 +602,7 @@ class MissionValidationTestCase(unittest.TestCase):
         self.assertFalse(report.publish_permitted)
         codes = {item.code for item in report.findings}
         self.assertIn("boundary_unit_id_missing", codes)
-        self.assertIn("boundary_missing", codes)
+        self.assertIn("boundary_manifest_file_mismatch", codes)
 
     def test_duplicate_boundary_id_is_fatal(self) -> None:
         root = self._make_mission(3)
@@ -599,6 +650,128 @@ class MissionValidationTestCase(unittest.TestCase):
         self.assertIn(
             "unit_live_checkpoint_present", {item.code for item in report.findings}
         )
+
+    def test_fake_database_and_missing_sidecar_are_fatal(self) -> None:
+        root = self._make_mission(1)
+        segment = root / "units" / "SupermarketSession-20260904-100000-U0001" / "segment_0001"
+        database = segment / "rtabmap_segment_0001.db"
+        database.write_bytes(b"sqlite-payload")
+        (segment / "trajectory_samples.json").unlink()
+        manifest_path = root / "mission_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["units"][0]["databaseSha256"] = _sha256_file(database)
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+        codes = {item.code for item in mv.validate_mission(root).findings}
+        self.assertIn("unit_database_invalid", codes)
+        self.assertIn("unit_sidecar_invalid", codes)
+
+    def test_foreign_unit_mission_identity_is_fatal(self) -> None:
+        root = self._make_mission(1)
+        metadata_path = root / "units" / "SupermarketSession-20260904-100000-U0001" / "segment_0001" / "metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata["missionId"] = "mission-foreign"
+        metadata_path.write_text(json.dumps(metadata, sort_keys=True), encoding="utf-8")
+        manifest_path = root / "mission_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["units"][0]["metadataSha256"] = _sha256_file(metadata_path)
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+        report = mv.validate_mission(root)
+        self.assertFalse(report.publish_permitted)
+        self.assertIn("mission_identity_drift", {item.code for item in report.findings})
+
+    def test_free_mapping_unit_is_not_a_prior_map_mission(self) -> None:
+        root = self._make_mission(1)
+        metadata_path = root / "units" / "SupermarketSession-20260904-100000-U0001" / "segment_0001" / "metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata["workflowMode"] = "free_mapping"
+        metadata_path.write_text(json.dumps(metadata, sort_keys=True), encoding="utf-8")
+        manifest_path = root / "mission_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["units"][0]["metadataSha256"] = _sha256_file(metadata_path)
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+        report = mv.validate_mission(root)
+        self.assertFalse(report.publish_permitted)
+        self.assertIn("unit_workflow_mode_invalid", {item.code for item in report.findings})
+
+        metadata["workflowMode"] = "prior_map_localized"
+        metadata["captureHealth"]["localizationRequiredWriteFailureCount"] = False
+        metadata_path.write_text(json.dumps(metadata, sort_keys=True), encoding="utf-8")
+        manifest["units"][0]["metadataSha256"] = _sha256_file(metadata_path)
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+        strict_report = mv.validate_mission(root)
+        self.assertFalse(strict_report.publish_permitted)
+        self.assertIn(
+            "unit_localization_evidence_incomplete",
+            {item.code for item in strict_report.findings},
+        )
+
+    def test_declared_paths_and_digests_are_mandatory(self) -> None:
+        root = self._make_mission(1)
+        manifest_path = root / "mission_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        unit = manifest["units"][0]
+        unit.pop("databaseSha256")
+        unit.pop("metadataSha256")
+        unit["databaseRelativePath"] = "../../foreign.db"
+        unit["metadataRelativePath"] = "units/other/metadata.json"
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+        codes = {item.code for item in mv.validate_mission(root).findings}
+        self.assertIn("mission_database_digest_missing", codes)
+        self.assertIn("mission_metadata_digest_missing", codes)
+        self.assertIn("mission_database_path_mismatch", codes)
+        self.assertIn("mission_metadata_path_mismatch", codes)
+
+    def test_unverified_manifest_and_live_checkpoint_never_publish(self) -> None:
+        root = self._make_mission(1)
+        manifest_path = root / "mission_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["integrity"] = "unverified"
+        manifest["publishPermitted"] = False
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+        (root / "mission_live_checkpoint.json").write_text("{}", encoding="utf-8")
+        report = mv.validate_mission(root)
+        codes = {item.code for item in report.findings}
+        self.assertFalse(report.publish_permitted)
+        self.assertIn("mission_live_checkpoint_present", codes)
+        self.assertIn("mission_manifest_integrity_unverified", codes)
+        self.assertIn("mission_manifest_publish_denied", codes)
+
+    def test_boundary_end_types_tracking_and_hashes_are_strict(self) -> None:
+        root = self._make_mission(2)
+        boundary_path = root / "boundaries" / "boundary_0001.json"
+        boundary = json.loads(boundary_path.read_text(encoding="utf-8"))
+        boundary["outgoing"]["nodeId"] = "101"
+        boundary["outgoing"]["nodeTimeSnapshotGeneration"] = -1
+        boundary["outgoing"]["trackingSessionId"] = "foreign-tracking"
+        boundary["outgoing"]["manualEventSha256"] = "missing"
+        boundary_path.write_text(json.dumps(boundary, sort_keys=True), encoding="utf-8")
+        manifest_path = root / "mission_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        declared = dict(boundary)
+        declared["fileSha256"] = _sha256_file(boundary_path)
+        manifest["boundaries"] = [declared]
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+        report = mv.validate_mission(root)
+        self.assertFalse(report.publish_permitted)
+        self.assertIn("boundary_outgoing_incomplete", {item.code for item in report.findings})
+
+    def test_extra_complete_nonadjacent_boundary_is_fatal(self) -> None:
+        root = self._make_mission(3)
+        extra = _boundary(
+            "mission-0001", "boundary-extra", "unit-0001", "unit-0003"
+        )
+        path = root / "boundaries" / "boundary_9999.json"
+        path.write_text(json.dumps(extra, sort_keys=True), encoding="utf-8")
+        declared = dict(extra)
+        declared["fileSha256"] = _sha256_file(path)
+        manifest_path = root / "mission_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["boundaries"].append(declared)
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+        report = mv.validate_mission(root)
+        codes = {item.code for item in report.findings}
+        self.assertFalse(report.publish_permitted)
+        self.assertTrue({"boundary_units_nonadjacent", "boundary_nonadjacent"} & codes)
 
     def test_report_is_json_serialisable(self) -> None:
         root = self._make_mission(2)

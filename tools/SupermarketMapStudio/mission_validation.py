@@ -26,6 +26,9 @@ import hashlib
 import json
 import math
 import os
+import sqlite3
+import stat
+from contextlib import closing
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -55,6 +58,14 @@ SEVERITY_WARNING = "warning"
 SEVERITY_INFO = "info"
 
 _READ_CHUNK = 1024 * 1024
+_MAX_JSON_BYTES = 128 * 1024 * 1024
+_REQUIRED_JSON_SIDECARS = {
+    "price_tags.json": list,
+    "scan_area_cells.json": dict,
+    "structure_coverage_cells.json": dict,
+    "trajectory_samples.json": (dict, list),
+}
+_REQUIRED_TEXT_SIDECARS = ("price_tags.csv", "trajectory_samples.csv")
 
 
 @dataclass
@@ -89,8 +100,13 @@ class UnitReport:
     active_capture_duration_s: Optional[float] = None
     rollover_trigger: Optional[str] = None
     prior_map_id: Optional[str] = None
+    prior_map_package_sha256: Optional[str] = None
     store_id: Optional[str] = None
     floor_id: Optional[str] = None
+    mission_id: Optional[str] = None
+    tracking_session_id: Optional[str] = None
+    build_identity: Optional[str] = None
+    node_count: Optional[int] = None
     findings: List[Finding] = field(default_factory=list)
 
     @property
@@ -161,16 +177,33 @@ class MissionReport:
 
 
 def sha256_file(path: Path) -> Optional[str]:
-    """SHA-256 of a regular file, or None when the file cannot be read."""
+    """Stable SHA-256 of one unlinked regular file."""
     digest = hashlib.sha256()
     try:
-        with open(path, "rb") as handle:
+        before = os.lstat(path)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            return None
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        opened = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+            os.close(descriptor)
+            return None
+        with os.fdopen(descriptor, "rb") as handle:
             while True:
                 chunk = handle.read(_READ_CHUNK)
                 if not chunk:
                     break
                 digest.update(chunk)
+            after_open = os.fstat(handle.fileno())
+        after = os.lstat(path)
     except OSError:
+        return None
+    identity = lambda value: (
+        value.st_dev, value.st_ino, value.st_size,
+        getattr(value, "st_mtime_ns", int(value.st_mtime * 1_000_000_000)),
+        value.st_nlink,
+    )
+    if identity(before) != identity(after_open) or identity(before) != identity(after):
         return None
     return digest.hexdigest()
 
@@ -183,7 +216,7 @@ def _is_link(path: Path) -> bool:
         info = os.lstat(path)
     except OSError:
         return False
-    if os.path.stat.S_ISDIR(info.st_mode):
+    if stat.S_ISDIR(info.st_mode):
         return False
     return int(getattr(info, "st_nlink", 1)) > 1
 
@@ -206,10 +239,19 @@ def _safe_relative_path(root: Path, candidate: Any) -> Tuple[Optional[Path], Opt
         # single-session shape, where the session directory holds segment_0001.
         return resolved_root, None
     candidate = resolved_root.joinpath(*parts)
-    if candidate.is_symlink():
-        # Reported before resolving so a link that escapes the root is named
-        # for what it is instead of looking like a plain missing directory.
-        return None, "link_detected"
+    cursor = resolved_root
+    for part in parts:
+        cursor = cursor / part
+        if not os.path.lexists(cursor):
+            continue
+        try:
+            info = os.lstat(cursor)
+        except OSError:
+            return None, "path_unreadable"
+        if stat.S_ISLNK(info.st_mode):
+            return None, "link_detected"
+        if stat.S_ISREG(info.st_mode) and info.st_nlink != 1:
+            return None, "link_detected"
     target = candidate.resolve()
     try:
         target.relative_to(resolved_root)
@@ -218,13 +260,49 @@ def _safe_relative_path(root: Path, candidate: Any) -> Tuple[Optional[Path], Opt
     return target, None
 
 
+def _stat_identity(value: os.stat_result) -> Tuple[int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        getattr(value, "st_mtime_ns", int(value.st_mtime * 1_000_000_000)),
+        value.st_nlink,
+    )
+
+
+def _read_regular_bytes(
+    path: Path, maximum_bytes: int = _MAX_JSON_BYTES
+) -> Tuple[Optional[bytes], Optional[str]]:
+    try:
+        before = os.lstat(path)
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                or before.st_size > maximum_bytes):
+            return None, "not_regular_or_size_limit"
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(descriptor, "rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if _stat_identity(before) != _stat_identity(opened):
+                return None, "identity_changed"
+            data = handle.read(maximum_bytes + 1)
+            after_open = os.fstat(handle.fileno())
+        after_path = os.lstat(path)
+        if len(data) > maximum_bytes:
+            return None, "size_limit"
+        if (_stat_identity(before) != _stat_identity(after_open)
+                or _stat_identity(before) != _stat_identity(after_path)):
+            return None, "identity_changed"
+        return data, None
+    except OSError as error:
+        return None, f"unreadable:{error.__class__.__name__}"
+
+
 def _read_json(path: Path) -> Tuple[Optional[Any], Optional[str]]:
     try:
-        if _is_link(path):
-            return None, "link_detected"
-        with open(path, "r", encoding="utf-8") as handle:
-            return json.load(handle), None
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        data, error = _read_regular_bytes(path)
+        if data is None:
+            return None, error
+        return json.loads(data.decode("utf-8")), None
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
         return None, f"unreadable:{error.__class__.__name__}"
 
 
@@ -233,6 +311,112 @@ def _finite_number(value: Any) -> Optional[float]:
         return None
     result = float(value)
     return result if math.isfinite(result) else None
+
+
+def _is_sha256(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(
+        character in "0123456789abcdefABCDEF" for character in value
+    )
+
+
+def _positive_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def _validate_database(path: Path) -> Tuple[Optional[int], Optional[str]]:
+    """Apply the existing PC production DB gate without importing server state."""
+    try:
+        uri = path.resolve().as_uri() + "?mode=ro&immutable=1"
+        with closing(sqlite3.connect(uri, uri=True)) as connection:
+            quick = connection.execute("PRAGMA quick_check").fetchone()
+            if not quick or quick[0] != "ok":
+                return None, f"quick_check:{quick[0] if quick else 'unknown'}"
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            if "Node" not in tables or "Data" not in tables:
+                return None, "required_tables_missing"
+            node_count = int(
+                connection.execute("SELECT count(*) FROM Node WHERE id > 0").fetchone()[0]
+            )
+            if node_count <= 0:
+                return None, "mapping_nodes_missing"
+            data_columns = {
+                str(row[1]) for row in connection.execute("PRAGMA table_info(Data)")
+            }
+            if not {"image", "depth", "calibration"}.issubset(data_columns):
+                return None, "rgbd_columns_missing"
+            rgbd_count = int(connection.execute(
+                "SELECT count(*) FROM Data "
+                "WHERE length(image)>0 AND length(depth)>0 AND length(calibration)>0"
+            ).fetchone()[0])
+            if rgbd_count <= 0:
+                return None, "rgbd_frames_missing"
+            node_columns = {
+                str(row[1]) for row in connection.execute("PRAGMA table_info(Node)")
+            }
+            if "stamp" in node_columns:
+                previous: Optional[float] = None
+                for (stamp_value,) in connection.execute(
+                    "SELECT stamp FROM Node WHERE id > 0 ORDER BY id"
+                ):
+                    if stamp_value is None:
+                        continue
+                    stamp_value = float(stamp_value)
+                    if previous is not None and stamp_value < previous:
+                        return None, "timestamp_regression"
+                    previous = stamp_value
+            return node_count, None
+    except (OSError, sqlite3.Error, TypeError, ValueError) as error:
+        return None, f"unreadable:{error.__class__.__name__}"
+
+
+def _validate_sidecars(segment: Path) -> List[Finding]:
+    findings: List[Finding] = []
+    for name, expected_type in _REQUIRED_JSON_SIDECARS.items():
+        path = segment / name
+        payload, error = _read_json(path)
+        if error is not None or not isinstance(payload, expected_type):
+            findings.append(_finding(
+                SEVERITY_FATAL,
+                "unit_sidecar_invalid",
+                f"{name}: {error or 'unexpected JSON shape'}",
+            ))
+    for name in _REQUIRED_TEXT_SIDECARS:
+        path = segment / name
+        try:
+            data, read_error = _read_regular_bytes(path)
+            if data is None:
+                raise OSError(read_error or "missing_or_linked")
+            if data and not data.endswith(b"\n"):
+                raise ValueError("missing_final_newline")
+            data.decode("utf-8")
+        except (OSError, UnicodeDecodeError, ValueError) as error:
+            findings.append(_finding(
+                SEVERITY_FATAL,
+                "unit_sidecar_invalid",
+                f"{name}: {error}",
+            ))
+    events = segment / "scan_events.jsonl"
+    try:
+        raw, read_error = _read_regular_bytes(events)
+        if raw is None:
+            raise OSError(read_error or "missing_or_linked")
+        if not raw or not raw.endswith(b"\n"):
+            raise ValueError("missing_final_newline")
+        for line in raw.decode("utf-8").splitlines():
+            if not line or not isinstance(json.loads(line), dict):
+                raise ValueError("invalid_jsonl_record")
+    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as error:
+        findings.append(_finding(
+            SEVERITY_FATAL, "unit_sidecar_invalid", f"scan_events.jsonl: {error}"
+        ))
+    return findings
 
 
 def _normalized_yaw_delta(lhs: float, rhs: float) -> float:
@@ -301,6 +485,14 @@ def validate_unit(
     metadata_path = segment / "metadata.json"
     database_path = segment / "rtabmap_segment_0001.db"
     live_checkpoint = segment / "live_checkpoint.json"
+    for suffix in ("-wal", "-shm", "-journal"):
+        residue = Path(str(database_path) + suffix)
+        if os.path.lexists(residue):
+            report.findings.append(_finding(
+                SEVERITY_FATAL,
+                "unit_database_residue_present",
+                residue.name,
+            ))
 
     # Link checks before any read: a linked database or metadata file must be
     # named as such, not silently followed.
@@ -325,6 +517,14 @@ def validate_unit(
             report.findings.append(
                 _finding(SEVERITY_FATAL, "unit_database_unreadable", relative_path)
             )
+        node_count, database_error = _validate_database(database_path)
+        report.node_count = node_count
+        if database_error is not None:
+            report.findings.append(_finding(
+                SEVERITY_FATAL,
+                "unit_database_invalid",
+                f"{relative_path}: {database_error}",
+            ))
 
     metadata, metadata_error = _read_json(metadata_path)
     if metadata is None or not isinstance(metadata, dict):
@@ -355,8 +555,23 @@ def validate_unit(
     if not report.unit_id:
         report.unit_id = None
     report.prior_map_id = metadata.get("priorMapId") if isinstance(metadata.get("priorMapId"), str) else None
+    report.prior_map_package_sha256 = (
+        metadata.get("priorMapSha256")
+        if isinstance(metadata.get("priorMapSha256"), str)
+        else None
+    )
     report.store_id = metadata.get("storeId") if isinstance(metadata.get("storeId"), str) else None
     report.floor_id = metadata.get("floorId") if isinstance(metadata.get("floorId"), str) else None
+    report.mission_id = (
+        metadata.get("missionId") if isinstance(metadata.get("missionId"), str) else None
+    )
+    report.tracking_session_id = (
+        metadata.get("trackingSessionId")
+        if isinstance(metadata.get("trackingSessionId"), str)
+        else None
+    )
+    build_value = metadata.get("buildIdentity") or metadata.get("appGitSHA")
+    report.build_identity = build_value if isinstance(build_value, str) else None
     report.previous_unit_id = (
         metadata.get("previousUnitId") if isinstance(metadata.get("previousUnitId"), str) else None
     )
@@ -385,17 +600,62 @@ def validate_unit(
                 )
             )
         report.unit_index = index_value
+    elif require_mission_fields:
+        report.findings.append(
+            _finding(SEVERITY_FATAL, "unit_index_missing", relative_path)
+        )
 
     if require_mission_fields:
         if not report.unit_id:
             report.findings.append(
                 _finding(SEVERITY_FATAL, "unit_id_missing", relative_path)
             )
-        mission_id = metadata.get("missionId")
-        if not isinstance(mission_id, str) or not mission_id:
+        if not report.mission_id:
             report.findings.append(
                 _finding(SEVERITY_FATAL, "unit_mission_id_missing", relative_path)
             )
+        for value, code in (
+            (report.tracking_session_id, "unit_tracking_session_missing"),
+            (report.prior_map_id, "unit_prior_map_id_missing"),
+            (report.store_id, "unit_store_id_missing"),
+            (report.floor_id, "unit_floor_id_missing"),
+            (report.build_identity, "unit_build_identity_missing"),
+        ):
+            if not value:
+                report.findings.append(_finding(SEVERITY_FATAL, code, relative_path))
+        if not _is_sha256(report.prior_map_package_sha256):
+            report.findings.append(_finding(
+                SEVERITY_FATAL, "unit_prior_map_digest_invalid", relative_path
+            ))
+        if report.workflow_mode != "prior_map_localized":
+            report.findings.append(_finding(
+                SEVERITY_FATAL, "unit_workflow_mode_invalid", relative_path
+            ))
+        capture_health = metadata.get("captureHealth")
+        eligibility = metadata.get("processingEligibility")
+        required_write_failures = (
+            capture_health.get("localizationRequiredWriteFailureCount")
+            if isinstance(capture_health, dict)
+            else None
+        )
+        if (
+            not isinstance(capture_health, dict)
+            or isinstance(required_write_failures, bool)
+            or required_write_failures != 0
+            or capture_health.get("localizationEvidenceComplete") is not True
+            or not isinstance(eligibility, dict)
+            or eligibility.get("status") != "eligible"
+            or eligibility.get("blockers") != []
+        ):
+            report.findings.append(_finding(
+                SEVERITY_FATAL,
+                "unit_localization_evidence_incomplete",
+                relative_path,
+            ))
+        if report.active_capture_duration_s is None or report.active_capture_duration_s < 0:
+            report.findings.append(_finding(
+                SEVERITY_FATAL, "unit_active_duration_invalid", relative_path
+            ))
     if report.finalized is not True:
         report.findings.append(
             _finding(SEVERITY_FATAL, "unit_not_finalized", relative_path)
@@ -404,6 +664,18 @@ def validate_unit(
         report.findings.append(
             _finding(SEVERITY_FATAL, "unit_scan_mode_invalid", relative_path)
         )
+    if require_mission_fields and report.node_count is not None:
+        declared_node_count = metadata.get("nodeCount")
+        if (not isinstance(declared_node_count, int)
+                or isinstance(declared_node_count, bool)
+                or declared_node_count != report.node_count):
+            report.findings.append(_finding(
+                SEVERITY_FATAL,
+                "unit_node_count_mismatch",
+                f"{relative_path}: metadata nodeCount does not match the database.",
+            ))
+    if require_mission_fields:
+        report.findings.extend(_validate_sidecars(segment))
     # lexists: a dangling symlink at the checkpoint path is still a checkpoint
     # as far as the PC is concerned and must block publication.
     if os.path.lexists(live_checkpoint):
@@ -425,10 +697,20 @@ def _relative(root: Path, path: Path) -> str:
 # --------------------------------------------------------------------------
 
 
-def _boundary_end_ok(end: Any, unit_id: Optional[str], pose: Tuple[float, float, float]) -> bool:
+def _boundary_end_ok(
+    end: Any,
+    unit: Optional[UnitReport],
+    pose: Tuple[float, float, float],
+    *,
+    required_hash: str,
+) -> bool:
     if not isinstance(end, dict):
         return False
-    if end.get("unitId") != unit_id:
+    if unit is None or end.get("unitId") != unit.unit_id:
+        return False
+    if _positive_int(end.get("unitIndex")) != unit.unit_index:
+        return False
+    if end.get("trackingSessionId") != unit.tracking_session_id:
         return False
     values = (
         _finite_number(end.get("confirmedX")),
@@ -444,9 +726,22 @@ def _boundary_end_ok(end: Any, unit_id: Optional[str], pose: Tuple[float, float,
         return False
     if _normalized_yaw_delta(confirmed_yaw, pose[2]) > YAW_TOLERANCE_RAD:
         return False
-    for required in ("nodeId", "nodeStamp", "nodeTimeSnapshotGeneration", "trackingSessionId"):
-        if end.get(required) is None:
-            return False
+    if _positive_int(end.get("nodeId")) is None:
+        return False
+    node_stamp = _finite_number(end.get("nodeStamp"))
+    if node_stamp is None or node_stamp < 0:
+        return False
+    if _positive_int(end.get("nodeTimeSnapshotGeneration")) is None:
+        return False
+    if not _is_sha256(end.get(required_hash)):
+        return False
+    optional_hash = (
+        "startReceiptSha256"
+        if required_hash == "manualEventSha256"
+        else "manualEventSha256"
+    )
+    if end.get(optional_hash) is not None and not _is_sha256(end.get(optional_hash)):
+        return False
     return True
 
 
@@ -487,6 +782,16 @@ def validate_boundary(
         report.findings.append(
             _finding(SEVERITY_FATAL, "boundary_id_missing", "Boundary has no identifier.")
         )
+    if not _is_sha256(report.file_sha256):
+        report.findings.append(
+            _finding(SEVERITY_FATAL, "boundary_digest_missing", boundary_id)
+        )
+    created = _finite_number(boundary.get("createdAtUnix"))
+    committed = _finite_number(boundary.get("committedAtUnix"))
+    if created is None or created < 0 or committed is None or committed < created:
+        report.findings.append(
+            _finding(SEVERITY_FATAL, "boundary_commit_time_invalid", boundary_id)
+        )
 
     pose_values = (
         _finite_number(boundary.get("confirmedX")),
@@ -504,10 +809,17 @@ def validate_boundary(
         pose_values[2],  # type: ignore[index]
     )
 
+    by_id = {unit.unit_id: unit for unit in units if unit.unit_id}
+    from_unit = by_id.get(report.from_unit_id)
+    to_unit = by_id.get(report.to_unit_id)
     outgoing = boundary.get("outgoing")
     incoming = boundary.get("incoming")
-    outgoing_ok = _boundary_end_ok(outgoing, report.from_unit_id, pose)
-    incoming_ok = _boundary_end_ok(incoming, report.to_unit_id, pose)
+    outgoing_ok = _boundary_end_ok(
+        outgoing, from_unit, pose, required_hash="manualEventSha256"
+    )
+    incoming_ok = _boundary_end_ok(
+        incoming, to_unit, pose, required_hash="startReceiptSha256"
+    )
     if not outgoing_ok:
         report.findings.append(
             _finding(SEVERITY_FATAL, "boundary_outgoing_incomplete", boundary_id)
@@ -528,6 +840,26 @@ def validate_boundary(
         report.findings.append(
             _finding(SEVERITY_FATAL, "boundary_unit_unknown", boundary_id)
         )
+    if from_unit and to_unit and (
+        from_unit.unit_index is None
+        or to_unit.unit_index != from_unit.unit_index + 1
+    ):
+        report.findings.append(
+            _finding(SEVERITY_FATAL, "boundary_units_nonadjacent", boundary_id)
+        )
+    expected_identity = {
+        "priorMapId": from_unit.prior_map_id if from_unit else None,
+        "priorMapPackageSha256": (
+            from_unit.prior_map_package_sha256 if from_unit else None
+        ),
+        "storeId": from_unit.store_id if from_unit else None,
+        "floorId": from_unit.floor_id if from_unit else None,
+    }
+    for key, expected in expected_identity.items():
+        if not expected or boundary.get(key) != expected:
+            report.findings.append(_finding(
+                SEVERITY_FATAL, "boundary_identity_mismatch", f"{boundary_id}:{key}"
+            ))
 
     report.complete = bool(
         outgoing_ok and incoming_ok and not any(
@@ -617,7 +949,7 @@ def validate_mission(root: Path) -> MissionReport:
     manifest_path = path / MANIFEST_NAME
     checkpoint_path = path / LIVE_CHECKPOINT_NAME
     has_manifest = manifest_path.is_file()
-    has_checkpoint = checkpoint_path.is_file()
+    has_checkpoint = os.path.lexists(checkpoint_path)
 
     if not has_manifest and not has_checkpoint:
         report.findings.append(
@@ -643,6 +975,13 @@ def validate_mission(root: Path) -> MissionReport:
         report.identity = running_state
         _collect_running_units(report, path, checkpoint)
         return report
+
+    if has_checkpoint:
+        report.findings.append(_finding(
+            SEVERITY_FATAL,
+            "mission_live_checkpoint_present",
+            "A completion manifest and live checkpoint cannot coexist.",
+        ))
 
 
     manifest, error = _read_json(manifest_path)
@@ -674,11 +1013,28 @@ def validate_mission(root: Path) -> MissionReport:
     identity = manifest.get("identity")
     if isinstance(identity, dict):
         report.identity = {
+            "mission_id": identity.get("missionId"),
             "prior_map_id": identity.get("priorMapId"),
             "prior_map_package_sha256": identity.get("priorMapPackageSha256"),
             "store_id": identity.get("storeId"),
             "floor_id": identity.get("floorId"),
+            "build_identity": identity.get("buildIdentity"),
         }
+        for key in (
+            "mission_id", "prior_map_id", "store_id", "floor_id", "build_identity"
+        ):
+            if not isinstance(report.identity.get(key), str) or not report.identity[key]:
+                report.findings.append(_finding(
+                    SEVERITY_FATAL, "mission_identity_incomplete", key
+                ))
+        if report.identity.get("mission_id") != report.mission_id:
+            report.findings.append(_finding(
+                SEVERITY_FATAL, "mission_identity_id_mismatch", MANIFEST_NAME
+            ))
+        if not _is_sha256(report.identity.get("prior_map_package_sha256")):
+            report.findings.append(_finding(
+                SEVERITY_FATAL, "mission_identity_digest_invalid", MANIFEST_NAME
+            ))
     else:
         report.findings.append(
             _finding(SEVERITY_FATAL, "mission_identity_missing", MANIFEST_NAME)
@@ -691,6 +1047,23 @@ def validate_mission(root: Path) -> MissionReport:
                 f"Unsupported maintenance policy version {manifest.get('policyVersion')}.",
             )
         )
+    completed_at = _finite_number(manifest.get("completedAtUnix"))
+    if completed_at is None or completed_at < 0:
+        report.findings.append(_finding(
+            SEVERITY_FATAL, "mission_completed_time_invalid", MANIFEST_NAME
+        ))
+    if manifest.get("integrity") != "verified":
+        report.findings.append(_finding(
+            SEVERITY_FATAL,
+            "mission_manifest_integrity_unverified",
+            "The phone did not commit integrity=verified.",
+        ))
+    if manifest.get("publishPermitted") is not True:
+        report.findings.append(_finding(
+            SEVERITY_FATAL,
+            "mission_manifest_publish_denied",
+            "The phone completion manifest did not permit publication.",
+        ))
 
     declared_units = manifest.get("units")
     if not isinstance(declared_units, list) or not declared_units:
@@ -813,7 +1186,11 @@ def _validate_units(report: MissionReport, root: Path, declared_units: List[Any]
         # The unit identity comes from the unit's own metadata, never from the
         # manifest: a manifest claim must not be able to name a unit whose
         # metadata declares no id.
-        if isinstance(entry.get("unitId"), str) and unit.unit_id != entry["unitId"]:
+        if not isinstance(entry.get("unitId"), str) or not entry["unitId"]:
+            report.findings.append(_finding(
+                SEVERITY_FATAL, "mission_unit_id_missing", relative, unit=index
+            ))
+        elif unit.unit_id != entry["unitId"]:
             report.findings.append(
                 _finding(
                     SEVERITY_FATAL,
@@ -822,6 +1199,26 @@ def _validate_units(report: MissionReport, root: Path, declared_units: List[Any]
                     unit=index,
                 )
             )
+        if entry.get("trackingSessionId") != unit.tracking_session_id:
+            report.findings.append(_finding(
+                SEVERITY_FATAL,
+                "mission_tracking_session_mismatch",
+                relative,
+                unit=index,
+            ))
+        for field_name, actual, suffix in (
+            ("databaseRelativePath", unit.database, "database"),
+            ("metadataRelativePath", unit.metadata_path, "metadata"),
+        ):
+            declared_path = entry.get(field_name)
+            _, path_error = _safe_relative_path(root, declared_path)
+            if path_error is not None or declared_path != actual:
+                report.findings.append(_finding(
+                    SEVERITY_FATAL,
+                    f"mission_{suffix}_path_mismatch",
+                    f"{relative}: declared {field_name} does not identify the validated file.",
+                    unit=index,
+                ))
         if unit.unit_id in seen_ids:
             report.findings.append(
                 _finding(SEVERITY_FATAL, "mission_duplicate_unit_id", str(unit.unit_id))
@@ -873,7 +1270,14 @@ def _validate_units(report: MissionReport, root: Path, declared_units: List[Any]
 def _validate_declared_digests(entry: Dict[str, Any], unit: UnitReport) -> List[Finding]:
     findings: List[Finding] = []
     declared_metadata = entry.get("metadataSha256")
-    if isinstance(declared_metadata, str) and unit.metadata_sha256:
+    if not _is_sha256(declared_metadata):
+        findings.append(_finding(
+            SEVERITY_FATAL,
+            "mission_metadata_digest_missing",
+            str(unit.relative_path),
+            unit=unit.unit_index,
+        ))
+    elif unit.metadata_sha256:
         if declared_metadata.lower() != unit.metadata_sha256.lower():
             findings.append(
                 _finding(
@@ -884,7 +1288,14 @@ def _validate_declared_digests(entry: Dict[str, Any], unit: UnitReport) -> List[
                 )
             )
     declared_database = entry.get("databaseSha256")
-    if isinstance(declared_database, str) and unit.database_sha256:
+    if not _is_sha256(declared_database):
+        findings.append(_finding(
+            SEVERITY_FATAL,
+            "mission_database_digest_missing",
+            str(unit.relative_path),
+            unit=unit.unit_index,
+        ))
+    elif unit.database_sha256:
         if declared_database.lower() != unit.database_sha256.lower():
             findings.append(
                 _finding(
@@ -895,8 +1306,15 @@ def _validate_declared_digests(entry: Dict[str, Any], unit: UnitReport) -> List[
                 )
             )
     declared_finalized = entry.get("finalized")
-    if isinstance(declared_finalized, bool) and unit.finalized is not None:
-        if declared_finalized != unit.finalized:
+    if declared_finalized is not True:
+        findings.append(_finding(
+            SEVERITY_FATAL,
+            "mission_finalized_flag_missing",
+            str(unit.relative_path),
+            unit=unit.unit_index,
+        ))
+    elif unit.finalized is not None:
+        if unit.finalized is not True:
             findings.append(
                 _finding(
                     SEVERITY_FATAL,
@@ -905,6 +1323,54 @@ def _validate_declared_digests(entry: Dict[str, Any], unit: UnitReport) -> List[
                     unit=unit.unit_index,
                 )
             )
+    finalized_at = _finite_number(entry.get("finalizedAtUnix"))
+    if finalized_at is None or finalized_at < 0:
+        findings.append(_finding(
+            SEVERITY_FATAL,
+            "mission_finalized_time_invalid",
+            str(unit.relative_path),
+            unit=unit.unit_index,
+        ))
+    duration = _finite_number(entry.get("activeCaptureDurationS"))
+    if duration is None or duration < 0 or duration != unit.active_capture_duration_s:
+        findings.append(_finding(
+            SEVERITY_FATAL,
+            "mission_active_duration_mismatch",
+            str(unit.relative_path),
+            unit=unit.unit_index,
+        ))
+    if entry.get("rolloverTrigger") not in {
+        "time_limit", "size_limit", "operator_stop", "safety_stop"
+    } or entry.get("rolloverTrigger") != unit.rollover_trigger:
+        findings.append(_finding(
+            SEVERITY_FATAL,
+            "mission_rollover_trigger_mismatch",
+            str(unit.relative_path),
+            unit=unit.unit_index,
+        ))
+    storage_bytes = entry.get("unitStorageBytes")
+    if (not isinstance(storage_bytes, int) or isinstance(storage_bytes, bool)
+            or storage_bytes <= 0):
+        findings.append(_finding(
+            SEVERITY_FATAL,
+            "mission_unit_storage_bytes_invalid",
+            str(unit.relative_path),
+            unit=unit.unit_index,
+        ))
+    if entry.get("previousUnitId") != unit.previous_unit_id:
+        findings.append(_finding(
+            SEVERITY_FATAL,
+            "mission_declared_previous_unit_mismatch",
+            str(unit.relative_path),
+            unit=unit.unit_index,
+        ))
+    if entry.get("previousUnitMetadataSha256") != unit.previous_unit_metadata_sha256:
+        findings.append(_finding(
+            SEVERITY_FATAL,
+            "mission_declared_previous_digest_mismatch",
+            str(unit.relative_path),
+            unit=unit.unit_index,
+        ))
     return findings
 
 
@@ -935,7 +1401,7 @@ def _validate_hash_chain(report: MissionReport) -> None:
                     unit=current.unit_index,
                 )
             )
-        if current.previous_unit_id and previous.unit_id and current.previous_unit_id != previous.unit_id:
+        if current.previous_unit_id != previous.unit_id:
             report.findings.append(
                 _finding(
                     SEVERITY_FATAL,
@@ -944,13 +1410,23 @@ def _validate_hash_chain(report: MissionReport) -> None:
                     unit=current.unit_index,
                 )
             )
+    if ordered and (
+        ordered[0].previous_unit_id is not None
+        or ordered[0].previous_unit_metadata_sha256 is not None
+    ):
+        report.findings.append(_finding(
+            SEVERITY_FATAL,
+            "mission_first_unit_has_predecessor",
+            "Unit 1 must not declare a predecessor.",
+            unit=ordered[0].unit_index,
+        ))
 
 
 def _validate_boundaries(
     report: MissionReport, root: Path, declared_boundaries: List[Any]
 ) -> None:
     boundaries_root = root / BOUNDARIES_DIRNAME
-    on_disk: Dict[str, Path] = {}
+    on_disk: Dict[str, List[Tuple[Path, Dict[str, Any], str]]] = {}
     if boundaries_root.is_dir():
         for candidate in sorted(boundaries_root.glob("boundary_*.json")):
             if _is_link(candidate):
@@ -958,41 +1434,84 @@ def _validate_boundaries(
                     _finding(SEVERITY_FATAL, "boundary_link_detected", candidate.name)
                 )
                 continue
-            payload = _read_json(candidate)[0]
-            if isinstance(payload, dict) and isinstance(payload.get("boundaryId"), str):
-                on_disk[payload["boundaryId"]] = candidate
+            payload, error = _read_json(candidate)
+            digest = sha256_file(candidate)
+            if (not isinstance(payload, dict)
+                    or not isinstance(payload.get("boundaryId"), str)
+                    or not digest):
+                report.findings.append(_finding(
+                    SEVERITY_FATAL,
+                    "boundary_file_unreadable",
+                    f"{candidate.name}: {error or 'invalid payload or unstable file'}",
+                ))
+                continue
+            on_disk.setdefault(payload["boundaryId"], []).append(
+                (candidate, payload, digest)
+            )
+    elif declared_boundaries:
+        report.findings.append(_finding(
+            SEVERITY_FATAL, "boundary_directory_missing", BOUNDARIES_DIRNAME
+        ))
 
     for entry in declared_boundaries:
-        boundary = validate_boundary(entry, report.mission_id or "", report.units)
-        if boundary.boundary_id in on_disk:
-            path = on_disk[boundary.boundary_id]
-            boundary.file = _relative(root, path)
-            digest = sha256_file(path)
-            if digest:
-                boundary.file_sha256 = digest
-                if boundary.file_sha256 and entry.get("fileSha256"):
-                    if str(entry["fileSha256"]).lower() != digest.lower():
-                        boundary.findings.append(
-                            _finding(
-                                SEVERITY_FATAL,
-                                "boundary_digest_mismatch",
-                                boundary.boundary_id,
-                            )
-                        )
-                        boundary.complete = False
-            else:
-                boundary.findings.append(
-                    _finding(SEVERITY_FATAL, "boundary_unreadable", boundary.boundary_id)
-                )
-                boundary.complete = False
-        else:
+        manifest_boundary = validate_boundary(
+            entry, report.mission_id or "", report.units
+        )
+        matches = on_disk.get(manifest_boundary.boundary_id, [])
+        if len(matches) != 1:
+            code = "boundary_file_missing" if not matches else "boundary_file_duplicate"
+            manifest_boundary.findings.append(
+                _finding(SEVERITY_FATAL, code, manifest_boundary.boundary_id)
+            )
+            manifest_boundary.complete = False
+            report.boundaries.append(manifest_boundary)
+            report.findings.extend(manifest_boundary.findings)
+            continue
+        path, disk_payload, digest = matches[0]
+        authoritative_payload = dict(disk_payload)
+        authoritative_payload["fileSha256"] = digest
+        boundary = validate_boundary(
+            authoritative_payload, report.mission_id or "", report.units
+        )
+        if manifest_boundary.findings:
+            boundary.findings.extend(manifest_boundary.findings)
+            boundary.complete = False
+        boundary.file = _relative(root, path)
+        boundary.file_sha256 = digest
+        if not isinstance(entry, dict) or not _is_sha256(entry.get("fileSha256")):
             boundary.findings.append(
                 _finding(
                     SEVERITY_FATAL,
-                    "boundary_file_missing",
-                    f"Boundary {boundary.boundary_id} has no file under {BOUNDARIES_DIRNAME}/.",
+                    "boundary_digest_missing",
+                    boundary.boundary_id,
                 )
             )
+            boundary.complete = False
+        elif str(entry["fileSha256"]).lower() != digest.lower():
+            boundary.findings.append(_finding(
+                SEVERITY_FATAL, "boundary_digest_mismatch", boundary.boundary_id
+            ))
+            boundary.complete = False
+        manifest_payload = dict(entry) if isinstance(entry, dict) else {}
+        manifest_payload.pop("fileSha256", None)
+        disk_comparable = dict(disk_payload)
+        disk_comparable.pop("fileSha256", None)
+        if manifest_payload != disk_comparable:
+            boundary.findings.append(_finding(
+                SEVERITY_FATAL,
+                "boundary_manifest_file_mismatch",
+                boundary.boundary_id,
+            ))
+            boundary.complete = False
+        from_unit = next(
+            (unit for unit in report.units if unit.unit_id == boundary.from_unit_id),
+            None,
+        )
+        if (from_unit is None or from_unit.unit_index is None
+                or path.name != f"boundary_{from_unit.unit_index:04d}.json"):
+            boundary.findings.append(_finding(
+                SEVERITY_FATAL, "boundary_filename_mismatch", path.name
+            ))
             boundary.complete = False
         report.boundaries.append(boundary)
         report.findings.extend(boundary.findings)
@@ -1034,6 +1553,12 @@ def _validate_boundaries(
 
     ordered = [unit for unit in report.units if unit.unit_index is not None]
     ordered.sort(key=lambda item: item.unit_index or 0)
+    if len(report.boundaries) != max(0, len(ordered) - 1):
+        report.findings.append(_finding(
+            SEVERITY_FATAL,
+            "boundary_count_invalid",
+            "The mission must declare exactly one boundary per adjacent unit pair.",
+        ))
     covered: set = set()
     for position in range(1, len(ordered)):
         previous = ordered[position - 1]
@@ -1070,12 +1595,12 @@ def _validate_boundaries(
                 )
             )
     for boundary in report.boundaries:
-        if boundary.boundary_id not in covered and not boundary.complete:
+        if boundary.boundary_id not in covered:
             report.findings.append(
                 _finding(
                     SEVERITY_FATAL,
-                    "boundary_incomplete",
-                    f"Boundary {boundary.boundary_id} is incomplete.",
+                    "boundary_nonadjacent",
+                    f"Boundary {boundary.boundary_id} does not link adjacent units.",
                 )
             )
 
@@ -1084,14 +1609,15 @@ def _validate_identity_consistency(report: MissionReport) -> None:
     expected = report.identity
     for unit in report.units:
         for key, value in (
+            ("mission_id", unit.mission_id),
             ("prior_map_id", unit.prior_map_id),
+            ("prior_map_package_sha256", unit.prior_map_package_sha256),
             ("store_id", unit.store_id),
             ("floor_id", unit.floor_id),
+            ("build_identity", unit.build_identity),
         ):
             declared = expected.get(key)
-            if declared is None:
-                continue
-            if value is not None and value != declared:
+            if not declared or not value or value != declared:
                 report.findings.append(
                     _finding(
                         SEVERITY_FATAL,
@@ -1100,6 +1626,13 @@ def _validate_identity_consistency(report: MissionReport) -> None:
                         unit=unit.unit_index,
                     )
                 )
+        if not unit.tracking_session_id:
+            report.findings.append(_finding(
+                SEVERITY_FATAL,
+                "mission_tracking_session_missing",
+                f"Unit {unit.unit_index} has no tracking session identity.",
+                unit=unit.unit_index,
+            ))
     # Boundary completeness is reported by _validate_boundaries, which knows
     # which boundary belongs to which adjacent pair.
 

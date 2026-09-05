@@ -8,9 +8,9 @@
 
 未实施：阶段 0 真机基线（故 `softMaxUnitBytes=nil`，字节门未启用）、阶段 2 iOS 强制 UX 与 exact-node 校准接线、阶段 3 自动封口与新单元启动、阶段 4 per-unit 处理编排与 Web 展示、阶段 5 真机资格与灰度，以及 §12.4 的 Mobile-Only 工作流状态扩展。
 
-本轮可执行证据：Swift macOS host 测试 **154 断言 PASS**（`tools/Qualification/swift-host-tests/run_periodic_maintenance_host_tests.sh`）、`test_mission_validation.py` **26/26 PASS**、Map Studio 全量 **174 例 PASS**、`py_compile` 与 mobile contracts `--check` PASS、新增文件对 iOS SDK `swiftc -typecheck` PASS、`SupermarketScanSession.swift` `-parse` PASS、`plutil -lint` 工程文件 PASS。**签名 iOS 全量构建因本机沙箱阻止 SwiftPM 解析未执行**，真机、现场与发布资格继续 **NO-GO / NOT PRODUCTION READY**。
+本轮审查整改后的可执行证据：Swift macOS host 测试 **173 断言 PASS**（`tools/Qualification/swift-host-tests/run_periodic_maintenance_host_tests.sh`）、`test_mission_validation.py` **33/33 PASS**、Map Studio 全量 **181 例 PASS**、Qualification **58/58 PASS**、`py_compile`、`SupermarketScanSession.swift` 与周期维护源码 `swiftc -parse`、`plutil -lint` 工程文件全部 PASS；修正 Xcode membership 后，**unsigned generic iPhoneOS Debug 全量编译/链接 PASS**，bundle identity 明确记录当前 feature 分支、dirty patch digest 与 `production_eligible=false`。**签名安装、真机运行与 clean Release exact-SHA 构建尚未执行**，现场与发布资格继续 **NO-GO / NOT PRODUCTION READY**。
 
-独立审查发现并已修复：PC 校验器两处 fail-open（unit 缺 `unitId`/`missionId` 或 boundary 缺 unit id 时 hash 链与 boundary 覆盖空过；缺少数据库/segment/metadata 的链接检查且 `live_checkpoint` 漏判悬挂符号链接）；恢复规划器对未被 checkpoint 引用的目录从“继续扫描”改为“隔离并需人工确认”。另补齐 5 项 P1：engine 状态→checkpoint 桥接、unit 封口摘要回填、rename 后父目录 fsync、分块流式 SHA-256、维护门内不采集增长样本。
+独立审查发现并已修复：PC 校验器不再仅凭文件存在和自报 SHA 放行，现会验证真实 SQLite quick-check/Node/RGB-D、required sidecar、定位证据水位、mission/map/package/store/floor/build/tracking identity、manifest 声明路径与必需摘要、previous hash 链，以及磁盘 boundary 内容、文件摘要、严格字段类型和相邻关系；`mission_manifest.json` 与任一 live checkpoint 并存、`integrity!=verified` 或 `publishPermitted!=true` 均关闭发布门。Swift 恢复规划不再默认未知 state/trigger/负 elapsed，也不会在缺当前 DB/checkpoint 证据时恢复幽灵扫描；finalization/next-unit 可恢复失败使用显式同事务重试，pending U0002 不再跳到 U0003，成功重试清除旧错误。手机 store 只允许完整 boundary 与真实 finalized unit/required sidecar/hash 链通过后使用 create-if-absent 原子提交不可变 manifest，稳定 SHA 会检查 inode/size/mtime/link identity，目录 fsync 失败显式上抛。`ScanLiveCheckpoint` mission 字段改为参与 synthesized Decodable 的 `var`，非法 active duration 不再写入 metadata；Xcode PBX 对象也已移回正确 section，两个新增 Swift 文件的生产 target membership 已由审计确认。
 
 2026-09-03 资源门重锚定、C-3 地图锚定遮挡重构与 C-1/C-2 判定窗口设计：
 

@@ -139,10 +139,9 @@
 		4EFD0F62259E341C00575D88 /* RTABMapApp.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4EFD0F61259E341C00575D88 /* RTABMapApp.cpp */; };
 		4EFD0F67259E38DE00575D88 /* NativeWrapper.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4EFD0F66259E38DE00575D88 /* NativeWrapper.cpp */; };
 		4EFD0F70259F847300575D88 /* background_renderer.cc in Sources */ = {isa = PBXBuildFile; fileRef = 4EFD0F6E259F847300575D88 /* background_renderer.cc */; };
-/* End PBXBuildFile section */
-
 		4EB100012FB0000100100001 /* PeriodicScanMaintenanceCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EB100012FB0000100100002 /* PeriodicScanMaintenanceCore.swift */; };
 		4EB100012FB0000200100001 /* PeriodicScanMaintenanceStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EB100012FB0000200100002 /* PeriodicScanMaintenanceStore.swift */; };
+/* End PBXBuildFile section */
 /* Begin PBXFileReference section */
 		44D4681D2D538A4100B094BA /* RTABMapApp.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; name = RTABMapApp.entitlements; path = RTABMapApp/RTABMapApp.entitlements; sourceTree = "<group>"; };
 		4E0D83822621F52C00C879AC /* Settings.bundle */ = {isa = PBXFileReference; lastKnownFileType = "wrapper.plug-in"; path = Settings.bundle; sourceTree = "<group>"; };
@@ -471,10 +470,9 @@
 		4EFD0F66259E38DE00575D88 /* NativeWrapper.cpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.cpp; name = NativeWrapper.cpp; path = RTABMapApp/NativeWrapper.cpp; sourceTree = SOURCE_ROOT; };
 		4EFD0F6E259F847300575D88 /* background_renderer.cc */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.cpp; name = background_renderer.cc; path = ../android/jni/background_renderer.cc; sourceTree = "<group>"; };
 		4EFD0F6F259F847300575D88 /* background_renderer.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; name = background_renderer.h; path = ../android/jni/background_renderer.h; sourceTree = "<group>"; };
-/* End PBXFileReference section */
-
 		4EB100012FB0000100100002 /* PeriodicScanMaintenanceCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PeriodicScanMaintenanceCore.swift; path = RTABMapApp/PeriodicScanMaintenanceCore.swift; sourceTree = "<group>"; };
 		4EB100012FB0000200100002 /* PeriodicScanMaintenanceStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PeriodicScanMaintenanceStore.swift; path = RTABMapApp/PeriodicScanMaintenanceStore.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
 /* Begin PBXFrameworksBuildPhase section */
 		4EE015BF259A2AF0008CCE65 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;

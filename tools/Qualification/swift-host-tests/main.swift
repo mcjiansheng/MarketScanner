@@ -92,9 +92,10 @@ func makeIdentity() -> MissionIdentity {
     MissionIdentity(
         missionId: "mission-0001",
         priorMapId: "map-01",
-        priorMapPackageSha256: "package-sha",
+        priorMapPackageSha256: String(repeating: "a", count: 64),
         storeId: "store-01",
-        floorId: "F1")
+        floorId: "F1",
+        buildIdentity: "build-20260905")
 }
 
 func makeUnit(
@@ -113,12 +114,21 @@ func makeUnit(
         finalized: finalized)
     unit.previousUnitId = previous?.unitId
     unit.previousUnitMetadataSha256 = previous?.metadataSha256
-    unit.metadataSha256 = "metadata-sha-\(index)"
-    unit.databaseSha256 = "database-sha-\(index)"
+    unit.metadataSha256 = String(repeating: String(index % 10), count: 64)
+    unit.databaseSha256 = String(repeating: String((index + 4) % 10), count: 64)
+    unit.rolloverTrigger = .timeLimit
+    unit.activeCaptureDurationS = 1800
+    unit.unitStorageBytes = 1024
+    unit.finalizedAtUnix = finalized ? 1_800_000_000 + Double(index) : nil
     return unit
 }
 
-func makeBoundaryEnd(unitId: String, index: Int, pose: (Double, Double, Double)) -> MissionBoundaryEnd {
+func makeBoundaryEnd(
+    unitId: String,
+    index: Int,
+    pose: (Double, Double, Double),
+    outgoing: Bool
+) -> MissionBoundaryEnd {
     MissionBoundaryEnd(
         unitId: unitId,
         unitIndex: index,
@@ -129,8 +139,8 @@ func makeBoundaryEnd(unitId: String, index: Int, pose: (Double, Double, Double))
         confirmedX: pose.0,
         confirmedY: pose.1,
         confirmedYaw: pose.2,
-        manualEventSha256: "manual-sha",
-        startReceiptSha256: "receipt-sha")
+        manualEventSha256: outgoing ? String(repeating: "b", count: 64) : nil,
+        startReceiptSha256: outgoing ? nil : String(repeating: "c", count: 64))
 }
 
 func makeBoundary(
@@ -151,8 +161,13 @@ func makeBoundary(
         confirmedX: pose.0,
         confirmedY: pose.1,
         confirmedYaw: pose.2)
-    record.outgoing = outgoing ? makeBoundaryEnd(unitId: from.unitId, index: from.unitIndex, pose: end) : nil
-    record.incoming = incoming ? makeBoundaryEnd(unitId: to.unitId, index: to.unitIndex, pose: end) : nil
+    record.outgoing = outgoing ? makeBoundaryEnd(
+        unitId: from.unitId, index: from.unitIndex, pose: end, outgoing: true) : nil
+    record.incoming = incoming ? makeBoundaryEnd(
+        unitId: to.unitId, index: to.unitIndex, pose: end, outgoing: false) : nil
+    record.createdAtUnix = 1
+    record.committedAtUnix = 2
+    record.fileSha256 = String(repeating: "d", count: 64)
     return record
 }
 
@@ -162,6 +177,11 @@ do {
     harness.section("time boundary 1799 / 1800 / 1801")
 
     var engine = makeEngine()
+    var invalidStart = PeriodicMaintenanceEngine(policy: makePolicy())
+    harness.expectEqual(
+        transitionError(invalidStart.startUnit(index: 2, at: 0)),
+        .invalidUnitIndex(expected: 1, actual: 2),
+        "the first unit cannot skip index 1")
     var tick = engine.tick(monotonic: 1799, unitBytes: nil)
     harness.expect(!tick.enteredGate, "1799 s must not close the gate")
     harness.expectEqual(engine.state, PeriodicMaintenanceState.warning, "state is warning inside the last 5 minutes")
@@ -337,6 +357,26 @@ do {
     recoverable.failUnitFinalization(code: "db_save_failed", message: "retry", sticky: false, at: 1810)
     harness.expectEqual(recoverable.state, PeriodicMaintenanceState.gate, "a recoverable save failure returns to the gate")
     harness.expect(!recoverable.blocksNextUnit, "a recoverable failure does not block the next unit")
+    harness.expect(
+        transitionSucceeded(recoverable.retryUnitFinalization(at: 1811)),
+        "a recoverable finalization failure can retry the same transaction")
+    harness.expectEqual(
+        recoverable.state, PeriodicMaintenanceState.finalizingUnit,
+        "the finalization retry does not reopen capture")
+
+    var preparationFailure = makeEngine()
+    _ = preparationFailure.tick(monotonic: 1800, unitBytes: nil)
+    _ = preparationFailure.beginAnchoring(at: 1800)
+    _ = preparationFailure.completeAnchoring(boundaryID: "boundary-1", at: 1805)
+    _ = preparationFailure.completeUnitFinalization(at: 1810)
+    preparationFailure.failNextUnitPreparation(
+        code: "receipt_failed", message: "retry", sticky: false, at: 1811)
+    harness.expectEqual(
+        preparationFailure.state, PeriodicMaintenanceState.gate,
+        "a recoverable next-unit failure returns to the closed gate")
+    harness.expect(
+        transitionSucceeded(preparationFailure.retryNextUnitPreparation(at: 1812)),
+        "next-unit preparation can retry without incrementing the index")
 }
 
 // MARK: 7. Safety priority (§5.3)
@@ -412,6 +452,14 @@ do {
     _ = tooFew.startUnit(index: 1, at: 0)
     tooFew.growth.record(monotonic: 0, bytes: 900)
     harness.expectEqual(tooFew.growth.projectedBytes(minimumSamples: 3, horizonS: 60), nil, "one sample cannot project a rate")
+
+    var saturated = StorageGrowthEstimator()
+    saturated.record(monotonic: 0, bytes: 0)
+    saturated.record(monotonic: 1, bytes: UInt64.max)
+    harness.expectEqual(
+        saturated.projectedBytes(minimumSamples: 2, horizonS: 10),
+        UInt64.max,
+        "an extreme projection saturates instead of trapping")
 }
 
 // MARK: 9. Path safety (§9.2)
@@ -519,9 +567,23 @@ do {
     func checkpoint(state: PeriodicMaintenanceState, elapsed: TimeInterval = 0) -> MissionLiveCheckpoint {
         var checkpoint = MissionLiveCheckpoint(
             missionId: "mission-0001", policyVersion: 1, identity: makeIdentity())
-        checkpoint.currentUnit = unit1
+        if state == .preparingNextUnit {
+            let finalized = makeUnit(index: 1, unitId: "unit-0001")
+            checkpoint.finalizedUnits = [finalized]
+            checkpoint.currentUnit = makeUnit(
+                index: 2, unitId: "unit-0002", previous: finalized, finalized: false)
+        } else {
+            checkpoint.currentUnit = unit1
+        }
         checkpoint.maintenanceState = state.rawValue
         checkpoint.activeCaptureElapsedS = elapsed
+        if state == .gate || state == .anchoring || state == .finalizingUnit
+            || state == .preparingNextUnit {
+            checkpoint.pendingTrigger = MaintenanceTrigger.timeLimit.rawValue
+        }
+        if state == .finalizingUnit || state == .preparingNextUnit {
+            checkpoint.pendingBoundaryId = "boundary-0001"
+        }
         return checkpoint
     }
 
@@ -617,6 +679,48 @@ do {
     harness.expect(bad.action == .operatorReview(reason: "maintenance_policy_invalid"), "an invalid policy is fail-closed")
     harness.expect(!bad.findings.isEmpty, "policy findings are reported")
 
+    var negativeElapsed = checkpoint(state: .scanning)
+    negativeElapsed.activeCaptureElapsedS = -1
+    let negative = planMissionRecovery(MissionRecoveryInput(
+        checkpoint: negativeElapsed,
+        observations: [],
+        monotonicNow: 0,
+        policy: policy))
+    harness.expect(
+        negative.action == .operatorReview(reason: "mission_checkpoint_malformed"),
+        "negative elapsed time cannot resume capture")
+
+    var unknownState = checkpoint(state: .scanning)
+    unknownState.maintenanceState = "unknown_state"
+    let unknown = planMissionRecovery(MissionRecoveryInput(
+        checkpoint: unknownState,
+        observations: [],
+        monotonicNow: 0,
+        policy: policy))
+    harness.expect(
+        unknown.action == .operatorReview(reason: "mission_checkpoint_malformed"),
+        "an unknown checkpoint state is fail-closed")
+
+    var missingTrigger = checkpoint(state: .gate)
+    missingTrigger.pendingTrigger = nil
+    let missing = planMissionRecovery(MissionRecoveryInput(
+        checkpoint: missingTrigger,
+        observations: [],
+        monotonicNow: 0,
+        policy: policy))
+    harness.expect(
+        missing.action == .operatorReview(reason: "mission_checkpoint_malformed"),
+        "a gate with no durable trigger is fail-closed")
+
+    let ghost = planMissionRecovery(MissionRecoveryInput(
+        checkpoint: checkpoint(state: .scanning, elapsed: 10),
+        observations: [],
+        monotonicNow: 0,
+        policy: policy))
+    harness.expect(
+        ghost.action == .operatorReview(reason: "current_unit_unobserved"),
+        "a scanning checkpoint without an observed database cannot resume")
+
     harness.expectEqual(
         nextMissionUnitIndex(
             checkpoint: checkpoint(state: .preparingNextUnit),
@@ -690,6 +794,17 @@ do {
     }
 
     let boundary = makeBoundary(from: unit1, to: makeUnit(index: 2, unitId: "unit-0002", previous: unit1))
+    do {
+        _ = try store.writeBoundary(
+            makeBoundary(
+                from: unit1,
+                to: makeUnit(index: 2, unitId: "unit-0002", previous: unit1),
+                incoming: false),
+            unitIndex: 1)
+        harness.expect(false, "an incomplete boundary must not be committed")
+    } catch is MissionStoreError {
+        harness.expect(true, "an incomplete boundary is refused before the immutable write")
+    }
     let committed = try store.writeBoundary(boundary, unitIndex: 1)
     harness.expect(committed.fileSha256 != nil, "the committed boundary carries its file digest")
     do {
@@ -700,6 +815,36 @@ do {
     }
     let boundaries = try store.readBoundaries()
     harness.expectEqual(boundaries.count, 1, "the boundary round-trips")
+
+    let duplicateBoundaryURL = store.boundariesRoot.appendingPathComponent("boundary_0002.json")
+    try fileManager.copyItem(
+        at: store.boundariesRoot.appendingPathComponent("boundary_0001.json"),
+        to: duplicateBoundaryURL)
+    do {
+        _ = try store.readBoundaries()
+        harness.expect(false, "a boundary file under the wrong index must not be accepted")
+    } catch is MissionStoreError {
+        harness.expect(true, "a boundary file under the wrong index is rejected without trapping")
+    }
+    try fileManager.removeItem(at: duplicateBoundaryURL)
+
+    let phantomRoot = base.appendingPathComponent("SupermarketMission-phantom", isDirectory: true)
+    let phantomStore = MissionStore(root: phantomRoot)
+    try phantomStore.createMissionRoot()
+    do {
+        _ = try phantomStore.writeManifest(
+            missionId: "mission-0001",
+            identity: makeIdentity(),
+            units: [makeUnit(index: 1, unitId: "unit-0001")],
+            boundaries: [],
+            completedAtUnix: 10)
+        harness.expect(false, "a descriptor cannot publish files that do not exist")
+    } catch is MissionStoreError {
+        harness.expect(true, "a phantom finalized unit cannot produce a manifest")
+    }
+    harness.expect(
+        !fileManager.fileExists(atPath: phantomStore.manifestURL.path),
+        "a failed phantom-unit check leaves no manifest")
 
     // Symlinked unit directories are refused instead of being followed.
     let outside = base.appendingPathComponent("outside", isDirectory: true)
@@ -854,9 +999,14 @@ do {
     harness.expectEqual(checkpoint.decodedPendingTrigger, .timeLimit, "the trigger is persisted")
     harness.expectEqual(checkpoint.lastError, nil, "no error is invented for a clean gate")
 
+    _ = engine.beginAnchoring(at: 1801)
+    _ = engine.completeAnchoring(boundaryID: "boundary-1", at: 1802)
     engine.failUnitFinalization(code: "db_save_failed", message: "retry", sticky: false, at: 1810)
     engine.apply(to: &checkpoint, at: 1810)
     harness.expectEqual(checkpoint.lastError, "db_save_failed", "the failure code is persisted")
+    _ = engine.retryUnitFinalization(at: 1811)
+    engine.apply(to: &checkpoint, at: 1811)
+    harness.expectEqual(checkpoint.lastError, nil, "a successful retry clears stale checkpoint errors")
 }
 
 // MARK: 19. Unit sealing fills the hash chain (review P1-5)
@@ -880,8 +1030,33 @@ do {
         try fileManager.createDirectory(at: segment, withIntermediateDirectories: true)
         try Data("database-\(index + 1)".utf8).write(
             to: segment.appendingPathComponent("rtabmap_segment_0001.db"))
-        try Data("metadata-\(index + 1)".utf8).write(
-            to: segment.appendingPathComponent("metadata.json"))
+        let unitID = "unit-\(String(format: "%04d", index + 1))"
+        let metadata = try JSONSerialization.data(withJSONObject: [
+            "finalized": true,
+            "scanMode": "continuous_streaming",
+            "workflowMode": "prior_map_localized",
+            "missionId": "mission-0001",
+            "unitId": unitID,
+            "unitIndex": index + 1,
+            "trackingSessionId": "tracking-\(unitID)",
+            "priorMapId": "map-01",
+            "priorMapSha256": String(repeating: "a", count: 64),
+            "storeId": "store-01",
+            "floorId": "F1",
+            "buildIdentity": "build-20260905"
+        ], options: [.sortedKeys])
+        try metadata.write(to: segment.appendingPathComponent("metadata.json"))
+        try Data("[]".utf8).write(to: segment.appendingPathComponent("price_tags.json"))
+        try Data("{}".utf8).write(to: segment.appendingPathComponent("scan_area_cells.json"))
+        try Data("{}".utf8).write(
+            to: segment.appendingPathComponent("structure_coverage_cells.json"))
+        try Data("[]".utf8).write(
+            to: segment.appendingPathComponent("trajectory_samples.json"))
+        try Data("barcode\n".utf8).write(to: segment.appendingPathComponent("price_tags.csv"))
+        try Data("timestamp\n".utf8).write(
+            to: segment.appendingPathComponent("trajectory_samples.csv"))
+        try Data("{\"event\":\"scan_finalized\"}\n".utf8).write(
+            to: segment.appendingPathComponent("scan_events.jsonl"))
     }
 
     let first = try store.finalizedUnitDescriptor(
@@ -891,6 +1066,14 @@ do {
     harness.expect(first.finalized, "sealing marks the unit finalized")
     harness.expect((first.unitStorageBytes ?? 0) > 0, "sealing records the database size")
 
+    let secondMetadataURL = secondDir
+        .appendingPathComponent("segment_0001/metadata.json")
+    var secondMetadata = (try JSONSerialization.jsonObject(
+        with: Data(contentsOf: secondMetadataURL)) as? [String: Any]) ?? [:]
+    secondMetadata["previousUnitId"] = first.unitId
+    secondMetadata["previousUnitMetadataSha256"] = first.metadataSha256
+    try JSONSerialization.data(withJSONObject: secondMetadata, options: [.sortedKeys])
+        .write(to: secondMetadataURL)
     var second = makeUnit(index: 2, unitId: "unit-0002", previous: first, finalized: false)
     second = try store.finalizedUnitDescriptor(second, finalizedAtUnix: 2)
     harness.expectEqual(
@@ -901,6 +1084,52 @@ do {
     let findings = validateMissionStructure(
         units: [first, second], boundaries: [boundary], identity: makeIdentity())
     harness.expect(findings.isEmpty, "a sealed two-unit mission validates: \(findings.map(\.code))")
+
+    let committedBoundary = try store.writeBoundary(boundary, unitIndex: 1)
+    let requiredSidecar = secondDir
+        .appendingPathComponent("segment_0001/price_tags.csv")
+    try fileManager.removeItem(at: requiredSidecar)
+    do {
+        _ = try store.writeManifest(
+            missionId: "mission-0001",
+            identity: makeIdentity(),
+            units: [first, second],
+            boundaries: [committedBoundary],
+            completedAtUnix: 3)
+        harness.expect(false, "a missing required sidecar must block the manifest")
+    } catch is MissionStoreError {
+        harness.expect(true, "required sidecars are verified before manifest commit")
+    }
+    try Data("barcode\n".utf8).write(to: requiredSidecar)
+    do {
+        _ = try store.writeManifest(
+            missionId: "foreign-mission",
+            identity: makeIdentity(),
+            units: [first, second],
+            boundaries: [committedBoundary],
+            completedAtUnix: 3)
+        harness.expect(false, "the manifest mission id must match its identity")
+    } catch is MissionStoreError {
+        harness.expect(true, "a mismatched top-level mission id is refused")
+    }
+    let manifest = try store.writeManifest(
+        missionId: "mission-0001",
+        identity: makeIdentity(),
+        units: [first, second],
+        boundaries: [committedBoundary],
+        completedAtUnix: 3)
+    harness.expect(manifest.publishPermitted, "verified files can produce a completion manifest")
+    do {
+        _ = try store.writeManifest(
+            missionId: "mission-0001",
+            identity: makeIdentity(),
+            units: [first, second],
+            boundaries: [committedBoundary],
+            completedAtUnix: 4)
+        harness.expect(false, "an immutable manifest must not be overwritten")
+    } catch is MissionStoreError {
+        harness.expect(true, "a second manifest write is refused")
+    }
 
     // A unit declared without digests cannot form a verifiable chain.
     let unsealed = validateMissionStructure(

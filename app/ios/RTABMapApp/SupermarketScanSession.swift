@@ -213,7 +213,7 @@ struct ScanMissionUnitBinding {
         metadata.previousUnitId = previousUnitId
         metadata.previousUnitMetadataSha256 = previousUnitMetadataSha256
         metadata.rolloverTrigger = rolloverTrigger
-        metadata.activeCaptureDurationS = activeCaptureDurationS
+        metadata.activeCaptureDurationS = sanitizedActiveCaptureDurationS
         metadata.maintenancePolicyVersion = maintenancePolicyVersion
         metadata.calibrationIntervalS = calibrationIntervalS
         metadata.boundaryCheckpointId = boundaryCheckpointId
@@ -753,16 +753,16 @@ struct ScanLiveCheckpoint: Codable {
     // A live checkpoint is a running-state snapshot, never a saved artifact.
     // These optional fields only add mission context for crash recovery; the
     // presence of `live_checkpoint.json` still means "not finalized".
-    let missionId: String? = nil
-    let missionFormatVersion: Int? = nil
-    let unitId: String? = nil
-    let unitIndex: Int? = nil
-    let rolloverTrigger: String? = nil
-    let activeCaptureElapsedS: Double? = nil
-    let nextMaintenanceAtActiveS: Double? = nil
-    let maintenancePolicyVersion: Int? = nil
-    let maintenanceState: String? = nil
-    let boundaryCheckpointId: String? = nil
+    var missionId: String? = nil
+    var missionFormatVersion: Int? = nil
+    var unitId: String? = nil
+    var unitIndex: Int? = nil
+    var rolloverTrigger: String? = nil
+    var activeCaptureElapsedS: Double? = nil
+    var nextMaintenanceAtActiveS: Double? = nil
+    var maintenancePolicyVersion: Int? = nil
+    var maintenanceState: String? = nil
+    var boundaryCheckpointId: String? = nil
 }
 
 struct ManualLocalizationEvent: Encodable {

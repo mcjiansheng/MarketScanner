@@ -98,10 +98,11 @@ GET  /api/jobs/<id>/localized/versions/<version>/artifact/<allowlisted-name>
 
 `POST /api/mission/inspect` 对 `SupermarketMission-*` 做严格输入检查（`tools/SupermarketMapStudio/mission_validation.py`），返回 `status = complete|partial|diagnostic|invalid`、`publish_permitted`、逐 unit 与逐 boundary 结论和 findings：
 
-- 只有存在 `mission_manifest.json` 才可能是 `complete`；只有 `mission_live_checkpoint.json` 的运行中任务一律 `diagnostic` 且 `publish_permitted=false`。
-- 每个 unit 仍按现有单会话规则校验：唯一 `segment_0001`、`continuous_streaming`、`finalized=true`、无 `live_checkpoint.json`、数据库可读。
-- unit index 必须 1..N 且 manifest 声明顺序必须升序；previous unit metadata SHA-256 链必须逐条对得上实际字节；相邻 unit 之间必须恰好一个 complete 双端 boundary。
-- symlink/hardlink、绝对路径、`..` 逃逸、重复 unit/boundary ID、manifest 虚报 `publishPermitted` 全部 fatal。
+- 只有存在不可变 `mission_manifest.json` 才可能是 `complete`；manifest 与 `mission_live_checkpoint.json` 并存、`integrity!=verified`、手机 `publishPermitted!=true`，或只有运行 checkpoint，均强制 `publish_permitted=false`。
+- 每个 unit 复用生产输入门：唯一 `segment_0001`、`continuous_streaming`、`prior_map_localized`、`finalized=true`、无 unit live checkpoint/SQLite WAL residue；数据库必须通过 quick-check 并含 Node 与完整 RGB-D，required sidecar 可稳定读取，定位证据 health/eligibility 完整。
+- mission/map package/store/floor/build、unit/tracking 身份必须非空且逐层一致；manifest 声明的 database/metadata 路径和 SHA-256 必须匹配磁盘真实文件，unit index 必须 1..N 升序，previous metadata hash 链逐条闭合。
+- 相邻 unit 之间必须恰好一个磁盘权威的 complete 双端 boundary；两端 node/index/generation/tracking/hash 类型严格且位姿一致。额外的完整非相邻 boundary、manifest 与 boundary 文件内容漂移也属于 fatal。
+- symlink/hardlink、中间路径链接、绝对路径、`..` 逃逸、读取期间文件身份变化、重复 unit/boundary ID 全部 fatal。
 - 旧版单个 `SupermarketSession-*` 按“一项只有一个 unit 的 legacy mission”读取，仍可处理。
 
 **尚未实现**：per-unit 处理编排、boundary-aware mission 聚合、Web 的 unit 时间轴/边界详情/下载，以及把 mission 作为 `POST /api/jobs` 的输入类型。在补齐前，PC 只能逐个 unit 处理，不能把多个源 DB 复制成一个可写 DB 再处理（需求 §11.2 明确禁止）。
