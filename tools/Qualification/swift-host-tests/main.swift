@@ -924,6 +924,35 @@ do {
             "an unexpected boundary file is named")
     }
     try fileManager.removeItem(at: unexpectedBoundary)
+
+    do {
+        _ = try store.unitURL(name: ".")
+        harness.expect(false, "the units directory cannot be addressed as a unit")
+    } catch let error as MissionStoreError {
+        harness.expect(error == .pathEscape("."), "a dot unit name is rejected")
+    }
+
+    try fileManager.removeItem(at: store.boundariesRoot)
+    try Data("not a directory".utf8).write(to: store.boundariesRoot)
+    do {
+        _ = try store.readBoundaries()
+        harness.expect(false, "a boundary directory replaced by a file must be refused")
+    } catch let error as MissionStoreError {
+        harness.expect(
+            error == .manifestUnreadable("boundaries"),
+            "a non-directory boundary root is named")
+    }
+
+    try fileManager.removeItem(at: store.unitsRoot)
+    try Data("not a directory".utf8).write(to: store.unitsRoot)
+    do {
+        _ = try store.observeUnits()
+        harness.expect(false, "a units directory replaced by a file must be refused")
+    } catch let error as MissionStoreError {
+        harness.expect(
+            error == .unitDirectoryMissing("units"),
+            "a non-directory units root is named")
+    }
 }
 
 // MARK: 14. Store fault injection

@@ -342,7 +342,7 @@ struct MissionStore {
     }
 
     func unitURL(name: String) throws -> URL {
-        guard !name.isEmpty, !name.contains("/") else {
+        guard !name.isEmpty, name != ".", !name.contains("/") else {
             throw MissionStoreError.pathEscape(name)
         }
         _ = try validatedMissionRelativePath("\(MissionLayout.unitsDirectoryName)/\(name)")
@@ -422,7 +422,12 @@ struct MissionStore {
         guard !writer.isLink(at: boundariesRoot) else {
             throw MissionStoreError.linkDetected(boundariesRoot.lastPathComponent)
         }
-        guard writer.directoryExists(at: boundariesRoot) else { return [] }
+        guard writer.directoryExists(at: boundariesRoot) else {
+            if writer.fileExists(at: boundariesRoot) {
+                throw MissionStoreError.manifestUnreadable(boundariesRoot.lastPathComponent)
+            }
+            return []
+        }
         var records: [MissionBoundaryRecord] = []
         for url in try writer.contentsOfDirectory(at: boundariesRoot) {
             if writer.isLink(at: url) {
@@ -559,7 +564,12 @@ struct MissionStore {
         guard !writer.isLink(at: unitsRoot) else {
             throw MissionStoreError.linkDetected(unitsRoot.lastPathComponent)
         }
-        guard writer.directoryExists(at: unitsRoot) else { return [] }
+        guard writer.directoryExists(at: unitsRoot) else {
+            if writer.fileExists(at: unitsRoot) {
+                throw MissionStoreError.unitDirectoryMissing(unitsRoot.lastPathComponent)
+            }
+            return []
+        }
         let directories = try writer.contentsOfDirectory(at: unitsRoot)
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
         var observations: [MissionRecoveryObservation] = []
