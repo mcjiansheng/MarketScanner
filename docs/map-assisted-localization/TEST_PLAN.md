@@ -1,6 +1,22 @@
 # 地图辅助定位阶段一至阶段三测试计划
 
-> 文档状态：**当前有效**。最后核对日期：2026-09-03。
+> 文档状态：**当前有效**。最后核对日期：2026-09-05。
+
+## 2026-09-05 周期强制校准与自动分卷（需求 §14 矩阵，仅覆盖阶段 1）
+
+自动化（已执行并 PASS）：
+
+1. **时间与提醒**：`tools/Qualification/swift-host-tests/main.swift` 的 1799/1800/1801 秒边界（1799 为 warning 且普通采集仍开、1800 立即关门）、Timer 延迟不额外给时间、提醒阶梯 5 min/1 min/30 s 各触发一次且不重复、时钟回拨记为异常且累计值不倒退、重启恢复累计值（恢复 1200 s 后再走 600 s 即到期，绝不会重新获得 30 分钟）。
+2. **强制门**：维护门内 `ordinaryNodeWrites / priceTagConfirmation / localizationCorrection` 全为 false，`oneShotAnchorNode` 仍为 true；`finalizingUnit / preparingNextUnit / terminalRecovery / completed` 为全关闭。
+3. **状态机**：`scanning` 不能直达 `finalizingUnit`；空 boundary id 不能开启封口；锚点失败回到 gate；`operator_stop / safety_stop` 不允许进入 `preparingNextUnit`；`completeNextUnitPreparation` 的 index 必须为 `current+1`。
+4. **安全优先级**：证据/数据库写失败、可用空间 <1 GiB、thermal critical 一律 `terminalRecovery` 且不开新卷；8 GiB 仅告警；安全门优先于时间与字节门。
+5. **字节门**：≥3 样本估计增长并预测未来 60 s；`softMaxUnitBytes=nil`（真机基线未冻结）时字节门不激活，不得宣称存在严格字节上限。
+6. **恢复幂等**：`finalizingUnit` 重试同 index、`preparingNextUnit` 重试同 next index、`finalized=false` 直判 terminal、无 checkpoint 目录一律隔离为 orphan、重复输入产生同一 idempotency key 与同一动作。
+7. **PC 校验**：`tools/SupermarketMapStudio/tests/test_mission_validation.py` 26 例——完整 4 单元可发布；缺卷/乱序/重复 index/断链/单边 boundary/符号链接/路径逃逸/运行中 mission/legacy 会话/manifest 虚报/缺 unit-mission 身份/缺 boundary unit id/重复 boundary id/链接数据库/悬挂 checkpoint 全部 `publish_permitted=false`。
+8. **原子提交故障注入**：rename/flush 阶段失败时不留任何半成品文件。
+9. **feature flag**：关闭时 engine 不开门、不发提醒、恢复规划不产生任何 mission 动作；开启后 engine 状态必须能写回 checkpoint（elapsed / state / pending trigger / last error）。
+
+尚未执行（功能未上线，按 §14.2/§14.3 必须补齐后才能声称完成）：签名 iOS 全量构建（本机沙箱阻止 SwiftPM 解析，本轮未执行）、iOS HUD/提醒/维护页手测、Dynamic Type/VoiceOver、真机 30 分钟/65 分钟/2 小时、4 单元 3 边界、20 次边界校准、热/低磁盘/强杀/外部存储矩阵、PC 处理编排与回放。
 
 ## 2026-09-03 资源门重锚定（取代 768 MiB 绝对门）
 
@@ -8,7 +24,8 @@
 
 1. **硬门：真机不闪退/不 OOM**，由 `performance_samples.jsonl`（内存轨迹）+ MetricKit（是否被系统杀）判定；已有一条 39.3 min 真机证据（进程峰值 1551 MB、系统可用最低 4592 MB、无崩溃，见 `IMPLEMENTATION_STATUS.md` 2026-09-03 条目）；
 2. **增长预警：与上一发布基线同规模峰值对比，增幅 >20% 必须给出原因说明**，不自动 fail；
-3. `localization_constraints.jsonl` 的 768 MiB **文件**上限（解析器防恶意输入）保持不变，与内存门无关。
+3. `localization_constraints.jsonl` 的 768 MiB **文件**上限（解析器防恶意输入）保持不变，与内存门无关；
+4. `tools/PriorMap/tests/test_prior_map.py` 中 `test_mobile_scale_evidence_streaming` 的测试断言已同步落地：废除了 `assertLess(..., 768 * 1024 * 1024)` 绝对断言，改为对比 15b339d 基线（747,192,320 字节）超幅 20% 时发出预警，测试判定与本规范完全统一。
 
 外部必测项中“C-1/C-2/C-3 Replay Pareto”相应变为：C-1/C-2 回放拟合（见 `C1_C2_JUDGMENT_WINDOW_DESIGN_2026-09-03.md`）；原 C-3 时长标定废弃，改为 C-3a 地图锚定遮挡分类的现场复核（无时长参数）。
 

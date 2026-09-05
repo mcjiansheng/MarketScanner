@@ -212,6 +212,20 @@ PC 输入 manifest v3 在既有 Recovery 证据之外绑定 burst sidecar，v4 �
 - 暂时打开控制中心、锁屏或发生系统中断后，恢复到同一条连续轨迹，不人为创建新子图。
 - `segment_0001` 仅为兼容早期 PC 工具保留的目录名，不表示生产模式仍会自动分段。
 
+### 大型门店周期强制校准与自动分卷（需求基线 + 阶段 1，功能未上线）
+
+现场反馈“门店都比较大，希望采集 30 分钟后强制位置校准并自动存盘”已固化为需求基线
+[`PERIODIC_MANUAL_CALIBRATION_AND_AUTO_ROLLOVER_REQUIREMENTS_2026-09-04.md`](docs/map-assisted-localization/PERIODIC_MANUAL_CALIBRATION_AND_AUTO_ROLLOVER_REQUIREMENTS_2026-09-04.md)。
+
+**当前现状：只有阶段 1（纯核心、schema 与恢复）已实现，且 feature flag 默认关闭。** 一次扫描仍然只产生一个连续 SQLite 数据库，手机端不会自动换卷，也不会强制校准：
+
+- `app/ios/RTABMapApp/PeriodicScanMaintenanceCore.swift`（新增）：Foundation-only 维护策略、单调有效采集计时、维护状态机、capture admission 门控、文件大小增长预测、mission/unit/boundary schema、崩溃恢复幂等规划器。
+- `app/ios/RTABMapApp/PeriodicScanMaintenanceStore.swift`（新增）：mission 目录布局、temp+fsync+rename 原子提交、SHA-256、symlink/hardlink 与路径逃逸拒绝。
+- `tools/SupermarketMapStudio/mission_validation.py`（新增）与 `POST /api/mission/inspect`：PC 侧严格 mission 校验（只读）。
+- `SupermarketScanSession.swift` 仅追加可选 mission 字段，旧数据仍可读，现有写入行为不变。
+
+**未实现**：真机 30 分钟/2 小时基线（故 `softMaxUnitBytes` 仍为 nil）、iOS HUD/提醒/不可跳过维护页、边界 exact-node 校准接线、自动封口与新单元启动、外部复制队列、Mobile-Only 工作流状态扩展、PC per-unit 处理编排与 Web 展示、真机资格与灰度。不得以本轮内容宣称周期强制校准或自动分卷已上线、已通过真机或现场验收。
+
 ### NFC 功能暂停
 
 当前项目暂停 NFC 相关功能的使用与开发。原因是 iOS 调起 Core NFC 会中断正在运行的摄像头采集，从而破坏连续扫描；同时，未具备相应认证、entitlement 和 provisioning profile 的 Apple 开发者账号无法在真机上调试 NFC。

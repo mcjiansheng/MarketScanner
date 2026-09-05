@@ -79,6 +79,7 @@ PC Map Studio result
 - `tools/PriorMap/offline_localization.py` 是阶段三派生 SE(2) 修正、价签重关联、质量门禁、人工编辑重放和导出实现。
 - `tools/PriorMap/localized_output_store.py` 在 POSIX/Windows 跨进程文件锁内管理 staging、不可变 version、成果 schema/hash 清单、输入身份和 current/published 单提交点原子指针；Windows 使用 write-through 原子移动，读取和 artifact 下载按 version 内清单及已打开文件字节再次复核完整性。
 - `SupermarketScanSession.swift` 只负责安全落盘和审计 sidecar；原始数据库仍是权威输入。
+- `PeriodicScanMaintenanceCore.swift` 是周期维护的 Foundation-only 决策核心（策略、单调计时、状态机、admission、字节增长预测、mission/unit/boundary schema、幂等恢复规划），不触碰文件、UI、定时器和墙上时间；`PeriodicScanMaintenanceStore.swift` 是它唯一的落盘实现（原子提交、SHA-256、链接与路径拒绝）。二者在 `PeriodicMaintenancePolicy.featureEnabled=false` 时不得改变任何现有采集行为。
 - `performance_samples.jsonl` 是独立可观测性 sidecar，不是 pose、地图坐标或发布授权。`tools/SupermarketMapStudio/performance_analysis.py` 流式校验并生成结果包性能工件；坏证据关闭性能资格但不删除有限地图数据。
 
 ## 安全边界
@@ -98,6 +99,7 @@ PC Map Studio result
 - NFC 入口保持关闭。
 - Vision 不创建 `AVCaptureSession`；检测、深度和相机位姿来自同一个 `ARFrame`。对齐快照按实际时间差和版本滞后分为 fresh/aging/stale，stale 观测强制复核。
 - Capture Mode 不暂停 ARSession、RTAB-Map、连续数据库、Clock、Pose、node creation 或 prior-map localization。Vision/preview/evidence/UI completion 全部受 generation gate；取消、系统中断、最终化和 prior-map unload 会统一失效旧工作。
+- 周期维护的维护门只允许“校准、存盘、重试、结束任务”四类动作，不提供跳过/稍后；维护门内普通节点、价签确认与定位修正必须为 0，仅 one-shot anchor node 例外。已封口 unit 禁止 reopen；`operator_stop`/`safety_stop` 不开启下一卷。`softMaxUnitBytes` 未由真机基线冻结前，不得宣称存在严格字节上限。功能整体未上线（见 `PERIODIC_MANUAL_CALIBRATION_AND_AUTO_ROLLOVER_REQUIREMENTS_2026-09-04.md`）。
 - session admission gate 是 localization/confirmation writer 与 finalization 的唯一线性化点。finalization 关闭新 admission 后等待所有已登记 transaction/reservation；已登记 writer 在取得序列化锁后不会被内部二次 finalization 检查误拒。finalization 排空在主线程之外完成，timeout 只改变等待提示，不允许在实际 drain 前半封口或发布 snapshot。
 - prior-map queue 在入队前和执行前都检查 generation 与 finalization；因此 drain sentinel 后排入的普通 ARFrame 任务不能更新 localizer 或写普通 Recovery。普通 frame-driven Recovery 显式使用 `allowDuringFinalization=false`，只有 terminal teardown/finalization Recovery 使用 true。
 - 原始价签观测先落盘，complete burst 再落盘，最终价签才允许用户明确确认。最终化与 PC reader 对每个 `observation_id / burst_id / frame_id / payload / symbology` 做精确交叉绑定，v2 tag 的 frame set 必须精确等于一个 verified complete burst，tag payload/symbology 必须与 burst 相等，burst sequence 必须为正且严格递增。schema-v2 depth observation 还必须精确匹配源数据库 node ID/stamp/map ID，并声明 `coordinate_frame=RTABMAP_BOUND_NODE_LOCAL`；最终位置只按 `P_final = T_final_node × P_node` 重投影。weak/recovering、低测量/低关联置信不能授权自动确认，但只要 complete burst、exact node 和 node-local 位置权威齐全，就保留为 `LOW_CONFIDENCE`；不足 3 帧、身份/图质量、exact node 或 node-local 位置权威缺失仍为 `RESCAN_REQUIRED`。历史 v1 的 prior-map `raw_map_position` 不再进入传播公式，只保留业务记录并要求重扫。

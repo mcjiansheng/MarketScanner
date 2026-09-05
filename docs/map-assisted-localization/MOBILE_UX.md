@@ -70,9 +70,21 @@ Vision 识别“条码”，不识别“这个条码印在商品包装还是 ESL
 - 原始导出要求 exact 单一 `segment_0001`、finalized、连续单库、tracking identity 一致、无 `live_checkpoint.json`，且数据库为普通单链接文件。复制前、目标复制后和源复制后重新计算完整 SHA-256 manifest；三者一致后写 `copy_verification.json` 与 `copy_package_manifest.json`。手机源始终保留，目标重名时创建 `-Export-yyyyMMdd-HHmmss[-N]`，失败仅清理本次未完成目标。
 - 导出按钮在复制期间禁用页面关闭、再次处理和再次导出，并显示校验、复制、SHA 复核和凭证写入进度。选择 Files/iCloud/外接存储目录时使用 security-scoped access，结束后释放。
 
+## 周期强制校准与自动分卷（尚未上线）
+
+需求基线见 [`PERIODIC_MANUAL_CALIBRATION_AND_AUTO_ROLLOVER_REQUIREMENTS_2026-09-04.md`](PERIODIC_MANUAL_CALIBRATION_AND_AUTO_ROLLOVER_REQUIREMENTS_2026-09-04.md)。目标交互（**当前代码中没有实现，不要对测试员或现场这样描述现状**）：
+
+- 常驻 HUD 显示“第 N 个文件 · 已采集 mm:ss”“距校准并存盘 mm:ss”、当前文件大小与状态（采集中/即将维护/请原地校准/正在存盘/正在创建新文件/可继续）；文字、颜色、图标共同表达，支持 Dynamic Type 与 VoiceOver，价签 overlay 不遮挡倒计时。
+- 剩余 5 分钟/1 分钟/30 秒各提醒一次；到点即关闭普通采集 admission（宽限 0 秒），全屏维护页不可通过点击背景、返回手势或“稍后”关闭。
+- 维护页三步：确认当前位置（复用现有 X/Y/yaw 选择器）→ 自动保存第 N 个文件（等待稳定节点 → 写入校准审计 → 保存数据库 → 封口证据 → 校验完成）→ 创建第 N+1 个文件。允许的操作只有“确认位置并存盘”“重新选择位置”“重试”“结束本次任务并安全存盘”。
+- 语义红线：`live_checkpoint.json` 只是运行状态摘要，**不是已存盘**；“已存盘”只在该 unit 满足 `metadata.finalized=true`、checkpoint 已清理、数据库脱离且本地文件仍在之后显示；“正在后台复制”不能替代本地已存盘。
+
+阶段 1 已落地的只是 Foundation-only 决策核心（`PeriodicScanMaintenanceCore.swift`/`PeriodicScanMaintenanceStore.swift`）与新增的可选 mission 字段，`featureEnabled` 默认 false；HUD、提醒、维护页、自动封口、新卷启动和 Mobile-Only 工作流状态扩展均未完成。
+
 ## 当前限制
 
 - 扫描中地图 HUD 仍以浮层叠加在现有相机/建图界面；本轮统一的是入口、地图库、配置和启动事务，不是对底层 RTAB-Map 渲染页面的整体重写。
+- 大型门店的 30 分钟强制校准、自动封口与新文件启动尚未接线，扫描期间仍只有一个连续数据库，文件大小不会自动受限。
 - ARKit 显示和记录完整连续，结构辅助计算按 2 Hz 节流，忙时丢弃新任务而不积压。
 - 二维 HUD 忽略 ARKit 竖直高度；原始连续数据库仍保留三维运动。
 - 当前扫描绑定一个楼层，不支持楼梯、电梯或其他跨楼层过程。

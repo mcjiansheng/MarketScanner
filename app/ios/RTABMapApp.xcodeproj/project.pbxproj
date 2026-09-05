@@ -141,6 +141,8 @@
 		4EFD0F70259F847300575D88 /* background_renderer.cc in Sources */ = {isa = PBXBuildFile; fileRef = 4EFD0F6E259F847300575D88 /* background_renderer.cc */; };
 /* End PBXBuildFile section */
 
+		4EB100012FB0000100100001 /* PeriodicScanMaintenanceCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EB100012FB0000100100002 /* PeriodicScanMaintenanceCore.swift */; };
+		4EB100012FB0000200100001 /* PeriodicScanMaintenanceStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EB100012FB0000200100002 /* PeriodicScanMaintenanceStore.swift */; };
 /* Begin PBXFileReference section */
 		44D4681D2D538A4100B094BA /* RTABMapApp.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; name = RTABMapApp.entitlements; path = RTABMapApp/RTABMapApp.entitlements; sourceTree = "<group>"; };
 		4E0D83822621F52C00C879AC /* Settings.bundle */ = {isa = PBXFileReference; lastKnownFileType = "wrapper.plug-in"; path = Settings.bundle; sourceTree = "<group>"; };
@@ -471,6 +473,8 @@
 		4EFD0F6F259F847300575D88 /* background_renderer.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; name = background_renderer.h; path = ../android/jni/background_renderer.h; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
+		4EB100012FB0000100100002 /* PeriodicScanMaintenanceCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PeriodicScanMaintenanceCore.swift; path = RTABMapApp/PeriodicScanMaintenanceCore.swift; sourceTree = "<group>"; };
+		4EB100012FB0000200100002 /* PeriodicScanMaintenanceStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PeriodicScanMaintenanceStore.swift; path = RTABMapApp/PeriodicScanMaintenanceStore.swift; sourceTree = "<group>"; };
 /* Begin PBXFrameworksBuildPhase section */
 		4EE015BF259A2AF0008CCE65 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
@@ -526,6 +530,8 @@
 				4EA400012F30000100100002 /* PriorMapLocalization.swift */,
 				4EA400012F30000100100004 /* PriorMapLocalizationCore.swift */,
 				4EA700012F60000100100002 /* SupermarketFinalizationCore.swift */,
+				4EB100012FB0000100100002 /* PeriodicScanMaintenanceCore.swift */,
+				4EB100012FB0000200100002 /* PeriodicScanMaintenanceStore.swift */,
 				4EA700012F60000200100002 /* RecoveryLifecyclePersistenceCore.swift */,
 				4EA700012F60000300100002 /* RecoveryLifecycleEvidenceParser.swift */,
 				4EA700012F60000400100002 /* StrictJSONScalar.swift */,
@@ -1016,6 +1022,8 @@
 				4EA400012F30000100100001 /* PriorMapLocalization.swift in Sources */,
 				4EA400012F30000100100003 /* PriorMapLocalizationCore.swift in Sources */,
 				4EA700012F60000100100001 /* SupermarketFinalizationCore.swift in Sources */,
+				4EB100012FB0000100100001 /* PeriodicScanMaintenanceCore.swift in Sources */,
+				4EB100012FB0000200100001 /* PeriodicScanMaintenanceStore.swift in Sources */,
 				4EA700012F60000200100001 /* RecoveryLifecyclePersistenceCore.swift in Sources */,
 				4EA700012F60000300100001 /* RecoveryLifecycleEvidenceParser.swift in Sources */,
 				4EA700012F60000400100001 /* StrictJSONScalar.swift in Sources */,

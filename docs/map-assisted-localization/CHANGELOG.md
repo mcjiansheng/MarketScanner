@@ -1,6 +1,21 @@
 # 地图辅助定位变更记录
 
-> 文档状态：**当前有效**。最后核对日期：2026-09-03。
+> 文档状态：**当前有效**。最后核对日期：2026-09-05。
+
+## 2026-09-05 — 大型门店周期强制人工校准与自动分卷：需求基线 + 阶段 1 核心（**功能未上线**）
+
+新增需求基线 [`PERIODIC_MANUAL_CALIBRATION_AND_AUTO_ROLLOVER_REQUIREMENTS_2026-09-04.md`](PERIODIC_MANUAL_CALIBRATION_AND_AUTO_ROLLOVER_REQUIREMENTS_2026-09-04.md)，把现场反馈“门店都比较大，希望采集 30 分钟后强制位置校准并自动存盘”拆成定位质量、文件规模与一线操作三个问题，并给出 P0 只对 `prior_map_localized` 开放的产品结论。
+
+**本轮只完成需求文档 §13 的阶段 1（纯核心、schema 与恢复），且 feature flag 默认关闭：**
+
+- `app/ios/RTABMapApp/PeriodicScanMaintenanceCore.swift`（新增，Foundation-only）：维护策略与策略自校验、`ProcessInfo.systemUptime` 单调累计（后台/维护门/封口/换卷不计入有效采集时间）、`scanning→warning→gate→anchoring→finalizingUnit→preparingNextUnit→scanning` 状态机与严格边、capture admission 门控（维护门内普通节点/价签确认/定位修正全部关闭，仅保留 one-shot anchor node）、文件大小增长预测与字节软门、mission/unit/boundary schema、崩溃恢复幂等规划器。
+- `app/ios/RTABMapApp/PeriodicScanMaintenanceStore.swift`（新增）：mission 目录布局与 `U%04d` 无碰撞命名、temp+fsync+rename 原子提交、SHA-256、`lstat` 级 symlink/hardlink 拒绝、路径逃逸拒绝、可注入故障。
+- `SupermarketScanSession.swift`：`ScanSegmentMetadata` 与 `ScanLiveCheckpoint` 末尾追加可选 mission/unit/maintenance 字段（旧数据仍解码 nil），新增 `ScanMissionUnitBinding`；**未改动任何现有写入行为**，`continuousStreamingSegmentIndex` 固定为 1，不产生 `segment_0002`。
+- `tools/SupermarketMapStudio/mission_validation.py`（新增）+ `server.py` 新增只读 `POST /api/mission/inspect`：按 §11.1 做 mission 输入检查（manifest/identity、unit index 连续性、previous hash 链、双端 boundary、路径与链接拒绝、legacy 单 session 兼容）。运行中的 mission（只有 live checkpoint）判为 `diagnostic` 且 `publish_permitted=false`。
+- 测试：`tools/Qualification/swift-host-tests/`（macOS host，154 断言 PASS，覆盖 1799/1800/1801 秒边界、提醒阶梯、时钟回拨与重启恢复、admission、粘性失败、安全优先级、字节门、路径安全、boundary 双端、恢复幂等、原子写故障注入、feature flag 生效、checkpoint 桥接、unit 封口摘要回填、孤儿隔离、增长采样范围）；`tools/SupermarketMapStudio/tests/test_mission_validation.py`（26 例 PASS，覆盖缺卷/乱序/重复 index/断链/单边 boundary/符号链接/路径逃逸/运行中 mission/legacy 会话/manifest 虚报/缺 unit-mission 身份/缺 boundary unit id/重复 boundary id/链接数据库/悬挂 checkpoint）。既有 Map Studio 全量 174 例 PASS（新增 6 例），无回归。
+- 自审与独立审查修复：PC 校验器两处 fail-open（unit 缺 `unitId`/`missionId` 或 boundary 缺 unit id 时 hash 链与 boundary 覆盖检查会空过；数据库/segment/metadata 的链接检查缺失、`live_checkpoint` 用 `exists()` 漏判悬挂符号链接）已改为 fatal；恢复规划器在存在未被 checkpoint 引用的目录时改为隔离而不是继续（§10/§15）；`softMaxUnitBytes` 之外的 P1——engine 状态到 checkpoint 的桥接（`apply(to:at:)`）、unit 封口摘要回填（`finalizedUnitDescriptor`）、rename 后对父目录 fsync、数据库哈希改为分块流式——均已补齐并加测试；维护门内不再采集文件增长样本。
+
+**未实现（不要据此宣称功能上线或已通过真机验收）**：阶段 0 真机 30 分钟/2 小时基线（因此 `softMaxUnitBytes` 仍为 nil，字节门未启用）；阶段 2 iOS HUD/提醒/不可跳过维护页与 exact-node 校准接线；阶段 3 自动封口、新单元启动、incoming boundary 绑定与外部复制队列；阶段 4 的 per-unit 处理编排与 Web 展示；阶段 5 真机资格与灰度。当前生产行为仍然是“一次扫描一个连续 SQLite 数据库”，旧单 session 输入与终止保存路径无回归。文档 §12.4 的 Mobile-Only 工作流状态扩展也未实施。
 
 ## 2026-09-03 — 资源门重锚定、C-3 地图锚定遮挡、C-1/C-2 判定窗口设计
 

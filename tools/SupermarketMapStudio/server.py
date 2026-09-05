@@ -52,6 +52,7 @@ import offline_processing as offline
 import gpu_acceleration as gpu
 import merge_processing as merge
 import performance_analysis as phone_performance
+import mission_validation
 from PriorMap.prior_map_schema import validate_package as validate_prior_map_package
 from PriorMap.prior_map_compatibility import (
     PriorMapCompatibilityError,
@@ -4058,6 +4059,22 @@ class StudioHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/session/inspect":
                 self.send_json(HTTPStatus.OK, inspect_session(require_session(data.get("session"))))
+                return
+            if path == "/api/mission/inspect":
+                # Read-only strict validation of a SupermarketMission-* container.
+                # A running mission (live checkpoint only) is reported as
+                # diagnostic and is never publishable; processing and per-unit
+                # orchestration belong to phase 4 and are not wired here yet.
+                root = resolve_path(data.get("path"), "Mission directory")
+                try:
+                    root_stat = os.lstat(root)
+                except OSError as exc:
+                    raise RequestError(f"门店任务目录不可用：{exc}") from exc
+                if _is_link_or_reparse(root, root_stat) or not stat.S_ISDIR(
+                    root_stat.st_mode
+                ):
+                    raise RequestError("门店任务目录必须是真实目录，不能是符号链接或重解析点。")
+                self.send_json(HTTPStatus.OK, mission_validation.inspect_mission(root))
                 return
             if path == "/api/session/cleanup-finalized-checkpoint":
                 self.send_json(

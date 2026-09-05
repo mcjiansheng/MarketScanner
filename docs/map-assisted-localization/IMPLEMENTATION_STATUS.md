@@ -1,13 +1,23 @@
 # 地图辅助定位实现状态
 
-> 文档状态：**当前有效**。最后核对日期：2026-09-03。
+> 文档状态：**当前有效**。最后核对日期：2026-09-05。
+
+2026-09-05 大型门店周期强制人工校准与自动分卷（**阶段 1 完成，功能未上线**）：需求基线见 [`PERIODIC_MANUAL_CALIBRATION_AND_AUTO_ROLLOVER_REQUIREMENTS_2026-09-04.md`](PERIODIC_MANUAL_CALIBRATION_AND_AUTO_ROLLOVER_REQUIREMENTS_2026-09-04.md)。本轮落地该文档 §13 的阶段 1：`PeriodicScanMaintenanceCore.swift`（Foundation-only 策略/单调计时/状态机/admission/字节增长预测/mission-unit-boundary schema/幂等恢复规划）与 `PeriodicScanMaintenanceStore.swift`（原子提交、SHA-256、链接与路径拒绝）；`SupermarketScanSession.swift` 仅追加可选 mission 字段且保持旧数据可读；PC 侧新增 `mission_validation.py` 与只读 `POST /api/mission/inspect`。
+
+**feature flag `PeriodicMaintenancePolicy.featureEnabled` 默认 false，当前生产行为仍是“一次扫描一个连续 SQLite 数据库”**，不构成自动分卷、强制校准或周期存盘能力。
+
+未实施：阶段 0 真机基线（故 `softMaxUnitBytes=nil`，字节门未启用）、阶段 2 iOS 强制 UX 与 exact-node 校准接线、阶段 3 自动封口与新单元启动、阶段 4 per-unit 处理编排与 Web 展示、阶段 5 真机资格与灰度，以及 §12.4 的 Mobile-Only 工作流状态扩展。
+
+本轮可执行证据：Swift macOS host 测试 **154 断言 PASS**（`tools/Qualification/swift-host-tests/run_periodic_maintenance_host_tests.sh`）、`test_mission_validation.py` **26/26 PASS**、Map Studio 全量 **174 例 PASS**、`py_compile` 与 mobile contracts `--check` PASS、新增文件对 iOS SDK `swiftc -typecheck` PASS、`SupermarketScanSession.swift` `-parse` PASS、`plutil -lint` 工程文件 PASS。**签名 iOS 全量构建因本机沙箱阻止 SwiftPM 解析未执行**，真机、现场与发布资格继续 **NO-GO / NOT PRODUCTION READY**。
+
+独立审查发现并已修复：PC 校验器两处 fail-open（unit 缺 `unitId`/`missionId` 或 boundary 缺 unit id 时 hash 链与 boundary 覆盖空过；缺少数据库/segment/metadata 的链接检查且 `live_checkpoint` 漏判悬挂符号链接）；恢复规划器对未被 checkpoint 引用的目录从“继续扫描”改为“隔离并需人工确认”。另补齐 5 项 P1：engine 状态→checkpoint 桥接、unit 封口摘要回填、rename 后父目录 fsync、分块流式 SHA-256、维护门内不采集增长样本。
 
 2026-09-03 资源门重锚定、C-3 地图锚定遮挡重构与 C-1/C-2 判定窗口设计：
 
 **1. 去除 768 MiB tag-evidence host RSS 绝对门。** 依据仓库内两条真机长扫实测：`0815-sam-084247`（39.3 min / 442 样本）进程物理内存 153 MB 起步、峰值 **1551 MB**、收尾 943 MB，系统可用内存最低仍剩 4592 MB，thermal fair 336 / nominal 106，CPU 峰值 135%，FPS 稳定 ~29，电量 90%→70%，`performance_qualified=true`，全程无崩溃；`0815-sam-103145`（15.1 min）同样通过。真机实际内存行为已超过该门一倍而稳定运行，证明该门与设备事实脱节。新政策：**硬门 = 真机不闪退/不 OOM**，由 `performance_samples.jsonl` + MetricKit 判定；host 规模压力测试继续执行并继续报告真实输入字节/耗时/峰值 RSS，但改为与上一发布基线对比的**增长预警**，不再以绝对值 fail 流水线。768 MiB 仅保留为 `localization_constraints.jsonl` 的解析器防恶意输入**文件**上限（`contracts/mobile_only_v1r5_input_limits.json`），与内存门无关且不变。同时确认 400,000 条合成压力规模与真实会话相差数个数量级（真实会话 `tag_observations.jsonl` 为个位数行），该规模本身的合理性待重新论证。这不关闭 2 小时热/低磁盘/低内存矩阵与签名真机资格。
 **2. C-3 重构为 C-3a/C-3b（用户现场洞察）。** 行进速度 1–2 m/s 下，站立顾客/购物车在整个扫描区间内全程遮挡货架，**遮挡持续时长不携带任何信息**；“顾客停多久算静态”的原 C-3 标定项废弃。新规则（地图权威，S-1）：地图上已知的连续货架，其观测覆盖出现两侧均有观测的内部缺口 → 判定为静止遮挡物，**货架推定存在但未被观测**；缺口 <0.3 m 视为采样噪声，>2.5 m 不做存在断言、进复核。新增 `tools/PriorMap/shelf_occlusion_classifier.py` 与 14 例回归（14/14 PASS）；Swift 侧 `ShelfLocalizationPolicy` 同步新增 `mapAnchoredStaticOccluderMinGapM/MaxGapM` 常量与注释，`DynamicShelfEvidenceFilter` 行为不变（继续按跨帧一致性排除移动碎片，即 C-3b），manifest v5 四流合同字段零变更。0.3/2.5 m 为工程初值，现场复核可修订。
 **3. C-1/C-2 判定窗口设计冻结。** 见 [`C1_C2_JUDGMENT_WINDOW_DESIGN_2026-09-03.md`](C1_C2_JUDGMENT_WINDOW_DESIGN_2026-09-03.md)。判定逻辑均已存在（`ShelfTrackingStateMachine` 触发低置信、`ShelfLoopVerifier.accepts` 手机侧实时两侧一致性），本版冻结现场交互/显示/标签回收设计：C-2 = 现场横幅 + `核对位置` 入口（复用现有人工重定位选择器，`manual_localization_events.jsonl` 自动构成标定标签）；C-1 = 闭环确认绿色通知（不拦截），阈值标定走后期回放拟合。ViewController HUD 接线、真机可见性验证与阈值数值冻结不在本版。
-本轮可执行证据：新增回归 **14/14 PASS**、`swiftc -parse` 修改文件 PASS、`py_compile` PASS。unsigned 全量构建、exact-SHA CI、签名真机与现场资格均未执行；整体继续 **NO-GO / NOT PRODUCTION READY**。
+本轮可执行证据：新增回归 **14/14 PASS**、`tools/PriorMap/tests/test_prior_map.py` 资源门断言已与增长预警统一（移除 768 MiB 硬断言）、`swiftc -parse` 修改文件 PASS、`py_compile` PASS。unsigned 全量构建、exact-SHA CI、签名真机与现场资格均未执行；整体继续 **NO-GO / NOT PRODUCTION READY**。
 
 2026-08-30 第二轮审查与价签识别优化（分支 `fix/esl-field-capture-efficiency`，基线 `96def5e`）：以仓库内真实现场数据（14 会话 / 74 burst / 233 观察）回测，确认价签链路端到端成功率为 **0%**，并定位到三道门叠加失效。修复后回测为 **64.9%**，单次采集均值耗时 4.00 s → 1.14 s。
 

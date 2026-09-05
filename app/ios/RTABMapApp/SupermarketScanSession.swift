@@ -155,6 +155,87 @@ struct ScanSegmentMetadata: Codable {
     /// processing can always resolve the bound map. Older metadata decodes
     /// nil and keeps the historical PC map-selection flow.
     var priorMapBundled: Bool? = nil
+    // MARK: Mission / unit maintenance fields (phase 1 schema only).
+    //
+    // All fields are optional and decode nil for every session written before
+    // the periodic-maintenance work. They describe a collection unit inside a
+    // `SupermarketMission-*` container; they do not by themselves enable
+    // automatic rollover. Ordinary capture still writes exactly one
+    // `continuous_streaming` database in `segment_0001`, and no code path may
+    // create `segment_0002` for a continuous session.
+    var missionId: String? = nil
+    var missionFormatVersion: Int? = nil
+    var unitId: String? = nil
+    var unitIndex: Int? = nil
+    var previousUnitId: String? = nil
+    var previousUnitMetadataSha256: String? = nil
+    /// `time_limit | size_limit | operator_stop | safety_stop`.
+    var rolloverTrigger: String? = nil
+    /// Effective capture seconds for this unit (monotonic accumulation only).
+    var activeCaptureDurationS: Double? = nil
+    var maintenancePolicyVersion: Int? = nil
+    var calibrationIntervalS: Double? = nil
+    var boundaryCheckpointId: String? = nil
+    var boundaryManualEventSha256: String? = nil
+    var unitStorageBytes: UInt64? = nil
+    var nextMaintenanceAtActiveS: Double? = nil
+    /// `scanning | warning | gate | anchoring | finalizing | preparing_next`.
+    var maintenanceState: String? = nil
+}
+
+/// Optional mission/unit projection of a finalized session. Keeping the
+/// mapping in one place stops the metadata writer, the live checkpoint and the
+/// PC validator from drifting apart on field names.
+struct ScanMissionUnitBinding {
+    let missionId: String
+    let missionFormatVersion: Int
+    let unitId: String
+    let unitIndex: Int
+    let previousUnitId: String?
+    let previousUnitMetadataSha256: String?
+    let rolloverTrigger: String?
+    let activeCaptureDurationS: Double?
+    let maintenancePolicyVersion: Int
+    let calibrationIntervalS: Double
+    let boundaryCheckpointId: String?
+    let boundaryManualEventSha256: String?
+    let unitStorageBytes: UInt64?
+    let nextMaintenanceAtActiveS: Double?
+    let maintenanceState: String
+
+    /// Applies the mission fields without touching any existing value, so a
+    /// legacy single-session write keeps decoding exactly as before.
+    func applying(to metadata: inout ScanSegmentMetadata) {
+        metadata.missionId = missionId
+        metadata.missionFormatVersion = missionFormatVersion
+        metadata.unitId = unitId
+        metadata.unitIndex = unitIndex
+        metadata.previousUnitId = previousUnitId
+        metadata.previousUnitMetadataSha256 = previousUnitMetadataSha256
+        metadata.rolloverTrigger = rolloverTrigger
+        metadata.activeCaptureDurationS = activeCaptureDurationS
+        metadata.maintenancePolicyVersion = maintenancePolicyVersion
+        metadata.calibrationIntervalS = calibrationIntervalS
+        metadata.boundaryCheckpointId = boundaryCheckpointId
+        metadata.boundaryManualEventSha256 = boundaryManualEventSha256
+        metadata.unitStorageBytes = unitStorageBytes
+        metadata.nextMaintenanceAtActiveS = nextMaintenanceAtActiveS
+        metadata.maintenanceState = maintenanceState
+    }
+
+    /// Effective capture time is only meaningful when it is finite and
+    /// non-negative; anything else would let a corrupt accumulator look like a
+    /// completed unit.
+    var sanitizedActiveCaptureDurationS: Double? {
+        guard let value = activeCaptureDurationS, value.isFinite, value >= 0 else { return nil }
+        return value
+    }
+
+    /// A continuous session always stores its database in `segment_0001`.
+    /// The requirement document forbids creating `segment_0002` (§8.2): a
+    /// large store is covered by several independent single-database mission
+    /// units, never by extra segments inside one session.
+    static let continuousStreamingSegmentIndex = 1
 }
 
 struct ScanPerformanceSampleInput {
@@ -667,6 +748,21 @@ struct ScanLiveCheckpoint: Codable {
     /// and unnamed scans.
     let scanDisplayName: String?
     let initialMapPose: PriorMapPose2D?
+    // MARK: Mission / unit maintenance fields (phase 1 schema only).
+    //
+    // A live checkpoint is a running-state snapshot, never a saved artifact.
+    // These optional fields only add mission context for crash recovery; the
+    // presence of `live_checkpoint.json` still means "not finalized".
+    let missionId: String? = nil
+    let missionFormatVersion: Int? = nil
+    let unitId: String? = nil
+    let unitIndex: Int? = nil
+    let rolloverTrigger: String? = nil
+    let activeCaptureElapsedS: Double? = nil
+    let nextMaintenanceAtActiveS: Double? = nil
+    let maintenancePolicyVersion: Int? = nil
+    let maintenanceState: String? = nil
+    let boundaryCheckpointId: String? = nil
 }
 
 struct ManualLocalizationEvent: Encodable {

@@ -87,6 +87,29 @@ ESL audit 不是 session 创建 API。每个 capture generation 冻结 exact tra
 
 checkpoint cleanup 是显式破坏性恢复事务。iOS 与 PC 都按 path component 验证 session/唯一 `segment_0001`，拒绝 symlink；Windows 额外拒绝 junction/reparse point。metadata、checkpoint 和既有 audit 文件以 no-follow descriptor 打开，`fstat` 证明 regular file 和设备/文件身份，授权审计后重新打开并比较身份、长度和字节，再删除同一 checkpoint；删除失败追加 `finalization_checkpoint_cleanup_failed`，审计自身失败会明确记录 degraded。Map Studio inspect 返回客户端看到的 tracking identity、finalized time 及 metadata/checkpoint SHA-256；POST 必须携带严格 `confirmed=true` 和全部 expected evidence，任何变化返回 HTTP 409 `checkpoint_cleanup_conflict`。普通 inspect/reprocess 从不自动删除。
 
+## 门店任务容器（SupermarketMission-*，阶段 1 schema，尚未上线）
+
+> 状态：**schema 与校验器已实现，自动分卷与强制校准未上线**。以 [`PERIODIC_MANUAL_CALIBRATION_AND_AUTO_ROLLOVER_REQUIREMENTS_2026-09-04.md`](PERIODIC_MANUAL_CALIBRATION_AND_AUTO_ROLLOVER_REQUIREMENTS_2026-09-04.md) 为需求基线；`PeriodicMaintenancePolicy.featureEnabled` 默认 false，当前生产仍只产生单个 `SupermarketSession-*`。
+
+一个门店任务（mission）由一个或多个采集单元（unit）组成，每个 unit 内部仍是现有的单库布局（`segment_0001/rtabmap_segment_0001.db` + 现有 sidecar），**不允许出现 `segment_0002`**：
+
+```text
+SupermarketMission-YYYYMMDD-HHMMSS/
+  mission_live_checkpoint.json     # 运行中状态快照；出现即表示任务未完成
+  mission_events.jsonl             # append-only 状态与故障审计，每条以 newline 结束
+  mission_manifest.json            # 任务完成的唯一标志，不可变
+  boundaries/boundary_NNNN.json    # unit N → unit N+1 的双端绑定
+  units/SupermarketSession-...-U0001/segment_0001/...
+  units/SupermarketSession-...-U0002/segment_0001/...
+```
+
+- `mission_live_checkpoint.json`：`format=marketscanner_mission_live_checkpoint`、`version=1`、`policyVersion=1`、mission/地图/store/floor 身份、current unit、已封口 unit 列表（相对路径 + metadata/database SHA-256 + previous hash）、pending boundary 与双端完成标记、`activeCaptureElapsedS`、`nextMaintenanceAtActiveS`、`maintenanceState`。
+- `boundary_NNNN.json`：`format=marketscanner_mission_boundary`、`version=1`、mission/boundary ID、地图身份、from/to unit ID、confirmed `X/Y/yaw`，以及 `outgoing`/`incoming` 两端各自的 unit ID、index、tracking session、node ID/stamp、node-time snapshot generation 和 manual event/start receipt 摘要。只有双端齐备且位姿一致（1e-6 m / 1e-6 rad）才算 complete；单边证据只保留上一 unit 的独立可处理性，mission 不得整体发布。
+- `mission_manifest.json`：`format=marketscanner_mission_manifest`、`version=1`、unit/boundary 清单、完成时间、`integrity`、`publishPermitted`。写入前必须通过结构校验（index 连续、hash 链、双端 boundary、路径与链接、全部 unit finalized）；manifest 自身声称 `publishPermitted=true` 而校验发现 fatal 时，PC 额外报 `mission_manifest_overclaims`。
+- unit `metadata.json` 与 `live_checkpoint.json` 末尾追加可选 mission 字段（`missionId`、`missionFormatVersion`、`unitId`、`unitIndex`、`previousUnitId`、`previousUnitMetadataSha256`、`rolloverTrigger`、`activeCaptureDurationS`、`maintenancePolicyVersion`、`calibrationIntervalS`、`boundaryCheckpointId`、`boundaryManualEventSha256`、`unitStorageBytes`、`nextMaintenanceAtActiveS`、`maintenanceState`）。全部可选，旧数据解码为 nil；`live_checkpoint.json` 存在仍然表示该 unit 未 finalized，绝不可当作“已存盘”。
+- 所有路径必须是 mission root 内的 canonical relative path；绝对路径、`..`、反斜杠、symlink、hardlink、重复 unit/boundary ID、重复 index 一律拒绝。不得用 symlink/hardlink 引用 unit。
+- 旧版单个 `SupermarketSession-*` 继续按“一项只有一个 unit 的 legacy mission”读取，PC 仍可逐 unit 处理。
+
 ## performance_samples.jsonl
 
 生产写侧约每 5 秒追加一条 `MarketScannerPerformanceSample` version 1，数据库保存完成后追加 `scan_state=finalizing` 的终止样本。文件最大 256 MiB、250,000 条、单条 64 KiB；48 小时资格规模按 5 秒 cadence 为 34,560 条。每行必须是 UTF-8 JSON object、无空行、以 newline 结束，`sequence` 从 1 连续递增，`timestamp_unix` 严格递增，`tracking_session_id` 在全文件内固定并与 metadata 相等，所有数字必须有限且非负。
